@@ -22,3 +22,5 @@ I never measured the paid service, so this compares **features**, not quality or
 | Voices | Kokoro presets | no cloning |
 | Uptime / SLA | none | single operator, no soak test |
 | Cost per minute | cheaper above ~1.5 average concurrent calls | docs/FINDINGS.md |
+
+Update: multilingual voices, call variables, OpenAPI tool import and call recovery now exist (unit tested; see docs/STATUS.md). Non-English audio is untested.

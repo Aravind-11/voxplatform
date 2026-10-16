@@ -194,22 +194,28 @@ step 3. The phone number rings into nothing until you run `deploy.sh` again on a
 | Twilio trial: can't call a number | Verify the destination in the Twilio console |
 | HTTP 401 | Use `X-API-Key` for `/v1/*`, `X-Admin-Key` for `/admin/*` |
 
-## 5. Production (own domain, Postgres, Redis, multiple nodes)
+## 5. Production (own domain, 2+ servers, alerts)
 ```bash
-cp deploy/env.example deploy/.env      # fill in domain and secrets
-docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
+cp deploy/env.example deploy/.env      # set your domain, secrets, passwords
+bash deploy/up.sh                      # Caddy (HTTPS) -> api1 + api2 -> Postgres, Redis, Prometheus, Alertmanager, Grafana
 ```
-Kubernetes manifest: `deploy/k8s/voxplatform.yaml`. **Both are written but were never built or run in this repo**
-(no Docker in the build environment). Treat them as a starting point and read [docs/OPERATIONS.md](docs/OPERATIONS.md).
+The platform runs two API nodes behind a health-checked load balancer, shares call caps through Redis, and alerts on 9 rules
+(node down, high latency, capacity, errors). A node killed mid-call drops only its calls; the phone carrier is told to reconnect the caller
+to another node with the transcript so far. Tested with real processes (`tests/e2e/ha_test.py`, 21 checks, fake models).
+**The Docker images and Kubernetes manifest were never built or run** (container registries are blocked in the build environment).
+Kubernetes: `deploy/k8s/voxplatform.yaml` (autoscale on the per-node `vox_active_calls` gauge, about 20-24 per node). See [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## 6. Run the tests (no GPU)
 ```bash
-pip install -r requirements-dev.txt && pytest          # 200+ unit tests
+pip install -r requirements-dev.txt && pytest          # 240+ unit tests
 ```
 
 ## 7. Technical documentation
 | Doc | What is in it |
 |---|---|
+| [docs/ASSESSMENT.md](docs/ASSESSMENT.md) | Engineering assessment: reuse vs build, architecture, cost per minute, scaling, plan, risks, proof-of-concept report |
+| [docs/INTEGRATION.md](docs/INTEGRATION.md) | OpenAPI tool import, call variables, signed webhooks, VoxSun adapter design |
+| [docs/LANGUAGES.md](docs/LANGUAGES.md) | Supported languages, voices, licence caveats |
 | [docs/FINDINGS.md](docs/FINDINGS.md) | Measured latency and capacity, cost vs. the paid service, what is not proven |
 | [docs/STATUS.md](docs/STATUS.md) | Every capability labelled verified / written / designed |
 | [docs/PARITY.md](docs/PARITY.md) | Feature-by-feature comparison with Ultravox Realtime |
@@ -218,7 +224,9 @@ pip install -r requirements-dev.txt && pytest          # 200+ unit tests
 | [docs/TUNING.md](docs/TUNING.md) | Turn-taking and latency settings |
 | [docs/LICENSES.md](docs/LICENSES.md) | Every component's license (commercial use) |
 
-Not built: SIP trunking (Twilio is the phone layer), voice cloning, single sign-on.
+Cost estimate: `python scripts/cost_model.py`. Resource logging on a GPU box: `scripts/resource_log.sh`.
+
+Not built: billing/sign-up, VoxSun integration, SIP trunking (Twilio is the phone layer), voice cloning, single sign-on.
 
 Code layout: `core/` (turn-taking, VAD, speech, session), `transports/` (Twilio, browser), `api/` (REST, WebSocket,
 dashboard, storage), `scripts/` (setup and deploy), `deploy/` (Docker, Kubernetes), `tests/`.

@@ -69,3 +69,5 @@ Full per-component table: docs/STATUS.md. Summary:
 ## 5. Reproduce
 `python -m pytest tests/unit` (CPU, about 20 s); `VOX_TEST_DB=postgresql://... python -m pytest tests/unit` (Postgres);
 `python tests/e2e/browser_test.py` (Chromium); `bash tests/e2e/deploy_dryrun.sh`; on the GPU box `bash scripts/deploy.sh` then `scripts/05_verify.sh`.
+
+See docs/ASSESSMENT.md for the 2-node cost model (break-even about 2.3 average simultaneous calls with a failover spare) which supersedes the single-GPU table above for production sizing.

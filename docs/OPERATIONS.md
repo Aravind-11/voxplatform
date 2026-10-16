@@ -16,3 +16,10 @@ callback must reach the node that holds the live call, so use sticky routing by 
 **Outbound dialing** costs money and can be abused: per-tenant daily cap (`VOX_OUTBOUND_PER_DAY`, default 50) and an optional
 country-prefix allow-list (`VOX_OUTBOUND_PREFIXES=+1`).
 **Instance housekeeping (Lambda)**: terminate the instance when not in use; the persistent filesystem keeps weights and database and bills weekly.
+
+## Monitoring, alerts and recovery (added)
+- `vox_active_calls` is **per node**; `vox_active_calls_cluster` is the Redis-wide total. Autoscale on the per-node gauge.
+- `deploy/up.sh` starts Prometheus, Alertmanager (rules in `deploy/monitoring/alerts.yml`, route in `alertmanager.yml`) and Grafana (dashboard provisioned). Set the alert receiver before relying on it.
+- `/healthz` is deep: database and Redis checked; 503 when draining or unhealthy, so Caddy stops routing new calls.
+- Call recovery: if a node dies, Twilio's next TwiML fetch hits `/twilio/resume/{id}` on a live node, which seeds the transcript (max 2 resumes per call). Verified only against a simulated Twilio.
+- Failover test: `BIN=<tools dir> VOX_DB=postgresql://... python tests/e2e/ha_test.py`.

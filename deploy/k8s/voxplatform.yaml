@@ -154,5 +154,5 @@ spec:
     - type: Pods
       pods:
         metric: { name: vox_active_calls }          # exposed by prometheus-adapter from GET /metrics
-        target: { type: AverageValue, averageValue: "12" }   # PLACEHOLDER: set from a load test on your hardware (docs/FINDINGS.md)
+        target: { type: AverageValue, averageValue: "20" }   # per-node gauge; measured comfortable limit is ~24 calls per H100 (docs/FINDINGS.md). Re-tune on your hardware.
   behavior: { scaleDown: { stabilizationWindowSeconds: 900 } }

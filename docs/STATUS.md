@@ -74,3 +74,9 @@ Response = caller speech end -> first agent audio, measured by the client.
 Stage timing at 16 calls (v1): model first token p50 63 ms; TTS per sentence p50 1433 ms -> TTS was the bottleneck,
 fixed by synthesizing only the first sentence eagerly and later ones just in time (1.5 s lookahead).
 Remaining limit above ~16 calls: TTS throughput on one GPU (Kokoro runs batch-1). Next levers: batched TTS worker, CUDA MPS.
+
+## Added since (labelled)
+- **verified (real processes, fake models):** 2-node HA behind Caddy with Postgres, Redis, Prometheus, Alertmanager; node kill, drain, alert fire/resolve (tests/e2e/ha_test.py, 21 checks).
+- **written + unit tested:** multilingual voices, call variables, OpenAPI import, signed call.ended webhook with transcript, call recovery, cost model, resource logging scripts.
+- **written, never run:** Docker images, deploy/up.sh against real Docker, Kubernetes; Stripe/billing ledger groundwork (not wired); non-English audio.
+- **not done:** VoxSun integration, soak test, GPU resource-consumption capture, paid-service baseline.

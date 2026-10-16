@@ -1,0 +1,58 @@
+# Alert rules. Thresholds marked (load test) come from docs/FINDINGS.md: on one H100 the 95th-percentile first-audio
+# time stayed under 2.3 s up to 32 simultaneous calls per node (synthetic callers) and passed 5 s at 48. Re-measure on
+# your hardware and edit.
+groups:
+  - name: voxplatform
+    rules:
+      - alert: NodeDown
+        expr: up{job="voxplatform"} == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "API node {{ $labels.instance }} is not answering"
+          description: "Calls on it are lost; the phone layer reconnects them to another node. Check the container and its database/Redis connection."
+      - alert: AllNodesDown
+        expr: count(up{job="voxplatform"} == 1) == 0 or absent(up{job="voxplatform"})
+        for: 30s
+        labels: { severity: critical }
+        annotations: { summary: "No API node is up: the service cannot take calls" }
+      - alert: ModelServerDown
+        expr: up{job="vllm"} == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "vLLM on {{ $labels.instance }} is not answering"
+          description: "Agents cannot understand or answer callers. Check the GPU and the vllm container logs."
+      - alert: SlowFirstAudio
+        expr: histogram_quantile(0.95, sum by (le) (rate(vox_first_audio_ms_bucket[5m]))) > 2500
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "95th-percentile first-audio time is {{ $value | printf \"%.0f\" }} ms (target under 2500)"
+          description: "Callers wait too long for the agent. Usually the GPU is saturated: add a node or lower the per-node call cap."
+      - alert: NodeNearCapacity
+        expr: vox_active_calls{job="voxplatform"} > 24
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value }} active calls (load-test comfort limit is about 28)"
+      - alert: ErrorsInCalls
+        expr: sum by (where) (rate(vox_errors_total[5m])) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "Errors in '{{ $labels.where }}' for 5 minutes" }
+      - alert: CallsBeingResumed
+        expr: increase(vox_call_resumes_total[10m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Phone calls lost their media stream and were reconnected"
+          description: "A node or the network between Twilio and the nodes is unstable. Look at NodeDown and at the proxy logs."
+      - alert: CallResumesExhausted
+        expr: increase(vox_call_resume_refused_total[10m]) > 0
+        labels: { severity: critical }
+        annotations: { summary: "Callers were dropped after repeated failed reconnects" }
+      - alert: ModelQueueBuilding
+        expr: sum(vllm:num_requests_waiting) > 8
+        for: 2m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $value }} requests are waiting on the model server" }

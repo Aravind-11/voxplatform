@@ -55,6 +55,8 @@ class ConcurrencyLimiter:
         with self._lock:
             return sum(len(v) for v in self._active.values())
 
+    local_active = total_active                    # one process: this node's calls are all the calls
+
 
 class RedisLimiter:
     """Per-tenant active-call cap shared by every API node (Redis). Same interface as ConcurrencyLimiter.
@@ -83,6 +85,9 @@ return 1
     def _key(self, tenant_id: str) -> str:
         return self.prefix + tenant_id
 
+    def ping(self) -> None:
+        self.r.ping()
+
     def acquire(self, tenant_id: str, call_id: str, limit: Optional[int] = None) -> bool:
         import time
         now = time.time()
@@ -102,7 +107,13 @@ return 1
         import time
         return int(self.r.zcount(self._key(tenant_id), time.time(), "+inf"))
 
+    def local_active(self) -> int:
+        """Calls held by THIS node (what a drain waits for, and what one node's capacity is measured against)."""
+        with self._lock:
+            return sum(len(v) for v in self._held.values())
+
     def total_active(self) -> int:
+        """Calls on every node (scans Redis; for dashboards, not for health checks)."""
         import time
         now = time.time()
         return sum(int(self.r.zcount(k, now, "+inf")) for k in self.r.scan_iter(self.prefix + "*"))

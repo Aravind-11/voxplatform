@@ -60,3 +60,12 @@ def test_concurrent_acquires_never_exceed_cap(redis_url):
     with ThreadPoolExecutor(16) as ex:
         res = list(ex.map(lambda i: lim.acquire("ten", f"c{i}"), range(40)))
     assert sum(res) == 5 and lim.active("ten") == 5
+
+
+def test_local_active_counts_this_nodes_calls_and_total_counts_the_cluster(redis_url):
+    a = RedisLimiter(redis_url, default_limit=10, prefix="t9:")
+    b = RedisLimiter(redis_url, default_limit=10, prefix="t9:")
+    assert a.acquire("t", "c1") and a.acquire("t", "c2") and b.acquire("t", "c3")
+    assert (a.local_active(), b.local_active(), a.total_active()) == (2, 1, 3)
+    a.release("t", "c1")
+    assert (a.local_active(), a.total_active()) == (1, 2)

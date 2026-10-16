@@ -1,7 +1,28 @@
-# TLS termination and websocket pass-through. Set VOX_DOMAIN (DNS A record -> this host); Caddy gets the certificate itself.
-{$VOX_DOMAIN} {
+# TLS termination + load balancing in front of every API node. Caddy obtains and renews the certificate itself:
+# point your domain's DNS A record at this host and set VOX_DOMAIN. Without a domain it serves plain HTTP on :80
+# (fine for a LAN test, not for Twilio, which needs https/wss).
+#
+# VOX_UPSTREAMS is a space-separated list of API nodes, e.g. "api1:8080 api2:8080" (compose) or
+# "10.0.0.11:8080 10.0.0.12:8080 10.0.0.13:8080" (one per GPU host). Add a node by adding it here and reloading.
+{$VOX_DOMAIN::80} {
 	encode zstd gzip
-	reverse_proxy api:8080 {
-		flush_interval -1
+
+	# Operational endpoints are not for the internet.
+	@internal path /metrics /metrics/*
+	respond @internal 404
+	# Optionally restrict /admin/* to your own addresses:
+	#   @admin { path /admin/*  not remote_ip 203.0.113.0/24 }
+	#   respond @admin 403
+
+	reverse_proxy {$VOX_UPSTREAMS:api1:8080 api2:8080} {
+		lb_policy least_conn
+		lb_try_duration 3s                  # a request that finds a dead node is retried on another
+		lb_try_interval 250ms
+		health_uri /healthz                 # 503 while a node drains or its database/Redis is unreachable
+		health_interval 3s
+		health_timeout 2s
+		health_status 2xx
+		flush_interval -1                   # do not buffer audio websockets
+		request_buffers 64KB                # small JSON bodies are held so a POST can be retried on another node
 	}
 }

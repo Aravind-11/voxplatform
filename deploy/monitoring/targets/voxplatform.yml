@@ -1,0 +1,2 @@
+# One entry per API node. Edit and save: Prometheus re-reads this file on its own.
+- targets: ["api1:8080", "api2:8080"]

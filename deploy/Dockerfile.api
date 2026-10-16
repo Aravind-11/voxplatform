@@ -1,6 +1,7 @@
 # API + speech front end (VAD, Kokoro TTS). Needs a GPU for Kokoro; shares the card with vLLM.
 # Not built or run in this repo's CI: written from the working bare-metal setup (scripts/00_setup.sh).
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+ARG BASE_IMAGE=pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+FROM ${BASE_IMAGE}
 ARG WITH_ESPEAK=0
 # espeak-ng is GPL-3.0; leave WITH_ESPEAK=0 (and set VOX_NO_ESPEAK=1) unless you have accepted that. docs/LICENSES.md
 RUN if [ "$WITH_ESPEAK" = "1" ]; then apt-get update && apt-get install -y --no-install-recommends espeak-ng && rm -rf /var/lib/apt/lists/*; fi
@@ -11,6 +12,7 @@ COPY api ./api
 COPY core ./core
 COPY transports ./transports
 COPY deploy/drain.py ./drain.py
+COPY scripts/bootstrap_tenant.py scripts/twilio_set_webhook.py ./
 ENV VOX_NO_ESPEAK=1 HF_HOME=/models/hf HF_HUB_OFFLINE=0 PYTHONUNBUFFERED=1
 EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=3s --retries=5 CMD python -c "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"

@@ -1,9 +1,39 @@
-# Full stack on one GPU host: vLLM (Ultravox) + API + Postgres + Redis + TLS proxy.
-#   cp deploy/env.example deploy/.env   # fill in secrets and your domain
-#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
-# Needs the NVIDIA container toolkit. Written from the verified bare-metal setup; NOT run end to end in this repo
-# (no Docker in the build sandbox). Check `docker compose logs vllm` first: the model download is ~70 GB.
+# Production stack on one GPU host:  vLLM (Ultravox) + 2 API nodes + Postgres + Redis + Caddy (TLS, load balancer)
+#                                    + Prometheus + Alertmanager + Grafana.
+#   bash deploy/up.sh          # creates secrets, starts everything, prints your keys. See README section 5.
+# Needs the NVIDIA container toolkit and a domain pointing at this host. Written from the verified bare-metal setup;
+# the configs it mounts are validated (promtool, amtool, caddy) and the same topology was run as processes
+# (tests/e2e/ha_test.sh); the container images themselves have NOT been built or started in this repo's build
+# environment (its image registries are blocked). Check `docker compose logs vllm` first: the model download is ~70 GB.
+#
+# More capacity: add GPU hosts, run the same api service on each, and list every node in VOX_UPSTREAMS (Caddyfile).
 name: voxplatform
+
+x-api: &api
+  build: { context: .., dockerfile: deploy/Dockerfile.api }
+  depends_on: { vllm: { condition: service_healthy }, postgres: { condition: service_healthy }, redis: { condition: service_started } }
+  environment: &api-env
+    VOX_VLLM_URL: http://vllm:8000/v1
+    VOX_DB: postgresql://vox:${POSTGRES_PASSWORD}@postgres/vox
+    VOX_REDIS_URL: redis://redis:6379/0
+    VOX_PUBLIC_URL: https://${VOX_DOMAIN}
+    VOX_ADMIN_KEY: ${VOX_ADMIN_KEY}
+    VOX_METRICS_TOKEN: ${VOX_METRICS_TOKEN}
+    TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+    TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+    VOX_TWILIO_NUMBER: ${VOX_TWILIO_NUMBER:-}
+    VOX_RECORD_DIR: /data/recordings
+    VOX_DEFAULT_CONCURRENCY: ${VOX_DEFAULT_CONCURRENCY:-64}
+    VOX_EOT: model
+    VOX_EOT_THRESHOLD: "0.9"
+    VOX_NO_ESPEAK: ${VOX_NO_ESPEAK:-1}
+    VOX_PRELOAD_LANGS: ${VOX_PRELOAD_LANGS:-a}
+    HF_HOME: /models/hf
+  volumes: [ "models:/models", "recordings:/data/recordings" ]
+  deploy: { resources: { reservations: { devices: [ { driver: nvidia, count: 1, capabilities: [ gpu ] } ] } } }
+  stop_grace_period: 1h          # live calls finish after the drain (see deploy/drain.py)
+  restart: unless-stopped
+
 services:
   vllm:
     # Pin this to the vLLM version printed by scripts/00_setup.sh on a known-good box.
@@ -21,28 +51,8 @@ services:
     healthcheck: { test: [ "CMD", "curl", "-fs", "http://localhost:8000/v1/models" ], interval: 20s, timeout: 5s, retries: 60, start_period: 120s }
     restart: unless-stopped
 
-  api:
-    build: { context: ..  , dockerfile: deploy/Dockerfile.api }
-    depends_on: { vllm: { condition: service_healthy }, postgres: { condition: service_healthy }, redis: { condition: service_started } }
-    environment:
-      VOX_VLLM_URL: http://vllm:8000/v1
-      VOX_DB: postgresql://vox:${POSTGRES_PASSWORD}@postgres/vox
-      VOX_REDIS_URL: redis://redis:6379/0
-      VOX_PUBLIC_URL: https://${VOX_DOMAIN}
-      VOX_ADMIN_KEY: ${VOX_ADMIN_KEY}
-      VOX_METRICS_TOKEN: ${VOX_METRICS_TOKEN}
-      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
-      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
-      VOX_TWILIO_NUMBER: ${VOX_TWILIO_NUMBER:-}
-      VOX_RECORD_DIR: /data/recordings
-      VOX_DEFAULT_CONCURRENCY: ${VOX_DEFAULT_CONCURRENCY:-64}
-      VOX_EOT: model
-      VOX_EOT_THRESHOLD: "0.9"
-      VOX_NO_ESPEAK: "1"
-      HF_HOME: /models/hf
-    volumes: [ "models:/models", "recordings:/data/recordings" ]
-    deploy: { resources: { reservations: { devices: [ { driver: nvidia, count: 1, capabilities: [ gpu ] } ] } } }
-    restart: unless-stopped
+  api1: { <<: *api, hostname: api1 }
+  api2: { <<: *api, hostname: api2 }
 
   postgres:
     image: postgres:16
@@ -58,10 +68,44 @@ services:
 
   proxy:
     image: caddy:2
-    depends_on: [ api ]
+    depends_on: [ api1, api2 ]
     ports: [ "80:80", "443:443" ]
-    environment: { VOX_DOMAIN: "${VOX_DOMAIN}" }
+    environment: { VOX_DOMAIN: "${VOX_DOMAIN}", VOX_UPSTREAMS: "${VOX_UPSTREAMS:-api1:8080 api2:8080}" }
     volumes: [ "./Caddyfile:/etc/caddy/Caddyfile:ro", "caddy:/data" ]
     restart: unless-stopped
 
-volumes: { models: {}, recordings: {}, pgdata: {}, caddy: {} }
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command: [ "--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d" ]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./monitoring/targets:/etc/prometheus/targets:ro
+      - promdata:/prometheus
+    secrets: [ vox_metrics_token ]
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command: [ "--config.file=/etc/alertmanager/alertmanager.yml" ]
+    volumes: [ "./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro" ]
+    secrets: [ alert_webhook_url ]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment: { GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password, GF_USERS_ALLOW_SIGN_UP: "false" }
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana:/var/lib/grafana
+    secrets: [ grafana_admin_password ]
+    ports: [ "127.0.0.1:3000:3000" ]        # reach it through an SSH tunnel; do not expose it publicly
+    restart: unless-stopped
+
+secrets:
+  vox_metrics_token: { file: ./secrets/vox_metrics_token }
+  alert_webhook_url: { file: ./secrets/alert_webhook_url }
+  grafana_admin_password: { file: ./secrets/grafana_admin_password }
+
+volumes: { models: {}, recordings: {}, pgdata: {}, caddy: {}, promdata: {}, grafana: {} }

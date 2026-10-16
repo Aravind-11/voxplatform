@@ -1,0 +1,29 @@
+# Where alerts go. The default sends the raw Alertmanager JSON to one webhook (its URL is read from a secret file, so it
+# never sits in this repository): works with most incident tools. Replace or add receivers below for Slack, PagerDuty
+# or email; see https://prometheus.io/docs/alerting/latest/configuration/
+route:
+  receiver: default
+  group_by: [alertname]
+  group_wait: 10s
+  group_interval: 2m
+  repeat_interval: 1h
+  routes:
+    - matchers: [severity="critical"]
+      receiver: default
+      repeat_interval: 15m
+receivers:
+  - name: default
+    webhook_configs:
+      - url_file: /run/secrets/alert_webhook_url
+        send_resolved: true
+  # - name: slack
+  #   slack_configs:
+  #     - api_url_file: /run/secrets/slack_webhook_url
+  #       channel: "#voice-alerts"
+  # - name: pagerduty
+  #   pagerduty_configs:
+  #     - routing_key_file: /run/secrets/pagerduty_key
+inhibit_rules:
+  - source_matchers: [alertname="AllNodesDown"]       # one page, not five, when everything is down
+    target_matchers: [alertname=~"NodeDown|SlowFirstAudio|NodeNearCapacity|ErrorsInCalls"]
+    equal: []

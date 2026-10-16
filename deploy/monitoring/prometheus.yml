@@ -1,0 +1,22 @@
+# Scrapes every API node and the model server, evaluates the alert rules, and hands firing alerts to Alertmanager.
+# Targets live in targets/*.yml so you can add a node without restarting Prometheus.
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+rule_files:
+  - /etc/prometheus/alerts.yml
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+scrape_configs:
+  - job_name: voxplatform
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/vox_metrics_token     # the same token as VOX_METRICS_TOKEN
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/voxplatform.yml"]
+  - job_name: vllm
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/vllm.yml"]

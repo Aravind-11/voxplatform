@@ -47,8 +47,11 @@ def main():
     rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
     s = Settings(admin_key=os.environ.get("VOX_ADMIN_KEY", "adm"),
                  public_base_url=os.environ.get("VOX_PUBLIC_URL", f"http://127.0.0.1:{port}"),
-                 metrics_token=os.environ.get("VOX_METRICS_TOKEN", "mt"), record_dir=rec)
-    uvicorn.run(create_app(store, rt, security.ConcurrencyLimiter(5), None, s), host="127.0.0.1", port=port, log_level="warning")
+                 metrics_token=os.environ.get("VOX_METRICS_TOKEN", "mt"), record_dir=rec,
+                 allow_unsigned_twilio=os.environ.get("VOX_ALLOW_UNSIGNED_TWILIO") == "1")
+    redis_url = os.environ.get("VOX_REDIS_URL", "")
+    limiter = security.RedisLimiter(redis_url, 5, ttl_s=float(os.environ.get("VOX_REDIS_TTL", "90"))) if redis_url else security.ConcurrencyLimiter(5)
+    uvicorn.run(create_app(store, rt, limiter, None, s), host=os.environ.get("VOX_HOST", "127.0.0.1"), port=port, log_level="warning")
 
 
 if __name__ == "__main__":

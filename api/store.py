@@ -117,6 +117,10 @@ class Store:
         with self.lock:
             return [dict(r) for r in self._run(sql, args).fetchall()]
 
+    def ping(self) -> None:
+        """Raises if the database cannot answer (readiness check)."""
+        self._one("SELECT 1 AS x")
+
     def close(self) -> None:
         with self.lock:
             self.db.close()

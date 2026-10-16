@@ -204,7 +204,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     if not getattr(runtime, "public_url", ""):
         runtime.public_url = settings.public_base_url
     app.state.store, app.state.limiter, app.state.runtime = store, limiter, runtime
-    METRICS.gauge("vox_active_calls", limiter.total_active)
+    METRICS.gauge("vox_active_calls", limiter.local_active)            # this node's calls
+    METRICS.gauge("vox_active_calls_cluster", limiter.total_active)   # every node's calls (Redis scan)
 
     @app.on_event("startup")
     async def _start_heartbeat():
@@ -306,9 +307,21 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     @app.get("/healthz")
     async def healthz():
-        """Readiness: 503 while draining so the load balancer stops sending new calls to this node."""
-        body = {"ok": not app.state.draining, "draining": app.state.draining, "active_calls": limiter.total_active()}
-        return Response(json.dumps(body), status_code=503 if app.state.draining else 200, media_type="application/json")
+        """Readiness: 503 while draining or when the database (or Redis, if used) is unreachable, so the load balancer
+        stops sending new calls to this node."""
+        checks = {}
+        for name, fn in (("db", store.ping), ("redis", getattr(limiter, "ping", None))):
+            if fn is None:
+                continue
+            try:
+                fn()
+                checks[name] = True
+            except Exception:  # noqa: BLE001
+                checks[name] = False
+                METRICS.inc("vox_errors_total", where=f"healthz_{name}")
+        ready = not app.state.draining and all(checks.values())
+        body = {"ok": ready, "draining": app.state.draining, "active_calls": limiter.local_active(), "checks": checks}
+        return Response(json.dumps(body), status_code=200 if ready else 503, media_type="application/json")
 
     def admin_only(x_admin_key: str) -> None:
         if not settings.admin_key or not hmac.compare_digest(x_admin_key, settings.admin_key):
@@ -319,7 +332,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """Stop taking new calls (live ones continue). Call from a pod preStop hook, then wait for active_calls == 0."""
         admin_only(x_admin_key)
         app.state.draining = True
-        return {"draining": True, "active_calls": limiter.total_active()}
+        return {"draining": True, "active_calls": limiter.local_active()}
 
     @app.post("/admin/undrain")
     async def undrain(x_admin_key: str = Header(default="")):

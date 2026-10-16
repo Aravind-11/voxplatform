@@ -55,6 +55,18 @@ def _count(e: dict) -> None:
         METRICS.inc("vox_errors_total", where=str(e.get("where", "")))
 
 
+# Said when a phone call is reconnected after the media stream or its node was lost. Short phrases per language;
+# the non-English ones have not been reviewed by a native speaker.
+RESUME_PHRASE = {"en": "Sorry about that, we got cut off for a moment. I'm back.",
+                 "es": "Disculpa, se cortó un momento. Ya estoy de vuelta.",
+                 "fr": "Désolé, nous avons été coupés un instant. Je suis de retour.",
+                 "hi": "माफ़ कीजिए, कनेक्शन कुछ पल के लिए कट गया था। मैं वापस आ गया हूँ।",
+                 "it": "Scusa, ci siamo interrotti per un momento. Sono di nuovo qui.",
+                 "ja": "失礼しました、一瞬途切れてしまいました。戻りました。",
+                 "pt": "Desculpe, a ligação caiu por um instante. Já voltei.",
+                 "zh": "不好意思，刚才断线了一下。我回来了。"}
+
+
 @dataclass
 class Runtime:
     llm: object
@@ -80,6 +92,20 @@ class Runtime:
         path = os.path.join(rec_dir, f"{call_id}.wav")
         rec.save(path)
         return path
+
+    def _earlier_messages(self, call_id: str, keep: int = 40) -> list[dict]:
+        """Transcript of the call this one continues (following the chain of reconnects), oldest first, last `keep`."""
+        chain: list[str] = []
+        cur = call_id
+        while cur and len(chain) < 4:
+            chain.append(cur)
+            c = self.store.get_call_any(cur)
+            m = (c or {}).get("metadata") or {}
+            cur = (json.loads(m) if isinstance(m, str) else m).get("resumedFrom")
+        out: list[dict] = []
+        for cid in reversed(chain):
+            out += self.store.messages(cid)
+        return out[-keep:]
 
     @staticmethod
     def _eot_mode() -> str:
@@ -137,6 +163,7 @@ class Runtime:
                   **{k: str(v) for k, v in (meta.get("variables") or {}).items()},
                   "caller": str(meta.get("from", "")), "callee": str(meta.get("to", "")), "callId": call["id"]}
         prompt = varmod.render(cfg.get("systemPrompt") or SessionConfig.system_prompt, values)
+        resumed = bool(meta.get("resumedFrom"))
         from core.tts import LANG_NAME
         if cfg.get("language") in LANG_NAME:
             name = LANG_NAME[cfg["language"]]
@@ -144,7 +171,8 @@ class Runtime:
                        f"if they speak another language, politely stay in {name}.")
         scfg = SessionConfig(system_prompt=prompt,
                              out_rate=transport.out_rate, tools_schema=schemas,
-                             greeting=varmod.render(str(cfg.get("greeting") or ""), values),
+                             greeting=(RESUME_PHRASE.get(cfg.get("language") or "en", RESUME_PHRASE["en"]) if resumed
+                                       else varmod.render(str(cfg.get("greeting") or ""), values)),
                              turn=TurnConfig(end_ms=float(os.environ.get("VOX_END_MS", "640")),
                                              eot_threshold=float(os.environ.get("VOX_EOT_THRESHOLD", "0.8")),
                                              patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000"))))
@@ -177,6 +205,8 @@ class Runtime:
             await sess.say_and_wait(message)
             await transport.end()
         ctx.voicemail = voicemail
+        if resumed:
+            sess.seed_history(self._earlier_messages(meta["resumedFrom"]))
         self.live[call["id"]] = (sess, transport)
         ctx.turn_fn = lambda: sess.stats["turns"]      # lets confirm-before-acting tools tell turns apart
         return sess

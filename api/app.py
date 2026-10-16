@@ -772,11 +772,17 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     # ---------------------------------------------------------- telephony
     def stream_twiml(call: dict) -> str:
+        """Connects the call to the agent. If the media stream ends, Twilio moves to the <Redirect>, which asks
+        /twilio/resume/{id} what to do: hang up (the agent ended the call) or reconnect (the stream or node was lost)."""
         ws = settings.public_base_url.replace("http", "ws", 1)
         return ('<?xml version="1.0" encoding="UTF-8"?><Response><Connect>'
                 f'<Stream url={quoteattr(f"{ws}/ws/twilio/{call["id"]}")}>'
                 f'<Parameter name="token" value={quoteattr(call["join_token"])}/>'
-                '</Stream></Connect></Response>')
+                '</Stream></Connect>'
+                f'<Redirect method="POST">{settings.public_base_url}/twilio/resume/{call["id"]}</Redirect></Response>')
+
+    HANGUP_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    MAX_RESUMES = 2
 
     @app.post("/twilio/voice/{agent_id}")
     async def twilio_voice(agent_id: str, request: Request):
@@ -813,13 +819,42 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             state["t"] = admit(call)
             return runtime.build_session(call, tr)
 
+        tr = TwilioTransport(_TwilioWS(ws), factory)
+        tr.before_end = lambda: store.update_call(call_id, end_reason="agent_hangup")
         try:
-            await TwilioTransport(_TwilioWS(ws), factory).run()
+            await tr.run()
         except _Reject as r:
             await ws.close(r.code, r.reason)
         finally:
             if "t" in state:
-                finish(call, state["t"], "hangup")
+                finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+
+    @app.post("/twilio/resume/{call_id}")
+    async def twilio_resume(call_id: str, request: Request):
+        """Twilio lands here when a call's media stream has ended but the caller is still on the line. If the agent
+        ended the call, hang up. Otherwise the stream or the node serving it was lost: reconnect the caller to a
+        healthy node with the conversation so far, at most MAX_RESUMES times per call."""
+        form = {k: str(v) for k, v in (await request.form()).items()}
+        twilio_check(request, form)
+        if app.state.draining:
+            raise HTTPException(503, "node is draining")
+        call = store.get_call_any(call_id)
+        if not call or call["medium"] != "twilio" or call.get("end_reason") in ("agent_hangup", "transfer", "no_credit"):
+            return Response(HANGUP_TWIML, media_type="text/xml")
+        meta = call["metadata"] if isinstance(call["metadata"], dict) else json.loads(call["metadata"] or "{}")
+        n = int(meta.get("resumes", 0))
+        if n >= MAX_RESUMES:
+            METRICS.inc("vox_call_resume_refused_total")
+            return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we are having technical '
+                            'difficulties. Please call again shortly. Goodbye.</Say><Hangup/></Response>', media_type="text/xml")
+        if call["status"] in ("created", "active"):
+            store.update_call(call_id, status="ended", ended=time.time(), end_reason="stream_lost")
+            limiter.release(call["tenant_id"], call_id)            # frees the dead node's slot at once
+        nxt = store.create_call(call["tenant_id"], call["agent_id"], "twilio", call["config"],
+                                {**meta, "resumedFrom": call_id, "resumes": n + 1})
+        METRICS.inc("vox_call_resumes_total")
+        store.audit(call["tenant_id"], "system", "call.resume", nxt["id"], {"from": call_id, "attempt": n + 1})
+        return Response(stream_twiml(nxt), media_type="text/xml")
 
     # ----------------------------------------------------- outbound calls
     def twilio_check(request: Request, form: dict) -> None:
@@ -866,10 +901,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             meta["voicemail"] = body.voicemailMessage
         call = store.create_call(t["id"], body.agentId, "twilio", cfg, meta)
         ws = settings.public_base_url.replace("http", "ws", 1)
-        twiml = ('<?xml version="1.0" encoding="UTF-8"?><Response><Connect>'
-                 f'<Stream url={quoteattr(f"{ws}/ws/twilio/{call["id"]}")}>'
-                 f'<Parameter name="token" value={quoteattr(call["join_token"])}/>'
-                 '</Stream></Connect></Response>')
+        twiml = stream_twiml(call)
         data = {"To": body.to, "From": caller_id, "Twiml": twiml,
                 "StatusCallback": f"{settings.public_base_url}/twilio/status/{call['id']}",
                 "StatusCallbackEvent": "completed"}

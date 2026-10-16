@@ -181,6 +181,13 @@ class Session:
         while not gen.cancelled and self.tracker.buffered_ms() > 0 and self.clock() < deadline:
             await asyncio.sleep(0.05)
 
+    def seed_history(self, messages: list[dict]) -> None:
+        """Restores earlier turns ({"role": "user"|"agent", "text"}) before the call starts, so a call that was
+        reconnected after a failure continues the same conversation."""
+        for m in messages:
+            if m.get("text"):
+                self.history.append({"role": "assistant" if m["role"] == "agent" else "user", "content": m["text"]})
+
     async def inject_text(self, text: str) -> None:
         """A caller turn that arrived as text (keypad digits): interrupts the agent like speech would, then replies."""
         g = self._gen

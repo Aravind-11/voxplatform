@@ -44,6 +44,8 @@ class TwilioTransport:
         self._buf = np.zeros(0, dtype=np.int16)
         self._digits = ""
         self._dtmf_task: asyncio.Task | None = None
+        self.ended_by_us = False          # True once the agent (not the caller or the network) ended the call
+        self.before_end = None            # optional hook run before the stream is closed (records why, for call recovery)
 
     async def _send(self, obj: dict) -> None:
         async with self._send_lock:
@@ -87,7 +89,13 @@ class TwilioTransport:
             await self.session.inject_text(f"[The caller pressed these keypad digits: {digits}]")
 
     async def end(self) -> None:
-        """Hang up: closing the media stream with no further TwiML after <Connect> ends the call."""
+        """Hang up. The reason is recorded first, because Twilio asks the server what to do next the moment the stream
+        closes (see /twilio/resume): the server must already know this close is deliberate."""
+        self.ended_by_us = True
+        if self.before_end is not None:
+            r = self.before_end()
+            if asyncio.iscoroutine(r):
+                await r
         close = getattr(self.ws, "close", None)
         if close is not None:
             await close()

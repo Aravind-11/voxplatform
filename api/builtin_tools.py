@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from xml.sax.saxutils import escape
+from xml.sax.saxutils import escape, quoteattr
 
 from core.session import ToolResult
 from .http_tools import NAME_RE, ToolConfigError
@@ -26,7 +26,10 @@ def validate(defn: dict) -> dict:
         for n, num in targets.items():
             if not NAME_RE.match(str(n)) or not isinstance(num, str) or not E164.match(num):
                 raise ToolConfigError(f"transfer target {n!r}: name must be a word and number E.164 (+15551234567)")
-        return {"builtin": "transfer", "targets": dict(targets),
+        mode = str(defn.get("mode", "cold"))
+        if mode not in ("cold", "warm"):
+            raise ToolConfigError("transfer mode must be 'cold' or 'warm'")
+        return {"builtin": "transfer", "targets": dict(targets), "mode": mode,
                 "description": str(defn.get("description") or "Transfer the caller to a human. Tell them you are transferring first.")[:1000]}
     if kind == "leaveVoicemail":
         msg = str(defn.get("message") or "").strip()
@@ -124,8 +127,17 @@ def make(defn: dict, ctx, client):
                 return {"error": f"knowledge base {defn['corpus']!r} not found"}
             if cache.get("v") != version:
                 cache["v"], cache["idx"] = version, BM25(docs)
-            hits = cache["idx"].search(str((args or {}).get("query", "")), defn["topK"])
-            return {"results": hits} if hits else {"results": [], "note": "nothing relevant found; say you don't know"}
+            q, mode = str((args or {}).get("query", "")), "keyword"
+            hits = None
+            if getattr(ctx, "embedder", None) is not None:
+                try:
+                    from core.embed import hybrid_search
+                    hits, mode = await hybrid_search(cache["idx"], ctx.embedder, q, defn["topK"]), "hybrid"
+                except Exception:  # noqa: BLE001  (embedding server down: keyword search still answers)
+                    hits = None
+            if hits is None:
+                hits = cache["idx"].search(q, defn["topK"])
+            return {"results": hits, "mode": mode} if hits else {"results": [], "note": "nothing relevant found; say you don't know"}
         return query
     if kind == "client":
         async def client_tool(args: dict) -> Any:
@@ -147,11 +159,21 @@ def make(defn: dict, ctx, client):
         if not ctx.call_sid or not ctx.twilio or client is None:
             return {"error": "transfer is only available on phone calls with Twilio credentials configured"}
 
+        if defn.get("mode") == "warm":
+            if not ctx.base_url or not ctx.call_id:
+                return {"error": "warm transfer needs the public URL configured"}
+            # Warm: the person who picks up first hears a short summary of what the caller wanted (<Number url=...>),
+            # and if nobody answers the caller is returned to the agent (the <Dial action=...> callback).
+            twiml = (f'<Response><Dial timeout="25" action={quoteattr(f"{ctx.base_url}/twilio/transfer-result/{ctx.call_id}?to={to}")}>'
+                     f'<Number url={quoteattr(f"{ctx.base_url}/twilio/whisper/{ctx.call_id}")}>{escape(number)}</Number></Dial></Response>')
+        else:
+            twiml = f"<Response><Dial>{escape(number)}</Dial></Response>"
+
         async def do() -> None:
             r = await client.post(
                 f"https://api.twilio.com/2010-04-01/Accounts/{ctx.twilio['sid']}/Calls/{ctx.call_sid}.json",
                 auth=(ctx.twilio["sid"], ctx.twilio["token"]), timeout=10,
-                data={"Twiml": f"<Response><Dial>{escape(number)}</Dial></Response>"})
+                data={"Twiml": twiml})
             if r.status_code >= 300:
                 raise RuntimeError(f"twilio transfer failed: HTTP {r.status_code}")
         return ToolResult({"transferring": to}, after=do, strict=True)

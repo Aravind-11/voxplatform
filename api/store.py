@@ -43,7 +43,9 @@ CREATE INDEX IF NOT EXISTS docs_corpus ON docs(corpus_id);
 """
 
 # columns added after the first release: (table, column, type)
-MIGRATIONS = [("api_keys", "id", "TEXT"), ("api_keys", "revoked", "{REAL}"), ("tenants", "rate_per_minute", "{REAL}")]
+MIGRATIONS = [("api_keys", "id", "TEXT"), ("api_keys", "revoked", "{REAL}"), ("tenants", "rate_per_minute", "{REAL}"),
+              ("api_keys", "role", "TEXT"), ("tenants", "retention_days", "INTEGER")]
+ROLES = ("admin", "developer", "viewer")      # viewer: read only; developer: read + change agents/tools/calls; admin: also keys, audit, webhook, deletes
 
 
 def new_id(prefix: str) -> str:
@@ -70,6 +72,7 @@ class Store:
                     self._run(stmt)
             for table, col, typ in MIGRATIONS:
                 self._add_column(table, col, typ.format(REAL=real))
+            self._x("UPDATE api_keys SET role='admin' WHERE role IS NULL")      # keys from before roles existed keep full rights
             for r in self._all("SELECT key_hash FROM api_keys WHERE id IS NULL"):
                 self._x("UPDATE api_keys SET id=? WHERE key_hash=?", (new_id("key"), r["key_hash"]))
 
@@ -119,14 +122,15 @@ class Store:
                 (tid, name, None, None, concurrency_limit, time.time()))
         return tid
 
-    def add_key(self, tenant_id: str, key_hash: str, label: str = "") -> str:
+    def add_key(self, tenant_id: str, key_hash: str, label: str = "", role: str = "admin") -> str:
+        assert role in ROLES, role
         kid = new_id("key")
-        self._x("INSERT INTO api_keys(key_hash, tenant_id, label, created, id, revoked) VALUES(?,?,?,?,?,NULL)",
-                (key_hash, tenant_id, label, time.time(), kid))
+        self._x("INSERT INTO api_keys(key_hash, tenant_id, label, created, id, revoked, role) VALUES(?,?,?,?,?,NULL,?)",
+                (key_hash, tenant_id, label, time.time(), kid, role))
         return kid
 
     def tenant_by_key(self, key_hash: str) -> Optional[dict]:
-        return self._one("SELECT t.*, k.id AS key_id FROM tenants t JOIN api_keys k ON k.tenant_id=t.id "
+        return self._one("SELECT t.*, k.id AS key_id, k.role AS role FROM tenants t JOIN api_keys k ON k.tenant_id=t.id "
                          "WHERE k.key_hash=? AND k.revoked IS NULL", (key_hash,))
 
     def key_id_for_hash(self, key_hash: str) -> Optional[str]:
@@ -134,25 +138,36 @@ class Store:
         return r["id"] if r else None
 
     def list_keys(self, tenant_id: str) -> list[dict]:
-        return self._all("SELECT id, label, created, revoked FROM api_keys WHERE tenant_id=? ORDER BY created",
+        return self._all("SELECT id, label, created, revoked, role FROM api_keys WHERE tenant_id=? ORDER BY created",
                          (tenant_id,))
 
     def revoke_key(self, tenant_id: str, key_id: str) -> bool:
         return self._x("UPDATE api_keys SET revoked=? WHERE id=? AND tenant_id=? AND revoked IS NULL",
                        (time.time(), key_id, tenant_id)) > 0
 
-    def active_key_count(self, tenant_id: str) -> int:
-        return self._one("SELECT COUNT(*) AS n FROM api_keys WHERE tenant_id=? AND revoked IS NULL",
+    def active_admin_key_count(self, tenant_id: str) -> int:
+        return self._one("SELECT COUNT(*) AS n FROM api_keys WHERE tenant_id=? AND revoked IS NULL AND role='admin'",
                          (tenant_id,))["n"]
 
+    def list_tenants(self) -> list[dict]:
+        return self._all("SELECT * FROM tenants ORDER BY created")
+
+    def expired_calls(self, tenant_id: str, cutoff: float, limit: int = 1000) -> list[str]:
+        """Ids of ended calls whose end time is before `cutoff`."""
+        return [r["id"] for r in self._all(
+            "SELECT id FROM calls WHERE tenant_id=? AND status='ended' AND COALESCE(ended, created) < ? LIMIT ?",
+            (tenant_id, cutoff, limit))]
+
     def update_tenant(self, tenant_id: str, concurrency_limit: Optional[int] = None,
-                      rate_per_minute: Optional[float] = None) -> Optional[dict]:
+                      rate_per_minute: Optional[float] = None, retention_days: Optional[int] = None) -> Optional[dict]:
         if self.get_tenant(tenant_id) is None:
             return None
         if concurrency_limit is not None:
             self._x("UPDATE tenants SET concurrency_limit=? WHERE id=?", (concurrency_limit, tenant_id))
         if rate_per_minute is not None:
             self._x("UPDATE tenants SET rate_per_minute=? WHERE id=?", (rate_per_minute, tenant_id))
+        if retention_days is not None:              # 0 turns retention off for this tenant
+            self._x("UPDATE tenants SET retention_days=? WHERE id=?", (retention_days or None, tenant_id))
         return self.get_tenant(tenant_id)
 
     def delete_call(self, tenant_id: str, call_id: str) -> bool:

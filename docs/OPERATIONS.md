@@ -4,7 +4,8 @@
 with hidden input. Rotate tenant API keys from the dashboard (Keys) or `POST /v1/keys/{id}/rotate`; the old key stops at once.
 **Recording and consent**: recording is off unless an agent sets `record: true` and `VOX_RECORD_DIR` is set. Many places require
 telling callers a call is recorded (some require everyone's consent); put it in the agent's `greeting`. `DELETE /v1/calls/{id}`
-removes the call, transcript, recording and saved utterances. There is no automatic retention schedule: run a job that calls it.
+removes the call, transcript, recording and saved utterances. Retention: set `retentionDays` per tenant (`PATCH /admin/tenants/{id}`) or `VOX_RETENTION_DAYS` for all; ended calls older than that are erased hourly (`POST /admin/purge` runs it now). Live calls are never touched.
+**Roles**: create keys as admin, developer (agents, tools, calls) or viewer (read only) from the dashboard Keys tab; use viewer keys for dashboards and reporting.
 **Backups**: Postgres (`pg_dump`) or the SQLite file; recordings directory. Redis holds only call counters: losing it is harmless.
 **Monitoring**: `GET /metrics` with `Authorization: Bearer $VOX_METRICS_TOKEN`: `vox_active_calls`, `vox_calls_total`,
 `vox_first_audio_ms` (histogram), `vox_errors_total{where}`, `vox_tool_calls_total`. Suggested alerts: `vox_errors_total` rate > 0 for

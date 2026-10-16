@@ -1,48 +1,66 @@
-# voxplatform
+# Tools
 
-A self-hosted AI voice-agent platform on the open-source Ultravox stack: real-time speech-to-speech conversation with
-interruptions, phone calls (inbound and outbound), tools, knowledge bases, multi-tenant API, recordings, dashboard, Postgres/Redis
-scale-out. Open components only (docs/LICENSES.md); you run all of it.
+An agent's `tools` list holds names or definition objects. Created with `POST /v1/agents` (validated; bad
+definitions are rejected with HTTP 422 at creation, not mid-call) and overridable per call in `POST /v1/calls`.
 
-**Read docs/FINDINGS.md first**: what is proven, what is not, where it beats the paid service on cost and where it does not.
-docs/STATUS.md labels every component *verified*, *written* or *designed*.
-
-## Run it on a GPU box (about 10 minutes after the model is cached)
-```bash
-bash scripts/00_setup.sh                  # once per instance: venv + vLLM
-pip install -r requirements.txt           # in that venv
-tmux new -s serve; bash scripts/01_serve_vllm.sh        # wait for "Application startup complete", detach with Ctrl-b d
-bash scripts/deploy.sh                    # tunnel + API + tenant + agent; prints dashboard, demo and phone URLs
-# optional: TWILIO_ACCOUNT_SID=AC... VOX_TWILIO_NUMBER=+1... bash scripts/deploy.sh   (also points your number at the agent)
+## HTTP tool
+```json
+{"name": "lookup_order", "description": "Find an order by its number.",
+ "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]},
+ "http": {"url": "https://api.example.com/orders", "method": "POST",
+          "headers": {"Authorization": "Bearer sk-..."}, "timeoutS": 8},
+ "static": {"tenant": "acme"},
+ "automatic": ["callId", "from"]}
 ```
-Open the printed `/demo` URL to talk from a browser, `/dashboard` to manage agents, or call your number.
+- `parameters`: JSON Schema of what the **model** fills in (dynamic). Unknown arguments are dropped.
+- `static`: always sent, never shown to the model, and the model cannot override them.
+- `automatic`: platform-filled: `callId`, `from`, `to`, `callSid`.
+- The model sees only name, description and `parameters`. Header values are write-only: the API returns `***`.
+- POST/PUT/PATCH send JSON; GET sends query parameters. The response (text or JSON, max 4000 chars) goes back to
+  the model; HTTP errors and timeouts go back as `{"error": ...}` so the agent can say something sensible.
+- Response header `X-Vox-Response-Type: hang-up` (or `X-Ultravox-Response-Type`) ends the call after the agent speaks.
+- Tools never run for a reply that is later cancelled (speculative reply) — only after the turn is committed.
 
-## Run it with Docker (written, not yet run: see docs/STATUS.md)
-`cp deploy/env.example deploy/.env`, edit, then `docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build`.
-Kubernetes reference manifests: `deploy/k8s/`.
+## Confirm before acting (guards against mishearing)
+Add `"confirm": true` to an HTTP tool, or write a named tool as `{"tool": "book_slot", "confirm": true}`. The first
+call does not run the tool: the model gets the details and must read them back to the caller. The tool runs only
+on a second call with `confirmed: true`, the same details, made in a **later caller turn**; one confirmation
+authorizes one action, and changed details need a new confirmation. A misheard request becomes an audible
+"Tuesday at 11, correct?" the caller can fix, instead of a silent action. Limit: it relies on the model hearing a
+short yes/no correctly, which is far easier than hearing a day or a name.
 
-## Use the API (header `X-API-Key`)
-```bash
-curl -X POST $URL/v1/agents -H "X-API-Key: $KEY" -H 'content-type: application/json' -d '{
-  "name":"reception","greeting":"Hi, how can I help?","systemPrompt":"You are brief and friendly.",
-  "tools":["hangUp",{"builtin":"queryCorpus","corpus":"faq"}]}'
-curl -X POST $URL/v1/calls -H "X-API-Key: $KEY" -d '{"agentId":"agt_..."}'            # returns a WebSocket joinUrl
-curl -X POST $URL/v1/calls/outbound -H "X-API-Key: $KEY" -d '{"agentId":"agt_...","to":"+15551234567"}'
-```
-Endpoints: agents, calls (+ messages, recording, delete), outbound, keys, audit, tools library, corpora (knowledge bases), usage (+ CSV),
-voices, `/metrics`, `/healthz`, `/demo`, `/dashboard`. Tools: docs/TOOLS.md. Tuning: docs/TUNING.md. Operations: docs/OPERATIONS.md.
+## Built-ins
+- `"hangUp"` or `{"builtin": "hangUp", "strict": false}`: ends the call after the agent finishes speaking.
+  `strict: true` (default) hangs up even if the caller talks over the goodbye; `false` lets the caller keep the call.
+- `{"builtin": "transfer", "targets": {"billing": "+15551234567"}}`: the model picks a target **name**; it can never
+  dial a number of its own. Phone calls only; needs `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` on the server.
+  Implemented as a Twilio call redirect after the agent has said it is transferring (not SIP REFER; no warm transfer).
 
-## Test it (no GPU needed)
-```bash
-pip install -r requirements-dev.txt
-python -m pytest tests/unit                                     # 195 tests, ~20 s
-VOX_TEST_DB=postgresql://user@host/db python -m pytest tests/unit      # same suite on PostgreSQL
-python tests/e2e/browser_test.py                                # dashboard + demo in headless Chromium, fake model
-bash tests/e2e/deploy_dryrun.sh                                 # runs scripts/deploy.sh against stand-ins
-```
-On the GPU box: `bash scripts/05_verify.sh` (tool-calling and end-of-turn checks), `python tests/bringup/tts_procs.py` (TTS scaling).
+## Safety
+URLs must be http(s) and resolve to public addresses only (loopback, private, link-local and metadata addresses are
+refused; `VOX_TOOL_ALLOW_PRIVATE=1` lifts this for local tests). Redirects are not followed. Known gap: the address is
+checked just before the request, so DNS rebinding could race it; production should send tool traffic through an egress proxy.
 
-## Layout
-`core/` conversation engine (VAD, turn-taking, session, TTS, recorder, metrics, BM25) · `transports/` Twilio and browser ·
-`api/` HTTP/WebSocket API, store, tools, dashboard pages · `scripts/` GPU-box setup and deploy · `deploy/` Docker, compose, Kubernetes ·
-`tests/` unit, e2e, bring-up · `docs/` findings, status, licenses, tools, tuning, operations.
+## Versus the paid product (from Ultravox's public tool docs; details they do not document are marked ?)
+| | Ultravox Realtime | This platform |
+|---|---|---|
+| HTTP (server) tools | yes | yes (written, unit-tested; real-model check pending) |
+| Client tools (run in the caller's app via SDK) | yes | no |
+| Reusable tool library across agents | yes (durable tools) | no (definitions live in each agent) |
+| Dynamic / static / automatic parameters | yes (+ per-call overrides) | dynamic, static, automatic; no call-time overrides |
+| Per-call auth tokens | yes | no; credentials stored in the agent (write-only) |
+| Response-type control | hang-up, new-stage | hang-up only |
+| hangUp | yes | yes |
+| Call transfer | cold + warm over SIP | cold, via Twilio redirect, to configured targets only |
+| playDtmfSounds, leaveVoicemail, queryCorpus (RAG) | yes | no |
+| Tool timeouts / async tools | not documented ? | 0.5-30 s timeout per tool; no async tools |
+| Egress protection | not documented ? | SSRF guard, no redirects, truncation |
+
+## Added later
+- `{"builtin":"queryCorpus","corpus":"faq","topK":3}`: keyword (BM25) search over a knowledge base created with `POST /v1/corpora` and `POST /v1/corpora/{name}/documents`.
+- `"playDtmf"`: the agent presses keypad digits (phone menus, extensions). Keypad digits the caller presses arrive as a text turn: `[The caller pressed these keypad digits: 123]` (ends on `#` or after 2 s).
+- `{"builtin":"leaveVoicemail","message":"..."}`: speaks the message and hangs up; the agent calls it when it hears a voicemail greeting. For outbound calls, `voicemailMessage` also turns on Twilio answering-machine detection and plays the message automatically.
+- `{"builtin":"client","name":"open_page","description":"...","parameters":{...}}`: a function that runs in the caller's browser on `/demo`-style WebSocket calls. The server sends `{"type":"client_tool_invocation","id","name","args"}`; the page answers `{"type":"client_tool_result","id","result"}` (or `"error"`).
+- `{"library":"name"}`: use a tool stored once with `PUT /v1/tools/{name}`; edits apply to every agent that uses it at its next call.
+- `{"builtin":"transfer","mode":"warm","targets":{...}}`: the person who answers first hears a short summary of what the caller said; if nobody answers within 25 s the caller is returned to the agent with a note that the person was unavailable (it starts a fresh conversation). Needs the public URL and Twilio credentials.
+- Hybrid knowledge-base search: set `VOX_EMBED_URL` to an OpenAI-compatible embeddings server and `queryCorpus` fuses meaning-based and keyword results; without it, keyword only.

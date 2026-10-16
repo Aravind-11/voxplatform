@@ -64,6 +64,8 @@ class Runtime:
     eot_fn: Optional[Callable] = None
     clock: Callable[[], float] = lambda: time.monotonic() * 1000.0   # ms: Session/PlaybackTracker expect ms
     http: Optional[object] = None          # shared httpx.AsyncClient for tool calls and Twilio transfer
+    embedder: Optional[object] = None      # optional embeddings client for hybrid knowledge-base search
+    public_url: str = ""                   # set by create_app from Settings; used in Twilio callback URLs
     record_dir: str = ""                   # where recordings / the utterance dataset go; "" -> VOX_RECORD_DIR env
     live: dict = field(default_factory=dict)       # call_id -> (Session, transport): lets webhooks reach a live call
     recorders: dict = field(default_factory=dict)  # call_id -> CallRecorder
@@ -108,6 +110,7 @@ class Runtime:
                                   end=transport.end, twilio={"sid": sid, "token": token} if sid and token else None)
         tid = call["tenant_id"]
         ctx.docs = lambda name: self.store.corpus_docs(tid, name)
+        ctx.embedder, ctx.base_url = self.embedder, self.public_url
         ctx.send_dtmf = getattr(transport, "send_dtmf", None)
         ctx.client_call = getattr(transport, "client_call", None)
         specs = toolmod.resolve_library(cfg.get("tools", []),

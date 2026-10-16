@@ -130,13 +130,14 @@ const VIEWS = {
   },
   async Keys() {
     const keys = await api("/v1/keys"); const label = h("input", { placeholder: "label" }); const shown = h("div", { class: "ok" });
+    const role = h("select", {}, h("option", { value: "admin" }, "admin: everything"), h("option", { value: "developer" }, "developer: agents, tools, calls"), h("option", { value: "viewer" }, "viewer: read only"));
     const reveal = (r) => { shown.textContent = "New key (shown once): " + r.apiKey; };
-    main.append(h("div", { class: "card" }, h("div", { class: "row" }, label, h("button", { class: "b", on: { click: async () => { reveal(await api("/v1/keys", { method: "POST", body: JSON.stringify({ label: label.value }) })); } } }, "Create key")), shown));
+    main.append(h("div", { class: "card" }, h("div", { class: "row" }, label, role, h("button", { class: "b", on: { click: async () => { reveal(await api("/v1/keys", { method: "POST", body: JSON.stringify({ label: label.value, role: role.value }) })); setTimeout(render, 0); } } }, "Create key")), shown));
     const body = h("tbody");
-    for (const k of keys) body.append(h("tr", {}, h("td", {}, k.id), h("td", {}, k.label || ""), h("td", {}, when(k.created)), h("td", {}, k.revoked ? "revoked " + when(k.revoked) : (k.current ? "active (this browser)" : "active")),
+    for (const k of keys) body.append(h("tr", {}, h("td", {}, k.id), h("td", {}, k.label || ""), h("td", {}, k.role || "admin"), h("td", {}, when(k.created)), h("td", {}, k.revoked ? "revoked " + when(k.revoked) : (k.current ? "active (this browser)" : "active")),
       h("td", {}, k.revoked ? "" : [h("button", { class: "b g", on: { click: async () => { const r = await api("/v1/keys/" + k.id + "/rotate", { method: "POST" }); reveal(r); if (k.current) { $("key").value = r.apiKey; ss.set("vox_key", r.apiKey); } setTimeout(render, 0); } } }, "Rotate"), " ",
         h("button", { class: "b d", on: { click: async () => { try { await api("/v1/keys/" + k.id, { method: "DELETE" }); render(); } catch (e) { alert(e.message); } } } }, "Revoke")])));
-    main.append(h("div", { class: "card" }, h("table", {}, h("thead", {}, h("tr", {}, ["Id", "Label", "Created", "State", ""].map((x) => h("th", {}, x)))), body)));
+    main.append(h("div", { class: "card" }, h("table", {}, h("thead", {}, h("tr", {}, ["Id", "Label", "Role", "Created", "State", ""].map((x) => h("th", {}, x)))), body)));
   },
   async Audit() {
     const log = await api("/v1/audit?limit=200"); const body = h("tbody");

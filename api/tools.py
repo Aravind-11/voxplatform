@@ -63,6 +63,8 @@ class CallContext:
     send_dtmf: Optional[Callable[[str], Awaitable[None]]] = None    # press keypad digits on a phone call
     voicemail: Optional[Callable[[str], Awaitable[None]]] = None    # speak a message, then hang up
     client_call: Optional[Callable[..., Awaitable[Any]]] = None     # run a tool in the caller's browser
+    embedder: Any = None                                            # optional core.embed.OpenAIEmbedder (hybrid KB search)
+    base_url: str = ""                                              # public URL of this API (warm-transfer callbacks)
 
 
 def _canon(args: dict) -> str:

@@ -52,10 +52,11 @@ anything longer than a few minutes (no soak test, so no uptime claim).
 ## 3. What was built, and how far each part is proven
 Full per-component table: docs/STATUS.md. Summary:
 - **verified on the real stack**: real-time conversation, barge-in, a real inbound call, tool calling with audio input (18/20 correct tool and arguments; both misses were an un-called hangUp), transcription guard, load test.
-- **verified on CPU with real servers**: the entire unit suite (195 tests) also passes against a **real PostgreSQL 16**; the Redis cap against a **real Redis 7** (shared across two simulated nodes, crash expiry, 40 racing acquires never exceed the cap); dashboard and demo page in **real headless Chromium** with a fake microphone; the deploy script run for real against stand-ins.
+- **verified on CPU with real servers**: the entire unit suite (200+ tests) also passes against a **real PostgreSQL 16**; the Redis cap against a **real Redis 7** (shared across two simulated nodes, crash expiry, 40 racing acquires never exceed the cap); dashboard and demo page in **real headless Chromium** with a fake microphone; the deploy script run for real against stand-ins.
 - **written, unit-tested with mocks, not run for real**: outbound calls and voicemail detection (Twilio mocked, no real dial), DTMF in and out over a live line (tones verified by an independent decoder; not heard on a call), client tools in a real browser, recording alignment against real Twilio timing, Prometheus scraping, `VOX_NO_ESPEAK`.
 - **written, not run anywhere**: Dockerfile and compose (no Docker in the sandbox), Kubernetes manifests (no cluster).
-- **not built**: SIP trunking, warm transfer (cold transfer to configured numbers exists), voice cloning, SSO/roles, automatic data-retention schedules, invoicing beyond the usage CSV, an embedding-based knowledge base (BM25 keyword search only).
+- **written, mocked or toy-tested**: key roles, retention sweeps, warm transfer (Twilio mocked), hybrid embedding search (toy embedder; keyword fallback).
+- **not built**: SIP trunking (direct SIP needs a SIP/RTP stack and a carrier to test with), voice cloning (no commercially licensed cloning model verified; needs a consent flow), SSO login (API-key roles only), invoicing beyond the usage CSV.
 
 ## 4. Open problems, in order of importance
 1. **Real-speech accuracy.** Live calls produced mishearings ("I like to cooking", "Yogen", a Thursday request read as "phone", after which the agent booked Tuesday).

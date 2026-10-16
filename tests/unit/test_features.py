@@ -632,7 +632,7 @@ def test_rate_cost_csv_and_admin_patch():
     assert c.get("/v1/usage", headers=H(k)).json().get("cost") is None                    # no rate set: no cost claimed
     assert c.patch(f"/admin/tenants/{tid}", json={"ratePerMinute": 0.02}).status_code == 403
     r = c.patch(f"/admin/tenants/{tid}", json={"ratePerMinute": 0.02, "concurrencyLimit": 7}, headers={"X-Admin-Key": "adm"})
-    assert r.json() == {"tenantId": tid, "concurrencyLimit": 7, "ratePerMinute": 0.02}
+    assert r.json() == {"tenantId": tid, "concurrencyLimit": 7, "ratePerMinute": 0.02, "retentionDays": None}
     assert c.patch("/admin/tenants/tnt_nope", json={"ratePerMinute": 1}, headers={"X-Admin-Key": "adm"}).status_code == 404
     assert c.patch(f"/admin/tenants/{tid}", json={"ratePerMinute": -1}, headers={"X-Admin-Key": "adm"}).status_code == 422
     now = time.time()
@@ -693,3 +693,261 @@ def test_old_database_is_migrated_in_place(tmp_path):
     assert s.revoke_key("tnt_1", kid) and s.tenant_by_key(security.hash_key("vox_new")) is None
     s.close()
     assert Store(path).tenant_by_key(security.hash_key("vox_oldkey"))["key_id"] == t["key_id"]      # stable across restarts
+
+
+# ------------------------------------------------------------------ roles
+def test_viewer_developer_admin_roles():
+    c, store, _ = make()
+    admin, tid = tenant(c)
+    ha = H(admin)
+    dev = c.post("/v1/keys", json={"label": "ci", "role": "developer"}, headers=ha).json()
+    view = c.post("/v1/keys", json={"label": "ro", "role": "viewer"}, headers=ha).json()
+    assert dev["role"] == "developer" and c.post("/v1/keys", json={"role": "root"}, headers=ha).status_code == 422
+    hd, hv = H(dev["apiKey"]), H(view["apiKey"])
+    a = c.post("/v1/agents", json={"name": "a"}, headers=ha).json()
+    # viewer: can read, cannot change anything
+    assert c.get("/v1/agents", headers=hv).status_code == 200 and c.get("/v1/usage", headers=hv).status_code == 200
+    assert c.get("/v1/me", headers=hv).json()["role"] == "viewer"
+    for method, path, body in (("post", "/v1/agents", {"name": "x"}), ("patch", f"/v1/agents/{a['id']}", {"greeting": "x"}),
+                               ("delete", f"/v1/agents/{a['id']}", None), ("put", "/v1/tools/t", {"spec": "hangUp"}),
+                               ("post", "/v1/calls", {}), ("post", "/v1/corpora", {"name": "k"})):
+        r = getattr(c, method)(path, headers=hv, **({"json": body} if body is not None else {}))
+        assert r.status_code == 403 and "read-only" in r.text, (method, path, r.status_code)
+    # developer: changes agents and tools, but not keys, audit, webhook, or call deletion
+    assert c.post("/v1/agents", json={"name": "x"}, headers=hd).status_code == 200
+    assert c.put("/v1/tools/t", json={"spec": "hangUp"}, headers=hd).status_code == 200
+    call = store.create_call(tid, None, "webSocket", {})
+    store.update_call(call["id"], status="ended")
+    assert c.post("/v1/calls", json={}, headers=hd).status_code == 200
+    for method, path, body in (("get", "/v1/keys", None), ("post", "/v1/keys", {}), ("get", "/v1/audit", None),
+                               ("put", "/v1/webhook", {"url": "https://x.example/h"}), ("delete", f"/v1/calls/{call['id']}", None)):
+        r = getattr(c, method)(path, headers=hd, **({"json": body} if body is not None else {}))
+        assert r.status_code == 403 and "admin key is required" in r.text, (method, path, r.status_code)
+    assert c.get("/v1/keys", headers=ha).json()[1]["role"] == "developer"
+    # a viewer can still search a knowledge base (read-only operation)
+    c.post("/v1/corpora", json={"name": "k"}, headers=ha)
+    assert c.post("/v1/corpora/k/search", json={"query": "x"}, headers=hv).status_code == 200
+    # rotation keeps the role; the last ADMIN key cannot be revoked even if other keys exist
+    rot = c.post(f"/v1/keys/{dev['id']}/rotate", headers=ha).json()
+    assert c.get("/v1/agents", headers=H(rot["apiKey"])).status_code == 200
+    assert c.post("/v1/agents", json={"name": "z"}, headers=H(rot["apiKey"])).status_code == 200
+    assert c.post("/v1/keys", json={"role": "viewer"}, headers=H(rot["apiKey"])).status_code == 403
+    admin_id = c.get("/v1/keys", headers=ha).json()[0]["id"]
+    assert c.delete(f"/v1/keys/{admin_id}", headers=ha).status_code == 409
+    assert c.delete(f"/v1/keys/{view['id']}", headers=ha).status_code == 200            # revoking a viewer is fine
+
+
+def test_keys_from_before_roles_are_admins(tmp_path):
+    import sqlite3
+    from api import security
+    from api.store import Store
+    path = str(tmp_path / "o.db")
+    db = sqlite3.connect(path)
+    db.executescript("CREATE TABLE tenants(id TEXT PRIMARY KEY, name TEXT, webhook_url TEXT, webhook_secret TEXT, concurrency_limit INTEGER, created REAL);"
+                     "CREATE TABLE api_keys(key_hash TEXT PRIMARY KEY, tenant_id TEXT, label TEXT, created REAL, id TEXT, revoked REAL);")
+    db.execute("INSERT INTO tenants VALUES('t','n',NULL,NULL,NULL,1)")
+    db.execute("INSERT INTO api_keys VALUES(?, 't', '', 1, 'key_1', NULL)", (security.hash_key("vox_k"),))
+    db.commit()
+    db.close()
+    assert Store(path).tenant_by_key(security.hash_key("vox_k"))["role"] == "admin"
+
+
+# ------------------------------------------------------------------ retention
+def test_retention_purges_old_ended_calls_files_and_leaves_the_rest(tmp_path):
+    from api import retention
+    c, store, _ = make()
+    ka, ta = tenant(c, "a")
+    kb, tb = tenant(c, "b")
+    now = time.time()
+    day = 86400
+
+    def mk(tid, age_days, status="ended"):
+        call = store.create_call(tid, None, "webSocket", {})
+        store.update_call(call["id"], status=status, joined=now - age_days * day - 60, ended=now - age_days * day)
+        store.add_message(call["id"], "user", "hi", 1.0)
+        (tmp_path / f"{call['id']}.wav").write_bytes(b"RIFF")
+        (tmp_path / "utterances").mkdir(exist_ok=True)
+        (tmp_path / "utterances" / f"{call['id']}-001.wav").write_bytes(b"x")
+        return call["id"]
+    old_a, new_a, live_old_a, old_b = mk(ta, 40), mk(ta, 5), mk(ta, 40, "active"), mk(tb, 40)
+    store.update_tenant(ta, retention_days=30)                       # tenant a: 30 days; tenant b: no limit
+    out = retention.purge_expired(store, str(tmp_path))
+    assert out == {ta: 1}
+    assert store.get_call_any(old_a) is None and store.messages(old_a) == []
+    assert not (tmp_path / f"{old_a}.wav").exists() and not (tmp_path / "utterances" / f"{old_a}-001.wav").exists()
+    for kept in (new_a, live_old_a, old_b):                          # recent, still-live and no-retention-tenant calls survive
+        assert store.get_call_any(kept) is not None and (tmp_path / f"{kept}.wav").exists()
+    assert store.list_audit(ta)[0]["action"] == "retention.purge"
+    assert retention.purge_expired(store, str(tmp_path), default_days=10) == {tb: 1}      # b has no limit of its own: the default applies; a keeps its 30
+    assert store.get_call_any(old_b) is None and store.get_call_any(new_a) is not None      # server default (10 d) now applies to b
+    assert store.get_call_any(live_old_a) is not None
+
+
+def test_retention_via_admin_api(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOX_RECORD_DIR", str(tmp_path))
+    c, store, _ = make()
+    k, tid = tenant(c)
+    r = c.patch(f"/admin/tenants/{tid}", json={"retentionDays": 7}, headers={"X-Admin-Key": "adm"})
+    assert r.json()["retentionDays"] == 7 and c.get("/v1/me", headers=H(k)).json()["retentionDays"] == 7
+    call = store.create_call(tid, None, "webSocket", {})
+    store.update_call(call["id"], status="ended", ended=time.time() - 10 * 86400)
+    assert c.post("/admin/purge").status_code == 403
+    assert c.post("/admin/purge", headers={"X-Admin-Key": "adm"}).json() == {"erased": {tid: 1}}
+    assert store.get_call_any(call["id"]) is None
+    assert c.patch(f"/admin/tenants/{tid}", json={"retentionDays": 0}, headers={"X-Admin-Key": "adm"}).json()["retentionDays"] is None
+
+
+# ------------------------------------------------------------------ embedding / hybrid knowledge-base search
+class ConceptEmbedder:
+    """Toy embedder: words of the same concept share a dimension, standing in for a real model's semantics."""
+    CONCEPTS = [{"fee", "price", "priced", "cost", "dollars", "charge"}, {"doctor", "dentist", "physician", "appointment", "appointments"},
+                {"open", "hours", "monday", "friday", "weekdays"}]
+
+    def __init__(self):
+        self.calls = 0
+        self.min_sim = 0.0
+        self.fail = False
+
+    async def embed(self, texts):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("embedding server down")
+        return [[float(sum(w.strip(".,?") in c for w in t.lower().split())) for c in self.CONCEPTS] for t in texts]
+
+
+KB = [{"id": "p", "title": "Pricing", "text": "A dentist appointment is priced at 80 dollars."},
+      {"id": "h", "title": "Hours", "text": "We are open Monday to Friday."}]
+
+
+async def test_hybrid_search_finds_meaning_that_keywords_miss_and_falls_back():
+    from core.embed import hybrid_search
+    bm = BM25(KB)
+    q = "what is the fee for seeing the doctor"
+    assert bm.search(q, 1) == []                                              # no shared words: keywords alone find nothing
+    emb = ConceptEmbedder()
+    hits = await hybrid_search(bm, emb, q, 1)
+    assert hits[0]["title"] == "Pricing"
+    hits = await hybrid_search(bm, emb, "when are you open on weekdays", 2)
+    assert hits[0]["title"] == "Hours"
+    emb.fail = True
+    ctx = CallContext(docs=lambda n: ("1", KB), embedder=emb)
+    _, fns = toolmod.build([{"builtin": "queryCorpus", "corpus": "kb", "topK": 1}], ctx)
+    out = await fns["queryCorpus"]({"query": "what are your opening hours on Monday"})
+    assert out["mode"] == "keyword" and out["results"][0]["title"] == "Hours"       # embedder down: keyword search still answers
+    emb.fail = False
+    out = await fns["queryCorpus"]({"query": q})
+    assert out["mode"] == "hybrid" and out["results"][0]["title"] == "Pricing"
+
+
+async def test_openai_embedder_batches_and_caches():
+    from core.embed import OpenAIEmbedder
+    seen = []
+
+    class C:
+        async def post(self, url, **kw):
+            seen.append(kw["json"]["input"])
+            inputs = kw["json"]["input"]
+            return httpx.Response(200, json={"data": [{"index": i, "embedding": [float(len(t)), 1.0]} for i, t in reversed(list(enumerate(inputs)))]},
+                                  request=httpx.Request("POST", url))
+    e = OpenAIEmbedder("http://x/v1/", "m", C(), batch=2)
+    v = await e.embed(["a", "bb", "ccc", "a"])
+    assert v == [[1.0, 1.0], [2.0, 1.0], [3.0, 1.0], [1.0, 1.0]]                  # order restored, duplicates share one request slot
+    assert seen == [["a", "bb"], ["ccc"]]
+    await e.embed(["bb", "ccc"])
+    assert len(seen) == 2                                                          # served from the cache
+
+
+def test_corpus_search_endpoint_uses_embeddings_when_configured():
+    c, store, _ = make()
+    k, tid = tenant(c)
+    c.post("/v1/corpora", json={"name": "kb"}, headers=H(k))
+    for d in KB:
+        c.post("/v1/corpora/kb/documents", json={"title": d["title"], "text": d["text"]}, headers=H(k))
+    q = {"query": "what is the fee for seeing the doctor"}
+    r = c.post("/v1/corpora/kb/search", json=q, headers=H(k)).json()
+    assert r["mode"] == "keyword" and r["results"] == []
+    c.app.state.runtime.embedder = ConceptEmbedder()
+    r = c.post("/v1/corpora/kb/search", json=q, headers=H(k)).json()
+    assert r["mode"] == "hybrid" and r["results"][0]["title"] == "Pricing"
+    c.app.state.runtime.embedder.fail = True                                        # embedding server down: still answers
+    r = c.post("/v1/corpora/kb/search", json={"query": "opening hours monday"}, headers=H(k)).json()
+    assert r["mode"] == "keyword" and r["results"][0]["title"] == "Hours"
+
+
+# ------------------------------------------------------------------ warm transfer
+from api import security as _sec
+
+
+def _signed(c, path, form, base="https://vox.example.com", query=""):
+    url = base + path + (f"?{query}" if query else "")
+    return {"X-Twilio-Signature": _sec.twilio_signature("tok", url, form)}
+
+
+async def test_warm_transfer_tool_builds_dial_with_whisper_and_return_callbacks():
+    posted = {}
+
+    class Client:
+        async def post(self, url, **kw):
+            posted.update(url=url, data=kw["data"])
+            return httpx.Response(200, json={}, request=httpx.Request("POST", url))
+    ctx = CallContext(call_id="call_1", call_sid="CA9", twilio={"sid": "ACx", "token": "t"}, base_url="https://vox.example.com")
+    spec = {"builtin": "transfer", "mode": "warm", "targets": {"billing": "+15551230001"}}
+    schemas, fns = toolmod.build([spec], ctx, Client())
+    r = await fns["transfer"]({"to": "billing"})
+    assert posted == {}                                                       # nothing happens until the goodbye is spoken
+    await r.after()
+    tw = posted["data"]["Twiml"]
+    assert posted["url"].endswith("/Calls/CA9.json")
+    assert 'action="https://vox.example.com/twilio/transfer-result/call_1?to=billing"' in tw
+    assert '<Number url="https://vox.example.com/twilio/whisper/call_1">+15551230001</Number>' in tw and 'timeout="25"' in tw
+    ctx2 = CallContext(call_id="call_1", call_sid="CA9", twilio={"sid": "ACx", "token": "t"})   # no public URL known
+    _, f2 = toolmod.build([spec], ctx2, Client())
+    assert "public URL" in (await f2["transfer"]({"to": "billing"}))["error"]
+    _, f3 = toolmod.build([{**spec, "mode": "cold"}], ctx, Client())
+    r3 = await f3["transfer"]({"to": "billing"})
+    posted.clear()
+    await r3.after()
+    assert posted["data"]["Twiml"] == "<Response><Dial>+15551230001</Dial></Response>"           # cold transfer unchanged
+    with pytest.raises(toolmod.ToolConfigError):
+        toolmod.validate_specs([{**spec, "mode": "tepid"}])
+
+
+def test_warm_transfer_whisper_summarises_the_caller_safely_and_needs_a_signature():
+    c, store, _ = make()
+    k, tid = tenant(c)
+    call = store.create_call(tid, None, "twilio", {})
+    for text in ("first thing", "I want to cancel <Redirect>http://evil</Redirect> my plan", "[inaudible]"):
+        store.add_message(call["id"], "user", text, 1.0)
+    store.add_message(call["id"], "agent", "Sure, one moment.", 2.0)
+    path = f"/twilio/whisper/{call['id']}"
+    assert c.post(path, data={"CallSid": "CA1"}).status_code == 403
+    r = c.post(path, data={"CallSid": "CA1"}, headers=_signed(c, path, {"CallSid": "CA1"}))
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/xml")
+    assert "<Say>" in r.text and "cancel" in r.text and "first thing" in r.text and "Sure, one moment" not in r.text
+    assert "<Redirect>" not in r.text and "evil" in r.text                      # markup stripped; plain words only
+    empty = store.create_call(tid, None, "twilio", {})
+    p2 = f"/twilio/whisper/{empty['id']}"
+    assert "did not leave details" in c.post(p2, data={"A": "b"}, headers=_signed(c, p2, {"A": "b"})).text
+
+
+def test_warm_transfer_result_hangs_up_when_answered_and_returns_the_caller_to_the_agent_otherwise():
+    c, store, _ = make()
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a", "systemPrompt": "Be brief.", "greeting": "Hello!"}, headers=H(k)).json()
+    call = store.create_call(tid, a["id"], "twilio", a["config"], {"from": "+1555", "to": "+1666"})
+    path, q = f"/twilio/transfer-result/{call['id']}", "to=billing"
+    done = {"DialCallStatus": "completed"}
+    assert c.post(f"{path}?{q}", data=done).status_code == 403
+    r = c.post(f"{path}?{q}", data=done, headers=_signed(c, path, done, query=q))
+    assert "<Hangup/>" in r.text and "<Stream" not in r.text
+    miss = {"DialCallStatus": "no-answer"}
+    r = c.post(f"{path}?{q}", data=miss, headers=_signed(c, path, miss, query=q))
+    assert "<Connect>" in r.text and "wss://vox.example.com/ws/twilio/" in r.text
+    resumed = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == call["id"]]
+    assert len(resumed) == 1 and resumed[0]["medium"] == "twilio"
+    cfg = resumed[0]["config"]
+    assert "billing is not available" in cfg["greeting"] and "Be brief." in cfg["systemPrompt"] and "billing" in cfg["systemPrompt"]
+    evil = {"DialCallStatus": "busy"}
+    q2 = "to=" + "x%3Cscript%3E"
+    r = c.post(f"{path}?{q2}", data=evil, headers=_signed(c, path, evil, query=q2))
+    assert "<script>" not in r.text and "<script>" not in store.list_calls(tid)[0]["config"]["greeting"]

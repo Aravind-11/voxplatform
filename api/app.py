@@ -20,8 +20,9 @@ from core.tts import VOICES
 from transports.browser import BrowserTransport
 from transports.twilio import TwilioTransport
 from . import security, tools as toolmod
+from . import retention
 from .runtime import Runtime
-from .store import Store
+from .store import ROLES, Store
 
 
 @dataclass
@@ -35,6 +36,7 @@ class Settings:
     twilio_number: str = ""            # default caller id for outbound calls (a number you own on Twilio)
     metrics_token: str = ""            # bearer token for /metrics (the admin key also works)
     record_dir: str = ""
+    retention_default_days: int = 0    # 0 = keep forever unless the tenant sets retention_days
     outbound_per_day: int = 50         # per-tenant cap on outbound calls in 24 h
     outbound_prefixes: tuple = ()      # e.g. ("+1",) restricts dialing to these country prefixes; empty = any
     static_dir: str = os.path.join(os.path.dirname(__file__), "static")
@@ -86,6 +88,7 @@ class ToolIn(BaseModel):
 
 class KeyIn(BaseModel):
     label: str = ""
+    role: str = "admin"                 # admin | developer | viewer
 
 
 class CorpusIn(BaseModel):
@@ -105,11 +108,13 @@ class TenantIn(BaseModel):
     name: str
     concurrencyLimit: Optional[int] = None
     ratePerMinute: Optional[float] = Field(None, ge=0, le=1000)       # your internal/chargeback rate, used by /v1/usage
+    retentionDays: Optional[int] = Field(None, ge=0, le=3650)
 
 
 class TenantPatch(BaseModel):
     concurrencyLimit: Optional[int] = Field(None, ge=1, le=100_000)
     ratePerMinute: Optional[float] = Field(None, ge=0, le=1000)
+    retentionDays: Optional[int] = Field(None, ge=0, le=3650)         # erase ended calls older than this; 0 = off
 
 
 class _TwilioWS:
@@ -177,7 +182,9 @@ class _Reject(Exception):
 def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimiter,
                dispatcher: Optional[security.WebhookDispatcher], settings: Settings) -> FastAPI:
     app = FastAPI(title="voxplatform")
-    app.state.store, app.state.limiter = store, limiter
+    if not getattr(runtime, "public_url", ""):
+        runtime.public_url = settings.public_base_url
+    app.state.store, app.state.limiter, app.state.runtime = store, limiter, runtime
     METRICS.gauge("vox_active_calls", limiter.total_active)
 
     @app.on_event("startup")
@@ -185,11 +192,31 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if hasattr(limiter, "heartbeat"):             # Redis limiter: keep this node's calls alive
             import asyncio
             app.state.heartbeat = asyncio.create_task(limiter.heartbeat())
+        import asyncio
+        async def sweep():
+            while True:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(None, lambda: retention.purge_expired(
+                        store, settings.record_dir or os.environ.get("VOX_RECORD_DIR", ""), settings.retention_default_days or None))
+                except Exception:  # noqa: BLE001  (try again next hour)
+                    METRICS.inc("vox_errors_total", where="retention")
+                await asyncio.sleep(3600)
+        app.state.retention = asyncio.create_task(sweep())
 
     def tenant(x_api_key: str = Header(default="")) -> dict:
         t = store.tenant_by_key(security.hash_key(x_api_key)) if x_api_key else None
         if not t:
             raise HTTPException(401, "invalid or missing API key")
+        return t
+
+    def tenant_write(t: dict = Depends(tenant)) -> dict:
+        if t.get("role") == "viewer":
+            raise HTTPException(403, "this API key is read-only (role: viewer)")
+        return t
+
+    def tenant_admin(t: dict = Depends(tenant)) -> dict:
+        if t.get("role") not in (None, "admin"):
+            raise HTTPException(403, f"this API key cannot do that (role: {t.get('role')}); an admin key is required")
         return t
 
     def check_tools(specs, tenant_id: str) -> None:
@@ -257,6 +284,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         tid = store.create_tenant(body.name, body.concurrencyLimit)
         if body.ratePerMinute is not None:
             store.update_tenant(tid, rate_per_minute=body.ratePerMinute)
+        if body.retentionDays is not None:
+            store.update_tenant(tid, retention_days=body.retentionDays)
         key = security.generate_key()
         store.add_key(tid, security.hash_key(key), "initial")
         return {"tenantId": tid, "apiKey": key}   # key is shown once; only its hash is stored
@@ -264,20 +293,28 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     @app.patch("/admin/tenants/{tenant_id}")
     async def patch_tenant(tenant_id: str, body: TenantPatch, x_admin_key: str = Header(default="")):
         admin_only(x_admin_key)
-        t = store.update_tenant(tenant_id, body.concurrencyLimit, body.ratePerMinute)
+        t = store.update_tenant(tenant_id, body.concurrencyLimit, body.ratePerMinute, body.retentionDays)
         if not t:
             raise HTTPException(404, "tenant not found")
-        return {"tenantId": tenant_id, "concurrencyLimit": t["concurrency_limit"], "ratePerMinute": t.get("rate_per_minute")}
+        return {"tenantId": tenant_id, "concurrencyLimit": t["concurrency_limit"], "ratePerMinute": t.get("rate_per_minute"),
+                "retentionDays": t.get("retention_days")}
+
+    @app.post("/admin/purge")
+    async def purge(x_admin_key: str = Header(default="")):
+        """Runs the retention purge now (the API also runs it hourly). Handy for cron or after changing a limit."""
+        admin_only(x_admin_key)
+        return {"erased": retention.purge_expired(store, settings.record_dir or os.environ.get("VOX_RETENTION_DIR", os.environ.get("VOX_RECORD_DIR", "")),
+                                                  settings.retention_default_days or None)}
 
     @app.put("/v1/webhook")
-    async def set_webhook(body: WebhookIn, t: dict = Depends(tenant)):
+    async def set_webhook(body: WebhookIn, t: dict = Depends(tenant_admin)):
         secret = security.generate_key()
         store.set_webhook(t["id"], body.url, secret)
         return {"url": body.url, "secret": secret}
 
     # ------------------------------------------------------------ agents
     @app.post("/v1/agents")
-    async def create_agent(body: AgentIn, t: dict = Depends(tenant)):
+    async def create_agent(body: AgentIn, t: dict = Depends(tenant_write)):
         check_tools(body.tools, t["id"])
         check_voice(body.voice)
         a = store.create_agent(t["id"], body.name, body.model_dump(exclude={"name"}))
@@ -285,7 +322,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return redacted(a)
 
     @app.patch("/v1/agents/{agent_id}")
-    async def update_agent(agent_id: str, body: AgentPatch, t: dict = Depends(tenant)):
+    async def update_agent(agent_id: str, body: AgentPatch, t: dict = Depends(tenant_write)):
         """Change an agent in place (same id, so a phone number's webhook keeps working). Only given fields change."""
         cur = store.get_agent(t["id"], agent_id)
         if not cur:
@@ -304,7 +341,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return redacted(store.update_agent(t["id"], agent_id, body.name, cfg))
 
     @app.delete("/v1/agents/{agent_id}")
-    async def delete_agent(agent_id: str, t: dict = Depends(tenant)):
+    async def delete_agent(agent_id: str, t: dict = Depends(tenant_write)):
         if not store.delete_agent(t["id"], agent_id):
             raise HTTPException(404, "agent not found")
         log(t, "agent.delete", agent_id)
@@ -316,7 +353,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     # ------------------------------------------------------------- calls
     @app.post("/v1/calls")
-    async def create_call(body: CallIn, t: dict = Depends(tenant)):
+    async def create_call(body: CallIn, t: dict = Depends(tenant_write)):
         base: dict = {}
         if body.agentId:
             agent = store.get_agent(t["id"], body.agentId)
@@ -346,20 +383,14 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return public_call(c)
 
     @app.delete("/v1/calls/{call_id}")
-    async def delete_call(call_id: str, t: dict = Depends(tenant)):
+    async def delete_call(call_id: str, t: dict = Depends(tenant_admin)):
         """Erases a call: its record, transcript and recording file (for deletion requests and retention policies)."""
         c = store.get_call(t["id"], call_id)
         if not c:
             raise HTTPException(404, "call not found")
         if c["status"] == "active":
             raise HTTPException(409, "call is still active")
-        d = settings.record_dir or os.environ.get("VOX_RECORD_DIR", "")
-        if d:
-            for p in (os.path.join(d, f"{call_id}.wav"),) + tuple(
-                    os.path.join(d, "utterances", f) for f in (os.listdir(os.path.join(d, "utterances")) if os.path.isdir(os.path.join(d, "utterances")) else [])
-                    if f.startswith(call_id + "-")):
-                if os.path.isfile(p):
-                    os.remove(p)
+        retention.delete_call_files(settings.record_dir or os.environ.get("VOX_RECORD_DIR", ""), call_id)
         store.delete_call(t["id"], call_id)
         log(t, "call.delete", call_id)
         return {"deleted": call_id}
@@ -391,7 +422,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     @app.get("/v1/me")
     async def me(t: dict = Depends(tenant)):
-        return {"tenantId": t["id"], "name": t["name"], "keyId": t.get("key_id"),
+        return {"tenantId": t["id"], "name": t["name"], "keyId": t.get("key_id"), "role": t.get("role") or "admin",
+                "retentionDays": t.get("retention_days") or settings.retention_default_days or None,
                 "concurrencyLimit": t["concurrency_limit"] or settings.default_concurrency}
 
     @app.get("/v1/voices")
@@ -412,38 +444,43 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     # ------------------------------------------------------------- keys
     @app.get("/v1/keys")
-    async def list_keys(t: dict = Depends(tenant)):
+    async def list_keys(t: dict = Depends(tenant_admin)):
         return [{**k, "current": k["id"] == t.get("key_id")} for k in store.list_keys(t["id"])]
 
     @app.post("/v1/keys")
-    async def create_key(body: KeyIn, t: dict = Depends(tenant)):
+    async def create_key(body: KeyIn, t: dict = Depends(tenant_admin)):
+        if body.role not in ROLES:
+            raise HTTPException(422, f"role must be one of {list(ROLES)}")
         key = security.generate_key()
-        kid = store.add_key(t["id"], security.hash_key(key), body.label[:100])
-        log(t, "key.create", kid, label=body.label[:100])
-        return {"id": kid, "apiKey": key}            # shown once; only the hash is stored
+        kid = store.add_key(t["id"], security.hash_key(key), body.label[:100], body.role)
+        log(t, "key.create", kid, label=body.label[:100], role=body.role)
+        return {"id": kid, "apiKey": key, "role": body.role}            # shown once; only the hash is stored
 
     @app.delete("/v1/keys/{key_id}")
-    async def revoke_key(key_id: str, t: dict = Depends(tenant)):
-        if store.active_key_count(t["id"]) <= 1:
-            raise HTTPException(409, "cannot revoke the last active key; create another first")
+    async def revoke_key(key_id: str, t: dict = Depends(tenant_admin)):
+        target = next((k for k in store.list_keys(t["id"]) if k["id"] == key_id and k["revoked"] is None), None)
+        if target is None:
+            raise HTTPException(404, "key not found or already revoked")
+        if target["role"] in (None, "admin") and store.active_admin_key_count(t["id"]) <= 1:
+            raise HTTPException(409, "cannot revoke the last active admin key; create another first")
         if not store.revoke_key(t["id"], key_id):
             raise HTTPException(404, "key not found or already revoked")
         log(t, "key.revoke", key_id)
         return {"revoked": key_id}
 
     @app.post("/v1/keys/{key_id}/rotate")
-    async def rotate_key(key_id: str, t: dict = Depends(tenant)):
+    async def rotate_key(key_id: str, t: dict = Depends(tenant_admin)):
         old = next((k for k in store.list_keys(t["id"]) if k["id"] == key_id and k["revoked"] is None), None)
         if not old:
             raise HTTPException(404, "key not found or already revoked")
         key = security.generate_key()
-        kid = store.add_key(t["id"], security.hash_key(key), old["label"])
+        kid = store.add_key(t["id"], security.hash_key(key), old["label"], old["role"] or "admin")
         store.revoke_key(t["id"], key_id)
         log(t, "key.rotate", key_id, newId=kid)
         return {"id": kid, "apiKey": key, "revoked": key_id}
 
     @app.get("/v1/audit")
-    async def audit(limit: int = 100, before: Optional[int] = None, t: dict = Depends(tenant)):
+    async def audit(limit: int = 100, before: Optional[int] = None, t: dict = Depends(tenant_admin)):
         return store.list_audit(t["id"], limit, before)
 
     # ------------------------------------------------------ tool library
@@ -461,7 +498,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return spec
 
     @app.put("/v1/tools/{name}")
-    async def put_tool(name: str, body: ToolIn, t: dict = Depends(tenant)):
+    async def put_tool(name: str, body: ToolIn, t: dict = Depends(tenant_write)):
         spec = lib_validate(name, body.spec)
         if len(store.list_tools(t["id"])) >= 200 and not store.get_tool(t["id"], name):
             raise HTTPException(409, "tool library is full (200)")
@@ -481,7 +518,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return {"name": name, "spec": toolmod.redact_specs([x["spec"]])[0]}
 
     @app.delete("/v1/tools/{name}")
-    async def delete_tool(name: str, t: dict = Depends(tenant)):
+    async def delete_tool(name: str, t: dict = Depends(tenant_write)):
         users = [a["name"] for a in store.list_agents(t["id"])
                  if any(isinstance(s, dict) and s.get("library") == name for s in a["config"].get("tools", []))]
         if users:
@@ -499,7 +536,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return c
 
     @app.post("/v1/corpora")
-    async def create_corpus(body: CorpusIn, t: dict = Depends(tenant)):
+    async def create_corpus(body: CorpusIn, t: dict = Depends(tenant_write)):
         if not toolmod.http_tools.NAME_RE.match(body.name):
             raise HTTPException(422, "name must match [A-Za-z_][A-Za-z0-9_-]{0,63}")
         c = store.create_corpus(t["id"], body.name)
@@ -513,14 +550,14 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return store.list_corpora(t["id"])
 
     @app.delete("/v1/corpora/{name}")
-    async def delete_corpus(name: str, t: dict = Depends(tenant)):
+    async def delete_corpus(name: str, t: dict = Depends(tenant_write)):
         if not store.delete_corpus(t["id"], name):
             raise HTTPException(404, "knowledge base not found")
         log(t, "corpus.delete", name)
         return {"deleted": name}
 
     @app.post("/v1/corpora/{name}/documents")
-    async def add_doc(name: str, body: DocIn, t: dict = Depends(tenant)):
+    async def add_doc(name: str, body: DocIn, t: dict = Depends(tenant_write)):
         c = corpus_or_404(t, name)
         if len(store.list_docs(t["id"], c["id"])) >= 1000:
             raise HTTPException(409, "knowledge base is full (1000 documents)")
@@ -533,7 +570,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return store.list_docs(t["id"], corpus_or_404(t, name)["id"])
 
     @app.delete("/v1/corpora/{name}/documents/{doc_id}")
-    async def delete_doc(name: str, doc_id: str, t: dict = Depends(tenant)):
+    async def delete_doc(name: str, doc_id: str, t: dict = Depends(tenant_write)):
         if not store.delete_doc(t["id"], corpus_or_404(t, name)["id"], doc_id):
             raise HTTPException(404, "document not found")
         log(t, "doc.delete", f"{name}/{doc_id}")
@@ -543,9 +580,16 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     async def search_corpus(name: str, body: dict, t: dict = Depends(tenant)):
         """Try a knowledge base without a call: {"query": "...", "topK": 3}."""
         from core.bm25 import BM25
+        from core.embed import hybrid_search
         corpus_or_404(t, name)
         _, docs = store.corpus_docs(t["id"], name)
-        return {"results": BM25(docs).search(str(body.get("query", "")), int(body.get("topK", 3)))}
+        bm, q, k = BM25(docs), str(body.get("query", "")), int(body.get("topK", 3))
+        if getattr(runtime, "embedder", None) is not None:
+            try:
+                return {"results": await hybrid_search(bm, runtime.embedder, q, k), "mode": "hybrid"}
+            except Exception:  # noqa: BLE001
+                pass
+        return {"results": bm.search(q, k), "mode": "keyword"}
 
     # ----------------------------------------------------- ops endpoints
     @app.get("/metrics")
@@ -628,6 +672,13 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             finish(call, t, reason)
 
     # ---------------------------------------------------------- telephony
+    def stream_twiml(call: dict) -> str:
+        ws = settings.public_base_url.replace("http", "ws", 1)
+        return ('<?xml version="1.0" encoding="UTF-8"?><Response><Connect>'
+                f'<Stream url={quoteattr(f"{ws}/ws/twilio/{call["id"]}")}>'
+                f'<Parameter name="token" value={quoteattr(call["join_token"])}/>'
+                '</Stream></Connect></Response>')
+
     @app.post("/twilio/voice/{agent_id}")
     async def twilio_voice(agent_id: str, request: Request):
         form = {k: str(v) for k, v in (await request.form()).items()}
@@ -646,12 +697,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         call = store.create_call(agent["tenant_id"], agent_id, "twilio", agent["config"],
                                  {"from": form.get("From", ""), "to": form.get("To", ""),
                                   "callSid": form.get("CallSid", "")})
-        ws = settings.public_base_url.replace("http", "ws", 1)
-        twiml = ('<?xml version="1.0" encoding="UTF-8"?><Response><Connect>'
-                 f'<Stream url={quoteattr(f"{ws}/ws/twilio/{call["id"]}")}>'
-                 f'<Parameter name="token" value={quoteattr(call["join_token"])}/>'
-                 '</Stream></Connect></Response>')
-        return Response(twiml, media_type="text/xml")
+        return Response(stream_twiml(call), media_type="text/xml")
 
     @app.websocket("/ws/twilio/{call_id}")
     async def ws_twilio(ws: WebSocket, call_id: str):
@@ -687,7 +733,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             raise HTTPException(403, "bad twilio signature")
 
     @app.post("/v1/calls/outbound")
-    async def outbound(body: OutboundIn, t: dict = Depends(tenant)):
+    async def outbound(body: OutboundIn, t: dict = Depends(tenant_write)):
         """Places a phone call through your Twilio account and connects the answered call to the agent."""
         if app.state.draining:
             raise HTTPException(503, "node is draining")
@@ -758,6 +804,41 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if call["status"] == "created" and status in ("busy", "failed", "no-answer", "canceled", "completed"):
             store.update_call(call_id, status="ended", ended=time.time(), end_reason=status)   # never answered / never connected
         return {"ok": True}
+
+    @app.post("/twilio/whisper/{call_id}")
+    async def twilio_whisper(call_id: str, request: Request):
+        """Played only to the person who answers a warm transfer, before they are connected to the caller."""
+        form = {k: str(v) for k, v in (await request.form()).items()}
+        twilio_check(request, form)
+        if not store.get_call_any(call_id):
+            raise HTTPException(404, "call not found")
+        said = [m["text"] for m in store.messages(call_id) if m["role"] == "user" and m["text"] != "[inaudible]"][-2:]
+        clean = lambda x: re.sub(r"[^\w\s.,?!'-]", "", x)[:160]  # noqa: E731
+        summary = " Then they said: ".join(clean(x) for x in said) or "They did not leave details"
+        from xml.sax.saxutils import escape as xesc
+        return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Say>'
+                        f'Incoming transfer from the voice assistant. The caller said: {xesc(summary)}. Connecting you now.'
+                        '</Say></Response>', media_type="text/xml")
+
+    @app.post("/twilio/transfer-result/{call_id}")
+    async def twilio_transfer_result(call_id: str, request: Request, to: str = ""):
+        """Twilio's <Dial action>: hang up when the human talked and finished; if nobody answered, bring the agent back."""
+        form = {k: str(v) for k, v in (await request.form()).items()}
+        twilio_check(request, form)
+        call = store.get_call_any(call_id)
+        if not call:
+            raise HTTPException(404, "call not found")
+        if form.get("DialCallStatus", "") == "completed":
+            return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>', media_type="text/xml")
+        if app.state.draining:
+            return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we cannot take your call right now.</Say><Hangup/></Response>', media_type="text/xml")
+        who = re.sub(r"[^\w -]", "", to)[:40] or "that person"
+        cfg = dict(call["config"])
+        cfg["greeting"] = f"Sorry, {who} is not available right now. Is there anything else I can help you with?"
+        cfg["systemPrompt"] = (cfg.get("systemPrompt") or "") + f"\nThe caller asked to be transferred to {who}, who did not answer. Offer to help or to take a message."
+        meta = {**call["metadata"], "resumedFrom": call_id}
+        resumed = store.create_call(call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
+        return Response(stream_twiml(resumed), media_type="text/xml")
 
     @app.post("/twilio/amd/{call_id}")
     async def twilio_amd(call_id: str, request: Request):

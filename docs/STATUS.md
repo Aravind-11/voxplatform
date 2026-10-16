@@ -30,7 +30,7 @@ Legend: **verified** = executed with the stated result; **written** = code + uni
 | Agent greets first (`greeting` on the agent or per call; fixed text, no model call, interruptible) | written | unit tests incl. barge-in over the greeting and history trimming; not yet heard on a real call |
 | Real-call finding: model misheard a spoken request and acted on it | **open problem, mitigated** | live call: caller asked about Thursday; transcript read 'Or better yet, phone.'; the model then booked Tuesday 11:00 unprompted. Earlier calls: 'I like to cooking', 'Yogen'. The synthetic test (0.3% WER) does not represent this speaker/line. Mitigation: `confirm` tools (read back + yes in a later turn), unit-tested, not yet tried live. Real fix needs measurement on recorded human speech |
 | UltraVAD | not used | page states no license; own reported accuracy 77.5% / precision 69.6% |
-| Postgres store | **verified** (CPU, real server) | the full unit suite (195 tests) passes against PostgreSQL 16; SQLite databases from the first release migrate in place (tested) |
+| Postgres store | **verified** (CPU, real server) | the full unit suite (205 tests) passes against PostgreSQL 16; SQLite databases from the first release migrate in place (tested) |
 | Redis call cap shared by API nodes | **verified** (CPU, real Redis 7) | two limiter instances share one cap; a crashed node's calls expire (TTL), live nodes refresh; 40 racing acquires never exceed the cap. Not run behind a real multi-node load balancer |
 | Drain mode (`/admin/drain`, readiness 503, preStop hook) | written | unit-tested, including the hook's wait loop; not run in a cluster |
 | Account features: API key create/revoke/rotate (last-key protection), audit log, per-tenant isolation | written | unit-tested incl. cross-tenant attempts; on SQLite and Postgres |
@@ -47,7 +47,11 @@ Legend: **verified** = executed with the stated result; **written** = code + uni
 | `scripts/deploy.sh` (tunnel, API, tenant, agent, optional Twilio webhook via REST) | **verified** (stand-ins) | run for real against stubbed vLLM/cloudflared/model; the output and created agent were checked. Not yet run on the GPU box |
 | Docker image, docker-compose stack, Kubernetes manifests | written, not run | no Docker or cluster available when written; YAML parses |
 | License audit | done | docs/LICENSES.md; espeak-ng (GPL-3.0) flagged, `VOX_NO_ESPEAK=1` written, not yet run on the GPU |
-| SIP trunks, warm transfer, voice cloning, SSO/roles, retention schedules, embeddings search | **not built** | see docs/FINDINGS.md |
+| Roles on API keys (admin / developer / viewer), last-admin protection | written | unit-tested, every mutating endpoint checked for viewer and developer; keys from before roles become admins (migration tested) |
+| Data retention (per-tenant days or server default, hourly sweep, `POST /admin/purge`) | written | unit-tested incl. files, live calls untouched; the hourly background task itself has not run for hours |
+| Warm transfer (summary whispered to whoever answers; caller returned to the agent if nobody does) | written | Twilio mocked; TwiML and callbacks unit-tested incl. signature and markup stripping; not tried on a real call. The returned agent starts a fresh conversation (earlier history is not carried over) |
+| Embedding (hybrid) knowledge-base search | written | fused with BM25, falls back to keywords if the embedding server is down; tested with a toy embedder only. `scripts/01b_serve_embed.sh` is written, not run (vLLM flag differs by version); no real model, no retrieval-quality measurement |
+| SIP trunks, voice cloning, SSO login | **not built** | SIP: with Twilio, a SIP domain pointed at the voice webhook may already work (untested); direct SIP needs a SIP/RTP stack and a carrier to test with. Cloning: Kokoro cannot clone, and no commercially licensed cloning model was verified. SSO: only API-key roles exist |
 
 ## Harness numbers with fake models (platform overhead only, NOT model latency)
 Fake LLM 50 ms, fake TTS ~10 ms, localhost, 20 concurrent callers: response p50 652 ms / p95 657 ms;

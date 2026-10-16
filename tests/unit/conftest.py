@@ -18,7 +18,8 @@ def _postgres_if_configured(monkeypatch):
 
     def init(self, path=":memory:"):
         orig(self, url if path == ":memory:" else path)
-        for t in TABLES:
-            self._x(f"TRUNCATE {t} RESTART IDENTITY")
+        if self.pg:                                   # tests that open their own SQLite file keep it untouched
+            for t in TABLES:
+                self._x(f"TRUNCATE {t} RESTART IDENTITY")
     monkeypatch.setattr(st.Store, "__init__", init)
     yield

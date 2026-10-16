@@ -1,0 +1,158 @@
+# Kubernetes reference manifests. WRITTEN, NOT APPLIED to any cluster (none was available). Validate with
+#   kubectl apply --dry-run=server -f deploy/k8s/voxplatform.yaml
+# Assumes: NVIDIA device plugin with time-slicing (replicas: 2) so the vLLM and API containers can each request a GPU
+# on the same card; ingress-nginx; cert-manager issuer "letsencrypt"; prometheus-adapter for the HPA metric.
+# In production prefer managed Postgres and Redis over the minimal ones below.
+apiVersion: v1
+kind: Namespace
+metadata: { name: voxplatform }
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: vox-secrets, namespace: voxplatform }
+type: Opaque
+stringData:                       # replace, or create from your secret manager; do not commit real values
+  POSTGRES_PASSWORD: change-me
+  VOX_ADMIN_KEY: change-me-long-random
+  VOX_METRICS_TOKEN: change-me-long-random
+  TWILIO_AUTH_TOKEN: ""
+  TWILIO_ACCOUNT_SID: ""
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: postgres, namespace: voxplatform }
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - { name: POSTGRES_USER, value: vox }
+            - { name: POSTGRES_DB, value: vox }
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: vox-secrets, key: POSTGRES_PASSWORD } } }
+          ports: [ { containerPort: 5432 } ]
+          readinessProbe: { exec: { command: [ "pg_isready", "-U", "vox" ] }, periodSeconds: 5 }
+          volumeMounts: [ { name: data, mountPath: /var/lib/postgresql/data, subPath: pg } ]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ ReadWriteOnce ], resources: { requests: { storage: 20Gi } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres, namespace: voxplatform }
+spec: { selector: { app: postgres }, ports: [ { port: 5432 } ] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: redis, namespace: voxplatform }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          args: [ "--save", "", "--appendonly", "no" ]
+          ports: [ { containerPort: 6379 } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: redis, namespace: voxplatform }
+spec: { selector: { app: redis }, ports: [ { port: 6379 } ] }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: model-cache, namespace: voxplatform }
+spec: { accessModes: [ ReadWriteMany ], resources: { requests: { storage: 150Gi } } }   # needs an RWX class, or one cache per node
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: voice-node, namespace: voxplatform }
+spec:
+  replicas: 2                       # keep >= 2: a new GPU node needs minutes to load the model
+  selector: { matchLabels: { app: voice-node } }
+  template:
+    metadata:
+      labels: { app: voice-node }
+      annotations: { prometheus.io/scrape: "false" }     # /metrics needs a bearer token; configure your scraper with it
+    spec:
+      terminationGracePeriodSeconds: 3600                # live calls finish; see the preStop drain below
+      volumes: [ { name: models, persistentVolumeClaim: { claimName: model-cache } }, { name: rec, emptyDir: {} } ]
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest                 # pin to the version printed by scripts/00_setup.sh
+          args: [ "--model", "fixie-ai/ultravox-v0_6-qwen-3-32b", "--served-model-name", "ultravox", "--trust-remote-code",
+                  "--dtype", "bfloat16", "--quantization", "fp8", "--max-model-len", "8192", "--gpu-memory-utilization", "0.60",
+                  "--limit-mm-per-prompt", "{\"audio\": 1}", "--enable-auto-tool-choice", "--tool-call-parser", "hermes" ]
+          env: [ { name: HF_HOME, value: /models/hf } ]
+          resources: { limits: { nvidia.com/gpu: 1 } }
+          ports: [ { containerPort: 8000 } ]
+          volumeMounts: [ { name: models, mountPath: /models } ]
+          readinessProbe: { httpGet: { path: /v1/models, port: 8000 }, periodSeconds: 10, failureThreshold: 90 }
+        - name: api
+          image: ghcr.io/aravind-11/voxplatform-api:latest      # build from deploy/Dockerfile.api and push
+          ports: [ { containerPort: 8080 } ]
+          env:
+            - { name: VOX_VLLM_URL, value: "http://127.0.0.1:8000/v1" }
+            - { name: VOX_DB, value: "postgresql://vox:$(POSTGRES_PASSWORD)@postgres/vox" }
+            - { name: VOX_REDIS_URL, value: "redis://redis:6379/0" }
+            - { name: VOX_PUBLIC_URL, value: "https://voice.example.com" }
+            - { name: VOX_RECORD_DIR, value: /data/recordings }
+            - { name: VOX_EOT, value: model }
+            - { name: VOX_EOT_THRESHOLD, value: "0.9" }
+            - { name: VOX_NO_ESPEAK, value: "1" }
+            - { name: HF_HOME, value: /models/hf }
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: vox-secrets, key: POSTGRES_PASSWORD } } }
+            - { name: VOX_ADMIN_KEY, valueFrom: { secretKeyRef: { name: vox-secrets, key: VOX_ADMIN_KEY } } }
+            - { name: VOX_METRICS_TOKEN, valueFrom: { secretKeyRef: { name: vox-secrets, key: VOX_METRICS_TOKEN } } }
+            - { name: TWILIO_AUTH_TOKEN, valueFrom: { secretKeyRef: { name: vox-secrets, key: TWILIO_AUTH_TOKEN } } }
+            - { name: TWILIO_ACCOUNT_SID, valueFrom: { secretKeyRef: { name: vox-secrets, key: TWILIO_ACCOUNT_SID } } }
+          resources: { limits: { nvidia.com/gpu: 1 } }
+          volumeMounts: [ { name: models, mountPath: /models }, { name: rec, mountPath: /data/recordings } ]
+          readinessProbe: { httpGet: { path: /healthz, port: 8080 }, periodSeconds: 5 }    # 503 while draining
+          lifecycle:
+            preStop:
+              exec:
+                command: [ "python", "/app/drain.py" ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api, namespace: voxplatform }
+spec: { selector: { app: voice-node }, ports: [ { port: 80, targetPort: 8080 } ] }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  namespace: voxplatform
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"     # websocket calls are long
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls: [ { hosts: [ voice.example.com ], secretName: vox-tls } ]
+  rules:
+    - host: voice.example.com
+      http: { paths: [ { path: /, pathType: Prefix, backend: { service: { name: api, port: { number: 80 } } } } ] }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: voice-node, namespace: voxplatform }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: voice-node }
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Pods
+      pods:
+        metric: { name: vox_active_calls }          # exposed by prometheus-adapter from GET /metrics
+        target: { type: AverageValue, averageValue: "12" }   # PLACEHOLDER: set from a load test on your hardware (docs/FINDINGS.md)
+  behavior: { scaleDown: { stabilizationWindowSeconds: 900 } }

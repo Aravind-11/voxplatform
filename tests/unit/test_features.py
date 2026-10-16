@@ -597,3 +597,99 @@ def test_outbound_status_and_amd_callbacks_need_a_valid_signature():
     assert r.json()["action"] == "voicemail"
     time.sleep(0.3)
     assert spoke == ["hi", "END"]
+
+
+# ------------------------------------------------------------------ draining (scale-in without dropping calls)
+def test_drain_stops_new_calls_but_reports_readiness():
+    from test_api import speech, silence
+    c, store, lim = make()
+    k, _ = tenant(c)
+    assert c.get("/healthz").status_code == 200
+    assert c.post("/admin/drain").status_code == 403
+    r = c.post("/admin/drain", headers={"X-Admin-Key": "adm"})
+    assert r.json()["draining"] is True
+    h = c.get("/healthz")
+    assert h.status_code == 503 and h.json()["draining"] is True            # load balancer sees "not ready"
+    call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=H(k)).json()
+    from starlette.websockets import WebSocketDisconnect
+    with pytest.raises(WebSocketDisconnect) as e:
+        with c.websocket_connect(call["joinUrl"].replace("wss://vox.example.com", "")) as ws:
+            ws.receive_text()
+    assert e.value.code == 1013 and store.get_call_any(call["id"])["end_reason"] == "draining"
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    from api import security
+    form = {"From": "+15551230000"}
+    sig = security.twilio_signature("tok", f"https://vox.example.com/twilio/voice/{a['id']}", form)
+    assert c.post(f"/twilio/voice/{a['id']}", data=form, headers={"X-Twilio-Signature": sig}).status_code == 503
+    assert c.post("/admin/undrain", headers={"X-Admin-Key": "adm"}).json() == {"draining": False}
+    assert c.get("/healthz").status_code == 200
+
+
+# ------------------------------------------------------------------ billing rate, CSV, call deletion
+def test_rate_cost_csv_and_admin_patch():
+    c, store, _ = make()
+    k, tid = tenant(c)
+    assert c.get("/v1/usage", headers=H(k)).json().get("cost") is None                    # no rate set: no cost claimed
+    assert c.patch(f"/admin/tenants/{tid}", json={"ratePerMinute": 0.02}).status_code == 403
+    r = c.patch(f"/admin/tenants/{tid}", json={"ratePerMinute": 0.02, "concurrencyLimit": 7}, headers={"X-Admin-Key": "adm"})
+    assert r.json() == {"tenantId": tid, "concurrencyLimit": 7, "ratePerMinute": 0.02}
+    assert c.patch("/admin/tenants/tnt_nope", json={"ratePerMinute": 1}, headers={"X-Admin-Key": "adm"}).status_code == 404
+    assert c.patch(f"/admin/tenants/{tid}", json={"ratePerMinute": -1}, headers={"X-Admin-Key": "adm"}).status_code == 422
+    now = time.time()
+    call = store.create_call(tid, None, "webSocket", {})
+    store.update_call(call["id"], status="ended", joined=now - 150, ended=now)
+    u = c.get("/v1/usage", headers=H(k)).json()
+    assert u["minutes"] == 2.5 and u["cost"] == 0.05 and u["byDay"][0]["cost"] == 0.05
+    csv = c.get("/v1/usage.csv", headers=H(k)).text.strip().splitlines()
+    assert csv[0] == "day,calls,minutes,cost" and csv[1].endswith(",1,2.5,0.05")
+    c2, *_ = make()
+    k2, t2 = tenant(c2)
+    assert c2.get("/v1/usage.csv", headers=H(k2)).text.strip() == "day,calls,minutes,cost"
+
+
+def test_delete_call_removes_record_transcript_and_recording(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOX_RECORD_DIR", str(tmp_path))
+    c, store, _ = make()
+    ka, ta = tenant(c, "a")
+    kb, _ = tenant(c, "b")
+    call = store.create_call(ta, None, "webSocket", {})
+    store.add_message(call["id"], "user", "secret words", 1.0)
+    (tmp_path / f"{call['id']}.wav").write_bytes(b"RIFF....")
+    (tmp_path / "utterances").mkdir()
+    (tmp_path / "utterances" / f"{call['id']}-001.wav").write_bytes(b"x")
+    store.update_call(call["id"], status="active")
+    assert c.delete(f"/v1/calls/{call['id']}", headers=H(ka)).status_code == 409           # not while live
+    store.update_call(call["id"], status="ended")
+    assert c.delete(f"/v1/calls/{call['id']}", headers=H(kb)).status_code == 404           # other tenant
+    assert c.delete(f"/v1/calls/{call['id']}", headers=H(ka)).status_code == 200
+    assert store.get_call_any(call["id"]) is None and store.messages(call["id"]) == []
+    assert not (tmp_path / f"{call['id']}.wav").exists() and not list((tmp_path / "utterances").iterdir())
+    assert c.get("/v1/audit", headers=H(ka)).json()[0]["action"] == "call.delete"
+
+
+def test_old_database_is_migrated_in_place(tmp_path):
+    """A DB created by the first release (no key ids, no revocation, no rate) keeps working after an upgrade."""
+    import sqlite3
+    from api import security
+    from api.store import Store
+    path = str(tmp_path / "old.db")
+    db = sqlite3.connect(path)
+    db.executescript("""
+      CREATE TABLE tenants(id TEXT PRIMARY KEY, name TEXT, webhook_url TEXT, webhook_secret TEXT, concurrency_limit INTEGER, created REAL);
+      CREATE TABLE api_keys(key_hash TEXT PRIMARY KEY, tenant_id TEXT, label TEXT, created REAL);
+      CREATE TABLE agents(id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT, config TEXT, created REAL);
+      CREATE TABLE calls(id TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT, medium TEXT, status TEXT, config TEXT, join_token TEXT,
+                         metadata TEXT, created REAL, joined REAL, ended REAL, end_reason TEXT);
+      CREATE TABLE messages(id INTEGER PRIMARY KEY AUTOINCREMENT, call_id TEXT, role TEXT, text TEXT, t REAL);
+    """)
+    db.execute("INSERT INTO tenants VALUES('tnt_1','old',NULL,NULL,NULL,1.0)")
+    db.execute("INSERT INTO api_keys VALUES(?, 'tnt_1', 'initial', 1.0)", (security.hash_key("vox_oldkey"),))
+    db.commit()
+    db.close()
+    s = Store(path)
+    t = s.tenant_by_key(security.hash_key("vox_oldkey"))
+    assert t["id"] == "tnt_1" and t["key_id"].startswith("key_") and t["rate_per_minute"] is None
+    kid = s.add_key("tnt_1", security.hash_key("vox_new"), "ci")
+    assert s.revoke_key("tnt_1", kid) and s.tenant_by_key(security.hash_key("vox_new")) is None
+    s.close()
+    assert Store(path).tenant_by_key(security.hash_key("vox_oldkey"))["key_id"] == t["key_id"]      # stable across restarts

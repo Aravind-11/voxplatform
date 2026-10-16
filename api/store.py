@@ -43,7 +43,7 @@ CREATE INDEX IF NOT EXISTS docs_corpus ON docs(corpus_id);
 """
 
 # columns added after the first release: (table, column, type)
-MIGRATIONS = [("api_keys", "id", "TEXT"), ("api_keys", "revoked", "{REAL}")]
+MIGRATIONS = [("api_keys", "id", "TEXT"), ("api_keys", "revoked", "{REAL}"), ("tenants", "rate_per_minute", "{REAL}")]
 
 
 def new_id(prefix: str) -> str:
@@ -115,7 +115,7 @@ class Store:
     # ---- tenants / keys
     def create_tenant(self, name: str, concurrency_limit: Optional[int] = None) -> str:
         tid = new_id("tnt")
-        self._x("INSERT INTO tenants VALUES(?,?,?,?,?,?)",
+        self._x("INSERT INTO tenants(id, name, webhook_url, webhook_secret, concurrency_limit, created) VALUES(?,?,?,?,?,?)",
                 (tid, name, None, None, concurrency_limit, time.time()))
         return tid
 
@@ -144,6 +144,22 @@ class Store:
     def active_key_count(self, tenant_id: str) -> int:
         return self._one("SELECT COUNT(*) AS n FROM api_keys WHERE tenant_id=? AND revoked IS NULL",
                          (tenant_id,))["n"]
+
+    def update_tenant(self, tenant_id: str, concurrency_limit: Optional[int] = None,
+                      rate_per_minute: Optional[float] = None) -> Optional[dict]:
+        if self.get_tenant(tenant_id) is None:
+            return None
+        if concurrency_limit is not None:
+            self._x("UPDATE tenants SET concurrency_limit=? WHERE id=?", (concurrency_limit, tenant_id))
+        if rate_per_minute is not None:
+            self._x("UPDATE tenants SET rate_per_minute=? WHERE id=?", (rate_per_minute, tenant_id))
+        return self.get_tenant(tenant_id)
+
+    def delete_call(self, tenant_id: str, call_id: str) -> bool:
+        if self.get_call(tenant_id, call_id) is None:
+            return False
+        self._x("DELETE FROM messages WHERE call_id=?", (call_id,))
+        return self._x("DELETE FROM calls WHERE id=? AND tenant_id=?", (call_id, tenant_id)) > 0
 
     def get_tenant(self, tenant_id: str) -> Optional[dict]:
         return self._one("SELECT * FROM tenants WHERE id=?", (tenant_id,))

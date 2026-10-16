@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import re
 import time
@@ -103,6 +104,12 @@ class WebhookIn(BaseModel):
 class TenantIn(BaseModel):
     name: str
     concurrencyLimit: Optional[int] = None
+    ratePerMinute: Optional[float] = Field(None, ge=0, le=1000)       # your internal/chargeback rate, used by /v1/usage
+
+
+class TenantPatch(BaseModel):
+    concurrencyLimit: Optional[int] = Field(None, ge=1, le=100_000)
+    ratePerMinute: Optional[float] = Field(None, ge=0, le=1000)
 
 
 class _TwilioWS:
@@ -217,9 +224,30 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             dispatcher.spawn(t["webhook_url"], t["webhook_secret"],
                              {"type": type_, "t": time.time(), "call": public_call(call)})
 
+    app.state.draining = False
+
     @app.get("/healthz")
     async def healthz():
-        return {"ok": True, "active_calls": limiter.total_active()}
+        """Readiness: 503 while draining so the load balancer stops sending new calls to this node."""
+        body = {"ok": not app.state.draining, "draining": app.state.draining, "active_calls": limiter.total_active()}
+        return Response(json.dumps(body), status_code=503 if app.state.draining else 200, media_type="application/json")
+
+    def admin_only(x_admin_key: str) -> None:
+        if not settings.admin_key or not hmac.compare_digest(x_admin_key, settings.admin_key):
+            raise HTTPException(403, "admin key required")
+
+    @app.post("/admin/drain")
+    async def drain(x_admin_key: str = Header(default="")):
+        """Stop taking new calls (live ones continue). Call from a pod preStop hook, then wait for active_calls == 0."""
+        admin_only(x_admin_key)
+        app.state.draining = True
+        return {"draining": True, "active_calls": limiter.total_active()}
+
+    @app.post("/admin/undrain")
+    async def undrain(x_admin_key: str = Header(default="")):
+        admin_only(x_admin_key)
+        app.state.draining = False
+        return {"draining": False}
 
     # ------------------------------------------------------------- admin
     @app.post("/admin/tenants")
@@ -227,9 +255,19 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not settings.admin_key or not hmac.compare_digest(x_admin_key, settings.admin_key):
             raise HTTPException(403, "admin key required")
         tid = store.create_tenant(body.name, body.concurrencyLimit)
+        if body.ratePerMinute is not None:
+            store.update_tenant(tid, rate_per_minute=body.ratePerMinute)
         key = security.generate_key()
         store.add_key(tid, security.hash_key(key), "initial")
         return {"tenantId": tid, "apiKey": key}   # key is shown once; only its hash is stored
+
+    @app.patch("/admin/tenants/{tenant_id}")
+    async def patch_tenant(tenant_id: str, body: TenantPatch, x_admin_key: str = Header(default="")):
+        admin_only(x_admin_key)
+        t = store.update_tenant(tenant_id, body.concurrencyLimit, body.ratePerMinute)
+        if not t:
+            raise HTTPException(404, "tenant not found")
+        return {"tenantId": tenant_id, "concurrencyLimit": t["concurrency_limit"], "ratePerMinute": t.get("rate_per_minute")}
 
     @app.put("/v1/webhook")
     async def set_webhook(body: WebhookIn, t: dict = Depends(tenant)):
@@ -307,6 +345,25 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             raise HTTPException(404, "call not found")
         return public_call(c)
 
+    @app.delete("/v1/calls/{call_id}")
+    async def delete_call(call_id: str, t: dict = Depends(tenant)):
+        """Erases a call: its record, transcript and recording file (for deletion requests and retention policies)."""
+        c = store.get_call(t["id"], call_id)
+        if not c:
+            raise HTTPException(404, "call not found")
+        if c["status"] == "active":
+            raise HTTPException(409, "call is still active")
+        d = settings.record_dir or os.environ.get("VOX_RECORD_DIR", "")
+        if d:
+            for p in (os.path.join(d, f"{call_id}.wav"),) + tuple(
+                    os.path.join(d, "utterances", f) for f in (os.listdir(os.path.join(d, "utterances")) if os.path.isdir(os.path.join(d, "utterances")) else [])
+                    if f.startswith(call_id + "-")):
+                if os.path.isfile(p):
+                    os.remove(p)
+        store.delete_call(t["id"], call_id)
+        log(t, "call.delete", call_id)
+        return {"deleted": call_id}
+
     @app.get("/v1/calls/{call_id}/messages")
     async def call_messages(call_id: str, t: dict = Depends(tenant)):
         if not store.get_call(t["id"], call_id):
@@ -315,7 +372,22 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     @app.get("/v1/usage")
     async def usage(days: int = 30, t: dict = Depends(tenant)):
-        return {**store.usage(t["id"], max(1, min(days, 365))), "active": limiter.active(t["id"])}
+        u = store.usage(t["id"], max(1, min(days, 365)))
+        rate = t.get("rate_per_minute")
+        if rate is not None:
+            u["ratePerMinute"], u["cost"] = rate, round(u["minutes"] * rate, 4)
+            for row in u["byDay"] + u["byAgent"]:
+                row["cost"] = round(row["minutes"] * rate, 4)
+        return {**u, "active": limiter.active(t["id"])}
+
+    @app.get("/v1/usage.csv")
+    async def usage_csv(days: int = 30, t: dict = Depends(tenant)):
+        """Per-day usage as CSV for invoicing: day, calls, minutes, cost (cost blank until a rate is set)."""
+        u = store.usage(t["id"], max(1, min(days, 365)))
+        rate = t.get("rate_per_minute")
+        rows = ["day,calls,minutes,cost"] + [f"{d['key']},{d['calls']},{d['minutes']},{'' if rate is None else round(d['minutes'] * rate, 4)}"
+                                            for d in u["byDay"]]
+        return PlainTextResponse("\n".join(rows) + "\n", media_type="text/csv")
 
     @app.get("/v1/me")
     async def me(t: dict = Depends(tenant)):
@@ -506,6 +578,9 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """Common admission: status check + per-tenant concurrency. Raises _Reject."""
         if call["status"] != "created":
             raise _Reject(4401, "call not joinable")
+        if app.state.draining:
+            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="draining")
+            raise _Reject(1013, "node is draining")
         t = store.get_tenant(call["tenant_id"])
         cap = t["concurrency_limit"] or settings.default_concurrency
         if not limiter.acquire(call["tenant_id"], call["id"], cap):
@@ -563,6 +638,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             if not security.validate_twilio(settings.twilio_auth_token, url, form,
                                             request.headers.get("X-Twilio-Signature", "")):
                 raise HTTPException(403, "bad twilio signature")
+        if app.state.draining:
+            raise HTTPException(503, "node is draining")
         agent = store.get_agent_any(agent_id)
         if not agent:
             raise HTTPException(404, "agent not found")
@@ -612,6 +689,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     @app.post("/v1/calls/outbound")
     async def outbound(body: OutboundIn, t: dict = Depends(tenant)):
         """Places a phone call through your Twilio account and connects the answered call to the agent."""
+        if app.state.draining:
+            raise HTTPException(503, "node is draining")
         if not (settings.twilio_account_sid and settings.twilio_auth_token):
             raise HTTPException(503, "outbound calling needs TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN on the server")
         if runtime.http is None:

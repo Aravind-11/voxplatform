@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8
+pytest-asyncio>=0.23
+twilio>=9                     # tests verify our webhook signature check against Twilio's own validator
+playwright>=1.45              # tests/e2e/browser_test.py (then: playwright install chromium)

@@ -1,0 +1,67 @@
+# Full stack on one GPU host: vLLM (Ultravox) + API + Postgres + Redis + TLS proxy.
+#   cp deploy/env.example deploy/.env   # fill in secrets and your domain
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
+# Needs the NVIDIA container toolkit. Written from the verified bare-metal setup; NOT run end to end in this repo
+# (no Docker in the build sandbox). Check `docker compose logs vllm` first: the model download is ~70 GB.
+name: voxplatform
+services:
+  vllm:
+    # Pin this to the vLLM version printed by scripts/00_setup.sh on a known-good box.
+    image: vllm/vllm-openai:${VLLM_TAG:-latest}
+    command: >
+      --model fixie-ai/ultravox-v0_6-qwen-3-32b --served-model-name ultravox --trust-remote-code
+      --dtype bfloat16 --quantization fp8 --max-model-len 8192 --gpu-memory-utilization 0.60
+      --limit-mm-per-prompt '{"audio": 1}' --enable-auto-tool-choice --tool-call-parser hermes
+    environment:
+      HF_HOME: /models/hf
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    volumes: [ "models:/models" ]
+    ipc: host
+    deploy: { resources: { reservations: { devices: [ { driver: nvidia, count: 1, capabilities: [ gpu ] } ] } } }
+    healthcheck: { test: [ "CMD", "curl", "-fs", "http://localhost:8000/v1/models" ], interval: 20s, timeout: 5s, retries: 60, start_period: 120s }
+    restart: unless-stopped
+
+  api:
+    build: { context: ..  , dockerfile: deploy/Dockerfile.api }
+    depends_on: { vllm: { condition: service_healthy }, postgres: { condition: service_healthy }, redis: { condition: service_started } }
+    environment:
+      VOX_VLLM_URL: http://vllm:8000/v1
+      VOX_DB: postgresql://vox:${POSTGRES_PASSWORD}@postgres/vox
+      VOX_REDIS_URL: redis://redis:6379/0
+      VOX_PUBLIC_URL: https://${VOX_DOMAIN}
+      VOX_ADMIN_KEY: ${VOX_ADMIN_KEY}
+      VOX_METRICS_TOKEN: ${VOX_METRICS_TOKEN}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      VOX_TWILIO_NUMBER: ${VOX_TWILIO_NUMBER:-}
+      VOX_RECORD_DIR: /data/recordings
+      VOX_DEFAULT_CONCURRENCY: ${VOX_DEFAULT_CONCURRENCY:-64}
+      VOX_EOT: model
+      VOX_EOT_THRESHOLD: "0.9"
+      VOX_NO_ESPEAK: "1"
+      HF_HOME: /models/hf
+    volumes: [ "models:/models", "recordings:/data/recordings" ]
+    deploy: { resources: { reservations: { devices: [ { driver: nvidia, count: 1, capabilities: [ gpu ] } ] } } }
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    environment: { POSTGRES_USER: vox, POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}", POSTGRES_DB: vox }
+    volumes: [ "pgdata:/var/lib/postgresql/data" ]
+    healthcheck: { test: [ "CMD-SHELL", "pg_isready -U vox" ], interval: 5s, timeout: 3s, retries: 20 }
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    command: [ "redis-server", "--save", "", "--appendonly", "no" ]    # only call counters live here; losing them is harmless
+    restart: unless-stopped
+
+  proxy:
+    image: caddy:2
+    depends_on: [ api ]
+    ports: [ "80:80", "443:443" ]
+    environment: { VOX_DOMAIN: "${VOX_DOMAIN}" }
+    volumes: [ "./Caddyfile:/etc/caddy/Caddyfile:ro", "caddy:/data" ]
+    restart: unless-stopped
+
+volumes: { models: {}, recordings: {}, pgdata: {}, caddy: {} }

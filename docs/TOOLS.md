@@ -55,3 +55,10 @@ checked just before the request, so DNS rebinding could race it; production shou
 | playDtmfSounds, leaveVoicemail, queryCorpus (RAG) | yes | no |
 | Tool timeouts / async tools | not documented ? | 0.5-30 s timeout per tool; no async tools |
 | Egress protection | not documented ? | SSRF guard, no redirects, truncation |
+
+## Added later
+- `{"builtin":"queryCorpus","corpus":"faq","topK":3}`: keyword (BM25) search over a knowledge base created with `POST /v1/corpora` and `POST /v1/corpora/{name}/documents`.
+- `"playDtmf"`: the agent presses keypad digits (phone menus, extensions). Keypad digits the caller presses arrive as a text turn: `[The caller pressed these keypad digits: 123]` (ends on `#` or after 2 s).
+- `{"builtin":"leaveVoicemail","message":"..."}`: speaks the message and hangs up; the agent calls it when it hears a voicemail greeting. For outbound calls, `voicemailMessage` also turns on Twilio answering-machine detection and plays the message automatically.
+- `{"builtin":"client","name":"open_page","description":"...","parameters":{...}}`: a function that runs in the caller's browser on `/demo`-style WebSocket calls. The server sends `{"type":"client_tool_invocation","id","name","args"}`; the page answers `{"type":"client_tool_result","id","result"}` (or `"error"`).
+- `{"library":"name"}`: use a tool stored once with `PUT /v1/tools/{name}`; edits apply to every agent that uses it at its next call.

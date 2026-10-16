@@ -1,0 +1,15 @@
+# API process (runs next to vLLM on the GPU node). Versions are minimums that the test suite ran with; pin your own lock file.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+pydantic>=2
+python-multipart>=0.0.9       # Twilio sends form-encoded webhooks
+numpy>=1.26
+scipy>=1.11
+openai>=1.40                  # client for the vLLM OpenAI-compatible server
+psycopg[binary]>=3.1          # only used when VOX_DB is a postgresql:// URL
+redis>=5                      # only used when VOX_REDIS_URL is set
+kokoro>=0.9.4                 # Kokoro-82M text-to-speech (Apache-2.0); pulls torch and misaki
+soundfile
+silero-vad>=5                 # voice activity detection (MIT)
+# espeak-ng (GPL-3.0) is deliberately NOT listed: see docs/LICENSES.md and VOX_NO_ESPEAK

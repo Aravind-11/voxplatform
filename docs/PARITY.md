@@ -1,14 +1,23 @@
-# Parity targets vs paid Ultravox (proposals until a baseline is measured)
+# Parity with the paid Ultravox Realtime service (feature map, not a benchmark)
 
-Same harness (`harness/caller.py`) is meant to run against both. Targets are my proposals, not Ultravox's published figures.
+I never measured the paid service, so this compares **features**, not quality or speed. Quality and latency parity are unproven.
 
-| Metric | Target | How measured |
+| Capability | Self-hosted here | Notes |
 |---|---|---|
-| Response latency (speech end -> first agent audio) p50 / p95 | <= 1.0 s / <= 1.8 s at 1 call; p95 <= 2.5 s at N calls | caller `response_ms` |
-| Barge-in time-to-silence p95 | <= 400 ms | caller `silence_ms` |
-| Calls completed under load | 100% at the claimed concurrency | caller `ok` |
-| Telephony | real inbound Twilio call completes | manual, recorded |
-| Cost/min | report GPU $/hr / (calls x minutes) vs $0.05/min paid | computed from measured concurrency |
-
-Known gaps vs paid: model is v0.6 (not the newer hosted one); TTS is Kokoro (not their voices); no voice cloning;
-end-of-turn is silence-based; single node; no proven uptime.
+| Real-time voice, interruptions | yes (verified on a real call) | model is Ultravox v0.6; paid is newer |
+| Telephony inbound | yes (verified once) | Twilio; BYO number |
+| Telephony outbound, voicemail, DTMF | written, mocked | not placed on a real call yet |
+| SIP trunk / warm transfer | **no** | cold transfer to configured numbers only |
+| Tools: HTTP, static/dynamic/automatic params, built-ins (hangUp, transfer, playDtmf, leaveVoicemail, queryCorpus) | yes | confirm-before-acting is an addition |
+| Client tools (run in the caller's browser) | yes (written) | |
+| Shared tool library | yes | |
+| Knowledge-base search | keyword (BM25) | paid likely uses embeddings |
+| Concurrent calls | ~24 per H100 comfortable, 32 usable (synthetic) | add nodes for more; paid scales for you |
+| Multi-tenant API, keys, rotation, audit | yes | |
+| Usage, cost, CSV | yes (internal chargeback; no invoicing) | |
+| Recording, dataset export | yes | consent is your responsibility |
+| Dashboard, browser demo | yes | |
+| Metrics | Prometheus text | |
+| Voices | Kokoro presets | no cloning |
+| Uptime / SLA | none | single operator, no soak test |
+| Cost per minute | cheaper above ~1.5 average concurrent calls | docs/FINDINGS.md |

@@ -30,8 +30,24 @@ Legend: **verified** = executed with the stated result; **written** = code + uni
 | Agent greets first (`greeting` on the agent or per call; fixed text, no model call, interruptible) | written | unit tests incl. barge-in over the greeting and history trimming; not yet heard on a real call |
 | Real-call finding: model misheard a spoken request and acted on it | **open problem, mitigated** | live call: caller asked about Thursday; transcript read 'Or better yet, phone.'; the model then booked Tuesday 11:00 unprompted. Earlier calls: 'I like to cooking', 'Yogen'. The synthetic test (0.3% WER) does not represent this speaker/line. Mitigation: `confirm` tools (read back + yes in a later turn), unit-tested, not yet tried live. Real fix needs measurement on recorded human speech |
 | UltraVAD | not used | page states no license; own reported accuracy 77.5% / precision 69.6% |
-| Redis-backed limiter, Postgres store, multi-node, K8s | designed only | |
-| Recording, Prometheus metrics, browser demo page | not written | |
+| Postgres store | **verified** (CPU, real server) | the full unit suite (195 tests) passes against PostgreSQL 16; SQLite databases from the first release migrate in place (tested) |
+| Redis call cap shared by API nodes | **verified** (CPU, real Redis 7) | two limiter instances share one cap; a crashed node's calls expire (TTL), live nodes refresh; 40 racing acquires never exceed the cap. Not run behind a real multi-node load balancer |
+| Drain mode (`/admin/drain`, readiness 503, preStop hook) | written | unit-tested, including the hook's wait loop; not run in a cluster |
+| Account features: API key create/revoke/rotate (last-key protection), audit log, per-tenant isolation | written | unit-tested incl. cross-tenant attempts; on SQLite and Postgres |
+| Shared tool library (`{"library":"name"}`, resolved at call time, secrets write-only) | written | unit-tested |
+| Knowledge-base search (`queryCorpus` tool, BM25 over passages) | written | unit-tested; keyword search only, retrieval quality on real documents unmeasured |
+| Usage by day/agent, rate and cost, CSV export, voices list, speaking speed | written | unit-tested; speed not heard on real audio |
+| Outbound calls via Twilio REST (caps per day, prefix allow-list), call status callbacks | written | Twilio mocked; no real outbound call placed |
+| Voicemail: answering-machine detection callback + `leaveVoicemail` tool | written | Twilio mocked; not tried against a real answering machine |
+| DTMF keypad in (digits -> text turn) and out (`playDtmf` tones) | written | in-bound follows Twilio's documented `dtmf` event; tones decode correctly with an independent Goertzel detector; not tested on a live call |
+| Client tools (functions run in the caller's browser) | written | roundtrip, error and timeout unit-tested incl. through a real websocket; only a demo handler exists in the page |
+| Call recording (stereo WAV, opt-in per agent), download and delete endpoints, per-utterance dataset | written | unit tests + fake-model end-to-end; alignment against real Twilio playback timing unmeasured; you need callers' consent |
+| Prometheus `/metrics` (protected) | written | text format unit-tested; no Prometheus has scraped it |
+| Browser demo page (`/demo`) and admin dashboard (`/dashboard`) | **verified** (fake model, real browser) | headless Chromium with fake microphone: greeting, speech heard, agent answers, call + transcript + recording appear in the dashboard; screenshots inspected. Not tried with a real mic or the real model |
+| `scripts/deploy.sh` (tunnel, API, tenant, agent, optional Twilio webhook via REST) | **verified** (stand-ins) | run for real against stubbed vLLM/cloudflared/model; the output and created agent were checked. Not yet run on the GPU box |
+| Docker image, docker-compose stack, Kubernetes manifests | written, not run | no Docker or cluster available when written; YAML parses |
+| License audit | done | docs/LICENSES.md; espeak-ng (GPL-3.0) flagged, `VOX_NO_ESPEAK=1` written, not yet run on the GPU |
+| SIP trunks, warm transfer, voice cloning, SSO/roles, retention schedules, embeddings search | **not built** | see docs/FINDINGS.md |
 
 ## Harness numbers with fake models (platform overhead only, NOT model latency)
 Fake LLM 50 ms, fake TTS ~10 ms, localhost, 20 concurrent callers: response p50 652 ms / p95 657 ms;

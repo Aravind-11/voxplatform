@@ -1,41 +1,48 @@
 # voxplatform
 
-Self-hosted voice-agent platform on open-weight Ultravox (v0.6 / Qwen3-32B), served by vLLM.
-Status of every component is tracked in `docs/STATUS.md` as **verified**, **written (untested)** or **designed**.
+A self-hosted AI voice-agent platform on the open-source Ultravox stack: real-time speech-to-speech conversation with
+interruptions, phone calls (inbound and outbound), tools, knowledge bases, multi-tenant API, recordings, dashboard, Postgres/Redis
+scale-out. Open components only (docs/LICENSES.md); you run all of it.
 
-## Step 0: bring-up on the H100 (what to run, in order)
+**Read docs/FINDINGS.md first**: what is proven, what is not, where it beats the paid service on cost and where it does not.
+docs/STATUS.md labels every component *verified*, *written* or *designed*.
 
-Prereqs: Lambda 1x H100 in Georgia (us-southeast-1), filesystem `arvi` attached, SSH key `arvi.pem`.
-The model cache already lives at `/lambda/nfs/arvi/hf` (Qwen/Qwen3-32B + fixie-ai/ultravox-v0_6-qwen-3-32b).
-
+## Run it on a GPU box (about 10 minutes after the model is cached)
 ```bash
-# from your Mac: copy the repo to the persistent filesystem (use the new instance IP)
-scp -i ~/Downloads/arvi.pem voxplatform.tar.gz ubuntu@<IP>:/lambda/nfs/arvi/
-ssh -i ~/Downloads/arvi.pem ubuntu@<IP>
-
-# on the instance
-cd /lambda/nfs/arvi && tar xzf voxplatform.tar.gz && cd voxplatform
-bash scripts/00_setup.sh            # venv on local disk + vLLM; prints versions
-
-tmux new -s serve
-bash scripts/01_serve_vllm.sh       # wait for "Application startup complete"
-# detach: Ctrl-b then d
-
-# in a second shell / tmux window
-source ~/venv/bin/activate
-python tests/bringup/bringup_test.py
+bash scripts/00_setup.sh                  # once per instance: venv + vLLM
+pip install -r requirements.txt           # in that venv
+tmux new -s serve; bash scripts/01_serve_vllm.sh        # wait for "Application startup complete", detach with Ctrl-b d
+bash scripts/deploy.sh                    # tunnel + API + tenant + agent; prints dashboard, demo and phone URLs
+# optional: TWILIO_ACCOUNT_SID=AC... VOX_TWILIO_NUMBER=+1... bash scripts/deploy.sh   (also points your number at the agent)
 ```
+Open the printed `/demo` URL to talk from a browser, `/dashboard` to manage agents, or call your number.
 
-Send back: the full terminal output of `01_serve_vllm.sh` (last ~60 lines, or any error) and of `bringup_test.py`.
+## Run it with Docker (written, not yet run: see docs/STATUS.md)
+`cp deploy/env.example deploy/.env`, edit, then `docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build`.
+Kubernetes reference manifests: `deploy/k8s/`.
 
-### If the server fails to start
-- Cache miss with offline mode: re-run with `OFFLINE=0 bash scripts/01_serve_vllm.sh`.
-- Out of memory: `UTIL=0.70 MAXLEN=4096 bash scripts/01_serve_vllm.sh`, or `QUANT=none` to rule out fp8.
-- fp8 + Ultravox incompatibility: `QUANT=none UTIL=0.90 MAXLEN=4096` (bf16 weights ~65 GB, little KV room).
-- Unknown-architecture / audio errors: paste the traceback; the repo's `tools/update_vllm_impl.py` patch path is the fallback.
+## Use the API (header `X-API-Key`)
+```bash
+curl -X POST $URL/v1/agents -H "X-API-Key: $KEY" -H 'content-type: application/json' -d '{
+  "name":"reception","greeting":"Hi, how can I help?","systemPrompt":"You are brief and friendly.",
+  "tools":["hangUp",{"builtin":"queryCorpus","corpus":"faq"}]}'
+curl -X POST $URL/v1/calls -H "X-API-Key: $KEY" -d '{"agentId":"agt_..."}'            # returns a WebSocket joinUrl
+curl -X POST $URL/v1/calls/outbound -H "X-API-Key: $KEY" -d '{"agentId":"agt_...","to":"+15551234567"}'
+```
+Endpoints: agents, calls (+ messages, recording, delete), outbound, keys, audit, tools library, corpora (knowledge bases), usage (+ CSV),
+voices, `/metrics`, `/healthz`, `/demo`, `/dashboard`. Tools: docs/TOOLS.md. Tuning: docs/TUNING.md. Operations: docs/OPERATIONS.md.
+
+## Test it (no GPU needed)
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/unit                                     # 195 tests, ~20 s
+VOX_TEST_DB=postgresql://user@host/db python -m pytest tests/unit      # same suite on PostgreSQL
+python tests/e2e/browser_test.py                                # dashboard + demo in headless Chromium, fake model
+bash tests/e2e/deploy_dryrun.sh                                 # runs scripts/deploy.sh against stand-ins
+```
+On the GPU box: `bash scripts/05_verify.sh` (tool-calling and end-of-turn checks), `python tests/bringup/tts_procs.py` (TTS scaling).
 
 ## Layout
-- `scripts/` instance setup and server launch
-- `tests/bringup/` model-server bring-up and concurrency probe
-- `core/ transports/ api/ harness/ deploy/` the platform (next)
-- `docs/` parity spec, status table, findings
+`core/` conversation engine (VAD, turn-taking, session, TTS, recorder, metrics, BM25) · `transports/` Twilio and browser ·
+`api/` HTTP/WebSocket API, store, tools, dashboard pages · `scripts/` GPU-box setup and deploy · `deploy/` Docker, compose, Kubernetes ·
+`tests/` unit, e2e, bring-up · `docs/` findings, status, licenses, tools, tuning, operations.

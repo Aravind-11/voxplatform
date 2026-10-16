@@ -1,5 +1,5 @@
 """Starts the real API app with fake model/TTS/VAD so browser and HTTP end-to-end tests need no GPU.
-Usage: python tests/e2e/serve_fake.py PORT"""
+Usage: python tests/e2e/serve_fake.py PORT   (honours VOX_ADMIN_KEY, VOX_PUBLIC_URL, VOX_METRICS_TOKEN)"""
 import os
 import sys
 import tempfile
@@ -45,7 +45,9 @@ def main():
     os.environ["VOX_RECORD_DIR"] = rec
     store = Store(os.environ.get("VOX_DB", ":memory:"))
     rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
-    s = Settings(admin_key="adm", public_base_url=f"http://127.0.0.1:{port}", metrics_token="mt", record_dir=rec)
+    s = Settings(admin_key=os.environ.get("VOX_ADMIN_KEY", "adm"),
+                 public_base_url=os.environ.get("VOX_PUBLIC_URL", f"http://127.0.0.1:{port}"),
+                 metrics_token=os.environ.get("VOX_METRICS_TOKEN", "mt"), record_dir=rec)
     uvicorn.run(create_app(store, rt, security.ConcurrencyLimiter(5), None, s), host="127.0.0.1", port=port, log_level="warning")
 
 

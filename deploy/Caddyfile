@@ -1,0 +1,7 @@
+# TLS termination and websocket pass-through. Set VOX_DOMAIN (DNS A record -> this host); Caddy gets the certificate itself.
+{$VOX_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy api:8080 {
+		flush_interval -1
+	}
+}

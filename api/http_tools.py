@@ -27,7 +27,7 @@ import os
 import re
 import socket
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
@@ -63,12 +63,16 @@ def validate(defn: dict) -> dict:
     if not isinstance(http, dict):
         raise ToolConfigError(f"tool {name}: 'http' object is required")
     _check_url_shape(str(http.get("url", "")))
+    placeholders = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", str(http.get("url", ""))))
     method = str(http.get("method", "POST")).upper()
     if method not in METHODS:
         raise ToolConfigError(f"tool {name}: method must be one of {sorted(METHODS)}")
     headers = http.get("headers", {}) or {}
     if not isinstance(headers, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items()):
         raise ToolConfigError(f"tool {name}: headers must map strings to strings")
+    query_names = http.get("query", []) or []
+    if not isinstance(query_names, list) or not all(isinstance(q, str) for q in query_names):
+        raise ToolConfigError(f"tool {name}: http.query must be a list of parameter names")
     timeout = float(http.get("timeoutS", 8))
     if not 0.5 <= timeout <= 30:
         raise ToolConfigError(f"tool {name}: timeoutS must be between 0.5 and 30")
@@ -78,6 +82,10 @@ def validate(defn: dict) -> dict:
     static = defn.get("static", {}) or {}
     if not isinstance(static, dict):
         raise ToolConfigError(f"tool {name}: static must be an object")
+    props = set(params.get("properties", {}))
+    bad = (placeholders | set(query_names)) - props - set(static)
+    if bad:
+        raise ToolConfigError(f"tool {name}: {sorted(bad)} appear in http.url or http.query but are not parameters")
     clash = set(static) & set(params.get("properties", {}))
     if clash:
         raise ToolConfigError(f"tool {name}: {sorted(clash)} are both static and model-filled")
@@ -85,7 +93,8 @@ def validate(defn: dict) -> dict:
     if not isinstance(auto, list) or not set(auto) <= AUTOMATIC:
         raise ToolConfigError(f"tool {name}: automatic must be a subset of {sorted(AUTOMATIC)}")
     return {"name": name, "description": desc.strip(), "parameters": params,
-            "http": {"url": http["url"], "method": method, "headers": headers, "timeoutS": timeout},
+            "http": {"url": http["url"], "method": method, "headers": headers, "timeoutS": timeout,
+                     "query": list(query_names)},
             "static": static, "automatic": list(auto), "confirm": bool(defn.get("confirm", False))}
 
 
@@ -130,10 +139,21 @@ def make_http_tool(defn: dict, ctx, client) -> Callable[[dict], Awaitable[Any]]:
         auto = {"callId": ctx.call_id, "from": ctx.caller, "to": ctx.callee, "callSid": ctx.call_sid}
         body.update({k: auto[k] for k in defn["automatic"]})
         try:
-            assert_public(http["url"])
-            kw: dict = {"params": {k: v if isinstance(v, (str, int, float)) else json.dumps(v)
-                                   for k, v in body.items()}} if http["method"] == "GET" else {"json": body}
-            r = await client.request(http["method"], http["url"], headers=http["headers"],
+            url = http["url"]
+            for ph in re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", url):       # path parameters: encoded, never raw
+                if ph not in body:
+                    return {"error": f"missing required value for {ph!r}"}
+                url = url.replace("{" + ph + "}", quote(str(body.pop(ph)), safe=""))
+            assert_public(url)
+            flat = lambda d: {k: v if isinstance(v, (str, int, float)) else json.dumps(v) for k, v in d.items()}  # noqa: E731
+            qnames = set(http.get("query", []))
+            if http["method"] == "GET":
+                kw: dict = {"params": flat(body)}
+            else:
+                kw = {"json": {k: v for k, v in body.items() if k not in qnames}}
+                if qnames & set(body):
+                    kw["params"] = flat({k: v for k, v in body.items() if k in qnames})
+            r = await client.request(http["method"], url, headers=http["headers"],
                                      timeout=http["timeoutS"], follow_redirects=False, **kw)
         except ToolConfigError as e:
             return {"error": f"blocked: {e}"}

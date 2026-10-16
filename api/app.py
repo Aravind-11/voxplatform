@@ -16,11 +16,12 @@ from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
 
 from core.metrics import METRICS
-from core.tts import VOICES
+from core import tts as ttsmod
+from core.tts import DEFAULT_VOICE, LANG_NAME, VOICES
 from transports.browser import BrowserTransport
 from transports.twilio import TwilioTransport
 from . import security, tools as toolmod
-from . import retention
+from . import openapi_import, retention, variables as varmod
 from .runtime import Runtime
 from .store import ROLES, Store
 
@@ -46,6 +47,8 @@ class AgentIn(BaseModel):
     name: str
     systemPrompt: str = ""
     voice: str = "af_heart"
+    language: Optional[str] = None                  # ISO code (en, es, fr, hi, it, ja, pt, zh): the agent speaks and replies in it
+    variables: dict[str, Any] = Field(default_factory=dict)   # defaults for {{name}} placeholders in the prompt/greeting
     greeting: str = Field("", max_length=500)       # spoken first when the call connects; empty = wait for the caller
     tools: list[Union[str, dict[str, Any]]] = Field(default_factory=list)
     speed: float = Field(1.0, ge=0.7, le=1.3)
@@ -56,6 +59,8 @@ class AgentPatch(BaseModel):
     name: Optional[str] = None
     systemPrompt: Optional[str] = None
     voice: Optional[str] = None
+    language: Optional[str] = None
+    variables: Optional[dict[str, Any]] = None
     greeting: Optional[str] = Field(None, max_length=500)
     tools: Optional[list[Union[str, dict[str, Any]]]] = None
     speed: Optional[float] = Field(None, ge=0.7, le=1.3)
@@ -66,6 +71,8 @@ class CallIn(BaseModel):
     agentId: Optional[str] = None
     systemPrompt: Optional[str] = None
     voice: Optional[str] = None
+    language: Optional[str] = None
+    variables: Optional[dict[str, Any]] = None
     greeting: Optional[str] = Field(None, max_length=500)
     tools: Optional[list[Union[str, dict[str, Any]]]] = None
     speed: Optional[float] = Field(None, ge=0.7, le=1.3)
@@ -79,11 +86,23 @@ class OutboundIn(BaseModel):
     fromNumber: Optional[str] = None
     record: Optional[bool] = None
     voicemailMessage: Optional[str] = Field(None, max_length=600)   # if an answering machine picks up, leave this
+    variables: Optional[dict[str, Any]] = None                      # fills {{name}} in the agent's prompt and greeting
     metadata: dict = Field(default_factory=dict)
 
 
 class ToolIn(BaseModel):
     spec: Union[str, dict[str, Any]]
+
+
+class OpenApiImportIn(BaseModel):
+    spec: dict[str, Any]                                # an OpenAPI 3.x document as JSON
+    baseUrl: Optional[str] = None                       # overrides servers[0].url
+    headers: dict[str, str] = Field(default_factory=dict)   # credentials sent on every call; stored write-only
+    prefix: str = Field("", max_length=20)
+    include: Optional[list[str]] = None                 # operationIds to import (default: all, max 100)
+    confirmWrites: bool = True                          # non-GET operations require read-back and a yes
+    dryRun: bool = False
+    overwrite: bool = False
 
 
 class KeyIn(BaseModel):
@@ -226,9 +245,41 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         except toolmod.ToolConfigError as e:
             raise HTTPException(422, str(e)) from e
 
-    def check_voice(voice) -> None:
+    def check_voice(voice, language=None) -> None:
         if voice is not None and voice not in VOICES:
             raise HTTPException(422, f"unknown voice {voice!r}; see GET /v1/voices")
+        if language is not None and language not in LANG_NAME:
+            raise HTTPException(422, f"unknown language {language!r}; supported: {sorted(LANG_NAME)}")
+        if voice is not None:
+            why = ttsmod.why_unavailable(ttsmod.lang_code_of(voice))
+            if why:
+                raise HTTPException(422, f"voice {voice!r} ({ttsmod.language_of(voice)}) is not available here: {why}")
+            if language is not None and ttsmod.language_of(voice) != language:
+                raise HTTPException(422, f"voice {voice!r} speaks {ttsmod.language_of(voice)}, not {language!r}; "
+                                         f"try {DEFAULT_VOICE[language]!r}")
+
+    def call_variables(cfg: dict, supplied, *, strict: bool) -> dict:
+        """Validated call-supplied variables. With strict=True (an API-created call) a placeholder that nothing fills is
+        a 422, so a typo never reaches a live conversation."""
+        try:
+            given = varmod.validate(supplied)
+            varmod.validate(cfg.get("variables") or {})
+        except varmod.VariableError as e:
+            raise HTTPException(422, str(e)) from e
+        if strict:
+            gone = varmod.missing([cfg.get("systemPrompt", ""), cfg.get("greeting", "")], {**(cfg.get("variables") or {}), **given})
+            if gone:
+                raise HTTPException(422, f"the agent's prompt or greeting uses {{{{{gone[0]}}}}} (and {len(gone) - 1} more) "
+                                         f"but no value was given: missing {gone}")
+        return given
+
+    def pick_voice(cur_voice, cur_lang, new_voice, new_lang, voice_given: bool):
+        """Effective (voice, language) after a change. Setting only a language switches to that language's default voice."""
+        lang = new_lang if new_lang is not None else cur_lang
+        voice = new_voice if voice_given and new_voice is not None else cur_voice
+        if new_lang in DEFAULT_VOICE and not voice_given and voice and ttsmod.language_of(voice) != new_lang:
+            voice = DEFAULT_VOICE[new_lang]
+        return voice, lang
 
     def log(t: dict, action: str, target: str = "", **detail) -> None:
         store.audit(t["id"], t.get("key_id") or "admin", action, target, detail)
@@ -246,10 +297,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             d["joinUrl"] = f"{ws}/ws/calls/{c['id']}?token={c['join_token']}"
         return d
 
-    def webhook(t: dict, type_: str, call: dict) -> None:
+    def webhook(t: dict, type_: str, call: dict, **extra) -> None:
         if dispatcher and t.get("webhook_url"):
             dispatcher.spawn(t["webhook_url"], t["webhook_secret"],
-                             {"type": type_, "t": time.time(), "call": public_call(call)})
+                             {"type": type_, "t": time.time(), "call": public_call(call), **extra})
 
     app.state.draining = False
 
@@ -316,8 +367,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     @app.post("/v1/agents")
     async def create_agent(body: AgentIn, t: dict = Depends(tenant_write)):
         check_tools(body.tools, t["id"])
-        check_voice(body.voice)
-        a = store.create_agent(t["id"], body.name, body.model_dump(exclude={"name"}))
+        cfg0 = body.model_dump(exclude={"name"})
+        cfg0["voice"], cfg0["language"] = pick_voice("af_heart", None, body.voice, body.language, "voice" in body.model_fields_set)
+        check_voice(cfg0["voice"], cfg0["language"])
+        call_variables(cfg0, None, strict=False)
+        a = store.create_agent(t["id"], body.name, cfg0)
         log(t, "agent.create", a["id"], name=body.name)
         return redacted(a)
 
@@ -329,14 +383,20 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             raise HTTPException(404, "agent not found")
         if body.tools is not None:
             check_tools(body.tools, t["id"])
-        check_voice(body.voice)
         cfg = dict(cur["config"])
+        eff_voice, eff_lang = pick_voice(cfg.get("voice", "af_heart"), cfg.get("language"), body.voice, body.language,
+                                         "voice" in body.model_fields_set)
+        check_voice(eff_voice, eff_lang)
         changed = []
-        for k in ("systemPrompt", "voice", "greeting", "tools", "speed", "record"):
+        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record"):
             v = getattr(body, k)
             if v is not None:
                 cfg[k] = v
                 changed.append(k)
+        call_variables(cfg, None, strict=False)
+        if eff_voice != cfg.get("voice"):
+            cfg["voice"] = eff_voice
+            changed.append("voice")
         log(t, "agent.update", agent_id, fields=changed)
         return redacted(store.update_agent(t["id"], agent_id, body.name, cfg))
 
@@ -360,15 +420,18 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             if not agent:
                 raise HTTPException(404, "agent not found")
             base = dict(agent["config"])
-        for k in ("systemPrompt", "voice", "greeting", "tools", "speed", "record"):
+        for k in ("systemPrompt", "voice", "language", "greeting", "tools", "speed", "record"):
             v = getattr(body, k)
             if v is not None:
                 if k == "tools":
                     check_tools(v, t["id"])
-                if k == "voice":
-                    check_voice(v)
                 base[k] = v
-        call = store.create_call(t["id"], body.agentId, "webSocket", base, body.metadata)
+        given_vars = call_variables(base, body.variables, strict=True)
+        base["voice"], base["language"] = pick_voice(base.get("voice", "af_heart"), base.get("language"), body.voice,
+                                                      body.language, "voice" in body.model_fields_set)
+        check_voice(base["voice"], base["language"])
+        call = store.create_call(t["id"], body.agentId, "webSocket", base,
+                                 {**body.metadata, **({"variables": given_vars} if given_vars else {})})
         return public_call(call, with_join=True)
 
     @app.get("/v1/calls")
@@ -428,7 +491,13 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     @app.get("/v1/voices")
     async def voices(t: dict = Depends(tenant)):
-        return {"voices": VOICES, "speed": {"min": 0.7, "max": 1.3, "default": 1.0}}
+        langs = []
+        for code, names in ttsmod.VOICES_BY_LANG.items():
+            why = ttsmod.why_unavailable(code)
+            langs.append({"code": ttsmod.LANG_ISO[code], "kokoroCode": code, "name": LANG_NAME[ttsmod.LANG_ISO[code]],
+                          "voices": names, "available": not why, "reason": why or None,
+                          "defaultVoice": DEFAULT_VOICE[ttsmod.LANG_ISO[code]]})
+        return {"voices": VOICES, "languages": langs, "speed": {"min": 0.7, "max": 1.3, "default": 1.0}}
 
     # ------------------------------------------------------- recordings
     @app.get("/v1/calls/{call_id}/recording")
@@ -505,6 +574,33 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         store.put_tool(t["id"], name, spec)
         log(t, "tool.put", name)
         return {"name": name, "spec": toolmod.redact_specs([spec])[0]}
+
+    @app.post("/v1/tools/import-openapi")
+    async def import_openapi(body: OpenApiImportIn, t: dict = Depends(tenant_write)):
+        """Creates one library tool per OpenAPI operation. Use them in an agent as {"library": "<name>"}."""
+        try:
+            tools, skipped = openapi_import.import_spec(body.spec, base_url=body.baseUrl, headers=body.headers,
+                                                        include=body.include, prefix=body.prefix,
+                                                        confirm_writes=body.confirmWrites)
+        except toolmod.ToolConfigError as e:
+            raise HTTPException(422, str(e)) from e
+        existing = {x["name"] for x in store.list_tools(t["id"])}
+        imported = []
+        for spec in tools:
+            if spec["name"] in existing and not body.overwrite:
+                skipped.append({"operation": spec["name"], "reason": "a library tool with this name exists (overwrite=true)"})
+                continue
+            if len(existing) >= 200 and spec["name"] not in existing:
+                skipped.append({"operation": spec["name"], "reason": "tool library is full (200)"})
+                continue
+            if not body.dryRun:
+                store.put_tool(t["id"], spec["name"], spec)
+                existing.add(spec["name"])
+            imported.append(spec)
+        if not body.dryRun:
+            log(t, "tool.import_openapi", "", count=len(imported), skipped=len(skipped))
+        return {"dryRun": body.dryRun, "imported": [x["name"] for x in imported], "skipped": skipped,
+                "tools": toolmod.redact_specs(imported)}
 
     @app.get("/v1/tools")
     async def list_tools(t: dict = Depends(tenant)):
@@ -644,7 +740,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             runtime.finalize(call["id"])
         except Exception:  # noqa: BLE001  (a failed recording write must not break call teardown)
             METRICS.inc("vox_errors_total", where="finalize")
-        webhook(t, "call.ended", store.get_call_any(call["id"]))
+        done = store.get_call_any(call["id"])
+        secs = round((done["ended"] - done["joined"]), 2) if done.get("joined") and done.get("ended") else 0.0
+        webhook(t, "call.ended", done, durationSeconds=secs,
+                transcript=[{"role": m["role"], "text": m["text"], "t": m["t"]} for m in store.messages(call["id"])[:500]])
 
     @app.websocket("/ws/calls/{call_id}")
     async def ws_call(ws: WebSocket, call_id: str, token: str = ""):
@@ -759,7 +858,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         cfg = dict(agent["config"])
         if body.record is not None:
             cfg["record"] = body.record
+        given_vars = call_variables(cfg, body.variables, strict=True)
         meta = {**body.metadata, "direction": "outbound", "from": caller_id, "to": body.to}
+        if given_vars:
+            meta["variables"] = given_vars
         if body.voicemailMessage:
             meta["voicemail"] = body.voicemailMessage
         call = store.create_call(t["id"], body.agentId, "twilio", cfg, meta)

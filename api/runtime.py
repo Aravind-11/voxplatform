@@ -132,9 +132,19 @@ class Runtime:
                     with open(os.path.join(rec_dir, "utterances", "index.jsonl"), "a") as f:
                         f.write(json.dumps({"call": call["id"], "n": counter["n"], "text": text, "eot": eot,
                                             "seconds": round(len(audio) / 16000, 2)}) + "\n")
-        scfg = SessionConfig(system_prompt=cfg.get("systemPrompt") or SessionConfig.system_prompt,
+        from . import variables as varmod
+        values = {**{k: str(v) for k, v in (cfg.get("variables") or {}).items()},
+                  **{k: str(v) for k, v in (meta.get("variables") or {}).items()},
+                  "caller": str(meta.get("from", "")), "callee": str(meta.get("to", "")), "callId": call["id"]}
+        prompt = varmod.render(cfg.get("systemPrompt") or SessionConfig.system_prompt, values)
+        from core.tts import LANG_NAME
+        if cfg.get("language") in LANG_NAME:
+            name = LANG_NAME[cfg["language"]]
+            prompt += (f"\n\nAlways speak and reply in {name}, whatever language the caller uses; "
+                       f"if they speak another language, politely stay in {name}.")
+        scfg = SessionConfig(system_prompt=prompt,
                              out_rate=transport.out_rate, tools_schema=schemas,
-                             greeting=str(cfg.get("greeting") or ""),
+                             greeting=varmod.render(str(cfg.get("greeting") or ""), values),
                              turn=TurnConfig(end_ms=float(os.environ.get("VOX_END_MS", "640")),
                                              eot_threshold=float(os.environ.get("VOX_EOT_THRESHOLD", "0.8")),
                                              patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000"))))

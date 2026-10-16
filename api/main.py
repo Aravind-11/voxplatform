@@ -18,7 +18,8 @@
   VOX_EMBED_URL            OpenAI-compatible embeddings server (e.g. http://127.0.0.1:8001/v1) -> hybrid knowledge-base search
   VOX_EMBED_MODEL          default BAAI/bge-small-en-v1.5;  VOX_EMBED_MIN_SIM  cosine floor for dense matches (default 0)
   VOX_RETENTION_DAYS       erase ended calls older than this for tenants without their own limit (default: keep)
-  VOX_NO_ESPEAK=1          run Kokoro without the GPL espeak-ng fallback
+  VOX_NO_ESPEAK=1          run Kokoro without the GPL espeak-ng fallback (English only; Spanish/French/Italian/Portuguese/Hindi need espeak)
+  VOX_PRELOAD_LANGS        Kokoro language codes to load at start-up, default a (a,b English; e,f,h,i,p,j,z others; see docs/LANGUAGES.md)
   VOX_ALLOW_UNSIGNED_TWILIO=1   development only
   VOX_EOT, VOX_EOT_THRESHOLD, VOX_END_MS, VOX_PATIENT_MS, VOX_TTS_CONCURRENCY, VOX_LOG_EVENTS: see docs/TUNING.md
 Run: uvicorn api.main:app --host 0.0.0.0 --port 8080   (put TLS in front; Twilio needs wss)."""
@@ -52,8 +53,8 @@ def build():
                         retention_default_days=int(env.get("VOX_RETENTION_DAYS", "0")),
                         default_concurrency=int(env.get("VOX_DEFAULT_CONCURRENCY", "10")))
     store = Store(env.get("VOX_DB", "vox.db"))
-    from core.tts import make_pipeline
-    pipeline = make_pipeline("a")                     # loaded once, shared by all calls
+    from core.tts import PipelineSet
+    pipelines = PipelineSet(preload=env.get("VOX_PRELOAD_LANGS", "a"))   # one front end per language, shared by all calls
     llm = VllmClient(base_url=env.get("VOX_VLLM_URL", "http://127.0.0.1:8000/v1"),
                      audio_style=env.get("VOX_AUDIO_STYLE", "input_audio"))
     http = httpx.AsyncClient()
@@ -62,7 +63,7 @@ def build():
         from core.embed import OpenAIEmbedder
         embedder = OpenAIEmbedder(env["VOX_EMBED_URL"], env.get("VOX_EMBED_MODEL", "BAAI/bge-small-en-v1.5"), http,
                                   min_sim=float(env.get("VOX_EMBED_MIN_SIM", "0")))
-    rt = Runtime(llm, lambda voice: KokoroTTS(voice=voice, pipeline=pipeline), SileroVAD, store,
+    rt = Runtime(llm, lambda voice: KokoroTTS(voice=voice, pipeline=pipelines.for_voice(voice)), SileroVAD, store,
                  http=http, record_dir=settings.record_dir, embedder=embedder)   # one pooled client for tools and Twilio
     redis_url = env.get("VOX_REDIS_URL", "")
     limiter = (security.RedisLimiter(redis_url, settings.default_concurrency) if redis_url

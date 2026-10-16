@@ -57,7 +57,7 @@ Deliveries are retried by the dispatcher; make your handler idempotent on `call.
 No VoxSun documentation or access was available. The engine needs a transport with: receive caller audio frames, send agent audio frames,
 clear queued audio on interruption, end call, optional DTMF, and call lifecycle events. Model it on `transports/twilio.py`
 (~200 lines). Open questions are listed in ASSESSMENT.md section 5 (audio delivery, codec, flush, lifecycle, auth, test access).
-If VoxSun can only offer SIP/RTP, a SIP stack must be added; that is not estimated here beyond "weeks".
+If VoxSun streams audio over a WebSocket like Twilio does, expect about a day to write it and 2-3 days with testing (estimate). If it is SIP/RTP only, a SIP stack must be added; that is not estimated here beyond "weeks".
 
 ## 6. Security notes
 Use a least-privilege service token for tool calls; keep `confirmWrites` on; terminate TLS at the proxy; verify webhook signatures; keep API keys per role.

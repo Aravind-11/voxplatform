@@ -121,7 +121,7 @@ I have no VoxSun documentation or access, so **everything here is an assumption 
 4. Call lifecycle: how do we learn the call started, ended, or failed, and can VoxSun re-route a call if our stream drops (the recovery feature depends on it)?
 5. Authentication of VoxSun to us and of us to VoxSun; network path (public internet or private link).
 6. Test access: a test number or call generator.
-Time for the adapter once those are answered: about 1-2 weeks including a test call (estimate).
+Time for the adapter once those are answered: if VoxSun streams audio over a WebSocket like Twilio does, writing it is about a day (the Twilio transport was built in hours); allow 2-3 days including a clean test call and fixes. Waiting for access and documentation is not counted. If VoxSun is SIP/RTP only, a SIP stack is needed and this estimate does not apply (estimate).
 
 ### Security boundaries
 TLS at the proxy only (nodes are on a private network). Accounts are isolated by an account id on every query (tested for cross-account access). API keys are stored as hashes, have roles (admin, developer, viewer), can be rotated and revoked, and every change is audited. Tool credentials are write-only. Tools cannot reach private or internal addresses. Phone webhooks are signature-checked and fail closed. `/metrics` needs a token and is not exposed publicly. Recording is opt-in per agent. **Known risks:** caller speech can attempt prompt injection against tools (mitigated by read-back and fixed parameters, not eliminated); the DNS-rebinding race on tool URLs (production should add an egress proxy); no external penetration test.

@@ -11,6 +11,19 @@ from typing import AsyncIterator
 import numpy as np
 
 
+def make_pipeline(lang_code: str = "a"):
+    """Loads Kokoro once. VOX_NO_ESPEAK=1 replaces the grapheme-to-phoneme stage with misaki's dictionary-only
+    English G2P (no espeak-ng fallback), so no GPL-3.0 code is used at run time. Out-of-dictionary words
+    (rare names, codes) are then pronounced less well. Written, not yet run on the GPU box: see docs/LICENSES.md."""
+    import os
+    from kokoro import KPipeline
+    pipeline = KPipeline(lang_code=lang_code)
+    if os.environ.get("VOX_NO_ESPEAK") == "1" and lang_code in ("a", "b"):
+        from misaki import en
+        pipeline.g2p = en.G2P(trf=False, british=(lang_code == "b"), fallback=None)
+    return pipeline
+
+
 class KokoroTTS:
     sample_rate = 24000
 

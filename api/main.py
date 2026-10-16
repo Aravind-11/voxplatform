@@ -25,8 +25,8 @@ def build():
                         allow_unsigned_twilio=env.get("VOX_ALLOW_UNSIGNED_TWILIO") == "1",
                         default_concurrency=int(env.get("VOX_DEFAULT_CONCURRENCY", "10")))
     store = Store(env.get("VOX_DB", "vox.db"))
-    from kokoro import KPipeline
-    pipeline = KPipeline(lang_code="a")               # loaded once, shared by all calls
+    from core.tts import make_pipeline
+    pipeline = make_pipeline("a")                     # loaded once, shared by all calls
     llm = VllmClient(base_url=env.get("VOX_VLLM_URL", "http://127.0.0.1:8000/v1"),
                      audio_style=env.get("VOX_AUDIO_STYLE", "input_audio"))
     rt = Runtime(llm, lambda voice: KokoroTTS(voice=voice, pipeline=pipeline), SileroVAD, store,

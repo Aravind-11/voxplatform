@@ -102,6 +102,8 @@ class VllmClient:
         return {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{b64}"}}
 
     def build_messages(self, history: list[dict], audio: np.ndarray, followups: list[dict]) -> list[dict]:
+        if len(audio) == 0:            # a text turn (e.g. keypad digits): the user message is already in history
+            return [*history, *followups]
         user = {"role": "user", "content": [self.audio_part(audio)]}
         return [*history, user, *followups]
 

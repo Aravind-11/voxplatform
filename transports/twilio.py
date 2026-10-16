@@ -18,11 +18,13 @@ from typing import Awaitable, Callable
 
 import numpy as np
 
+from core import dtmf
 from core.audio import StreamResampler, mulaw_to_pcm16, pcm16_to_mulaw
 from core.session import FRAME_SAMPLES, Session
 
 SessionFactory = Callable[["TwilioTransport", dict], Awaitable[Session]]
 MAX_PAYLOAD_SAMPLES = 8000  # 1 s per outbound media message
+DTMF_IDLE_S = 2.0           # keypad digits are handed to the agent as one turn after this much quiet, or on '#'
 
 
 class TwilioTransport:
@@ -40,6 +42,8 @@ class TwilioTransport:
         self._send_lock = asyncio.Lock()
         self._rs = StreamResampler(8000, 16000)
         self._buf = np.zeros(0, dtype=np.int16)
+        self._digits = ""
+        self._dtmf_task: asyncio.Task | None = None
 
     async def _send(self, obj: dict) -> None:
         async with self._send_lock:
@@ -58,6 +62,29 @@ class TwilioTransport:
 
     async def clear(self) -> None:
         await self._send({"event": "clear", "streamSid": self.stream_sid})
+
+    async def send_dtmf(self, digits: str) -> None:
+        """Press keypad digits on the call by sending DTMF tones as audio."""
+        await self.send_audio(dtmf.sequence(digits, 8000), 8000)
+
+    def _on_dtmf(self, digit: str) -> None:
+        """Collects keypad presses; '#' or a pause ends the entry and it reaches the agent as a text turn."""
+        if not digit:
+            return
+        if self._dtmf_task:
+            self._dtmf_task.cancel()
+        if digit == "#":
+            self._dtmf_task = asyncio.create_task(self._flush_digits(0.0))
+            return
+        self._digits += digit
+        self._dtmf_task = asyncio.create_task(self._flush_digits(DTMF_IDLE_S))
+
+    async def _flush_digits(self, delay: float) -> None:
+        if delay:
+            await asyncio.sleep(delay)
+        digits, self._digits = self._digits, ""
+        if digits and self.session is not None:
+            await self.session.inject_text(f"[The caller pressed these keypad digits: {digits}]")
 
     async def end(self) -> None:
         """Hang up: closing the media stream with no further TwiML after <Connect> ends the call."""
@@ -82,6 +109,8 @@ class TwilioTransport:
                     m = msg["media"]
                     if m.get("track", "inbound") == "inbound":
                         await self._on_media(m["payload"])
+                elif ev == "dtmf":
+                    self._on_dtmf(str((msg.get("dtmf") or {}).get("digit", "")))
                 elif ev == "mark":
                     self.marks_acked += 1
                 elif ev == "stop":
@@ -89,6 +118,8 @@ class TwilioTransport:
         except EOFError:          # socket adapter signals a peer disconnect
             pass
         finally:
+            if self._dtmf_task:
+                self._dtmf_task.cancel()
             if self.session is not None:
                 await self.session.close()
 

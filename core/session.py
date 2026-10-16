@@ -108,7 +108,9 @@ class Session:
                  cfg: SessionConfig | None = None, tools: dict[str, Tool] | None = None,
                  on_event: OnEvent | None = None,
                  eot_fn: Optional[Callable[[np.ndarray, list[dict]], float]] = None,
-                 eot_async: Optional[Callable[[np.ndarray, list[dict]], Awaitable[float]]] = None):
+                 eot_async: Optional[Callable[[np.ndarray, list[dict]], Awaitable[float]]] = None,
+                 recorder: Any = None,
+                 on_utterance: Optional[Callable[[np.ndarray, str, Optional[float]], None]] = None):
         self.llm, self.tts, self.vad = llm, tts, vad
         self.send_audio, self.clear_audio = send_audio, clear_audio
         self.clock = clock
@@ -117,6 +119,9 @@ class Session:
         self.on_event = on_event or (lambda e: None)
         self.eot_fn = eot_fn
         self.eot_async = eot_async
+        self.recorder = recorder              # optional core.recorder.CallRecorder: mic(frame), agent(pcm, rate), clear()
+        self.on_utterance = on_utterance      # optional dataset hook: (audio16k, transcript, eot_score)
+        self._last_eot: Optional[float] = None
         self._eot_task: Optional[asyncio.Task] = None
         self.turn = TurnManager(self.cfg.turn, eot_scorer=self._eot_score if eot_fn else None)
         self.tracker = PlaybackTracker(clock, self.cfg.output_latency_ms)
@@ -132,6 +137,8 @@ class Session:
     # ------------------------------------------------------------------ input
     async def feed(self, frame: np.ndarray) -> None:
         """Feed one 512-sample 16 kHz int16 frame (32 ms)."""
+        if self.recorder is not None:
+            self.recorder.mic(frame)
         prob = self.vad.prob(frame)
         if prob >= self.cfg.turn.threshold:
             self._last_speech_clock = self.clock()
@@ -163,6 +170,36 @@ class Session:
                      asyncio.create_task(self._drain(gen))]
         self._gen = gen
         self._emit("greeting", text=text)
+
+    async def say_and_wait(self, text: str, timeout_s: float = 60.0) -> None:
+        """Speaks fixed text and returns once it has finished playing (or the caller talked over it)."""
+        self.say(text)
+        gen = self._gen
+        assert gen is not None
+        deadline = self.clock() + timeout_s * 1000.0
+        await asyncio.wait({gen.tasks[-1]}, timeout=timeout_s)         # the drain task: every sentence sent
+        while not gen.cancelled and self.tracker.buffered_ms() > 0 and self.clock() < deadline:
+            await asyncio.sleep(0.05)
+
+    async def inject_text(self, text: str) -> None:
+        """A caller turn that arrived as text (keypad digits): interrupts the agent like speech would, then replies."""
+        g = self._gen
+        if g and g.committed and self._agent_active():
+            await self._interrupt(g)
+        elif g and not g.committed:
+            await self._cancel(g)
+            self._gen = None
+        self.stats["turns"] += 1
+        self.history.append({"role": "user", "content": text})
+        base = list(self.history)
+        self.history.append({"role": "assistant", "content": ""})
+        gen = _Generation(np.zeros(0, np.int16), base, self.clock())
+        gen.committed = True
+        gen.commit.set()
+        gen.tasks = [asyncio.create_task(self._produce(gen)), asyncio.create_task(self._synth(gen)),
+                     asyncio.create_task(self._drain(gen))]
+        self._gen = gen
+        self._emit("user_transcript", text=text, source="text")
 
     async def close(self) -> None:
         self._cancel_eot()
@@ -229,6 +266,7 @@ class Session:
         except Exception as e:  # noqa: BLE001
             self._emit("error", where="eot", error=repr(e))
             return
+        self._last_eot = score
         self._emit("eot_score", score=round(score, 3), ms=self.clock() - t0)
         for ev in self.turn.apply_eot(score):
             await self._handle(ev)
@@ -266,6 +304,11 @@ class Session:
             self._emit("error", where="transcribe", error=repr(e))
         self.history[idx]["content"] = text
         self._emit("user_transcript", text=text)
+        if self.on_utterance is not None:
+            try:
+                self.on_utterance(audio, text, self._last_eot)
+            except Exception as e:  # noqa: BLE001  (a dataset write must never break a call)
+                self._emit("error", where="utterance_sink", error=repr(e))
 
     async def _produce(self, gen: _Generation) -> None:
         followups: list[dict] = []
@@ -395,6 +438,8 @@ class Session:
                 self._emit("agent_first_audio",
                            latency_ms=self.clock() - gen.speech_end_clock)
             await self.send_audio(pcm, self.cfg.out_rate)
+            if self.recorder is not None:
+                self.recorder.agent(pcm, self.cfg.out_rate)
             dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
             self.tracker.on_sent(text, dur)
             gen.pending_ms -= dur
@@ -407,6 +452,8 @@ class Session:
     async def _interrupt(self, gen: _Generation) -> None:
         heard, cut = self.tracker.heard()
         await self.clear_audio()          # stop the far end first: that is what the caller hears
+        if self.recorder is not None:
+            self.recorder.clear()
         await self._cancel(gen)
         a, gen.after = gen.after, None
         if a is not None and a.strict:

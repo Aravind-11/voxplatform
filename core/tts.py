@@ -11,6 +11,11 @@ from typing import AsyncIterator
 import numpy as np
 
 
+VOICES = ["af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky", "af_alloy", "af_aoede", "af_jessica", "af_kore",
+          "af_nova", "af_river", "am_adam", "am_echo", "am_eric", "am_liam", "am_michael", "am_onyx", "am_puck",
+          "bf_alice", "bf_emma", "bf_isabella", "bf_lily", "bm_daniel", "bm_fable", "bm_george", "bm_lewis"]
+
+
 def make_pipeline(lang_code: str = "a"):
     """Loads Kokoro once. VOX_NO_ESPEAK=1 replaces the grapheme-to-phoneme stage with misaki's dictionary-only
     English G2P (no espeak-ng fallback), so no GPL-3.0 code is used at run time. Out-of-dictionary words

@@ -59,6 +59,10 @@ class CallContext:
     end: Callable[[], Awaitable[None]] = _noop_end
     twilio: Optional[dict] = None          # {"sid": ..., "token": ...} for transfer
     turn_fn: Callable[[], int] = lambda: 0  # how many caller turns have ended so far (set by the runtime)
+    docs: Optional[Callable[[str], tuple]] = None             # knowledge base name -> (version, [{id,title,text}])
+    send_dtmf: Optional[Callable[[str], Awaitable[None]]] = None    # press keypad digits on a phone call
+    voicemail: Optional[Callable[[str], Awaitable[None]]] = None    # speak a message, then hang up
+    client_call: Optional[Callable[..., Awaitable[Any]]] = None     # run a tool in the caller's browser
 
 
 def _canon(args: dict) -> str:
@@ -97,6 +101,21 @@ def with_confirmation(fn, schema: dict, ctx):
     return sch, run
 
 
+def resolve_library(specs: list, lookup: Callable[[str], Optional[Any]]) -> list:
+    """Replaces {"library": "name"} entries with the tenant's stored tool definition (resolved again at every call,
+    so editing a library tool updates every agent that uses it). `lookup(name)` returns the spec or None."""
+    out = []
+    for sp in specs or []:
+        if isinstance(sp, dict) and "library" in sp:
+            found = lookup(str(sp["library"]))
+            if found is None:
+                raise ToolConfigError(f"tool library has no tool named {sp['library']!r}")
+            out.append(found)
+        else:
+            out.append(sp)
+    return out
+
+
 def validate_specs(specs: list) -> list[dict]:
     """Normalizes an agent's tool list or raises ToolConfigError (surfaced as HTTP 422 at agent creation)."""
     out: list[dict] = []
@@ -104,11 +123,11 @@ def validate_specs(specs: list) -> list[dict]:
         if isinstance(sp, str):
             if sp in DEMO_SCHEMAS:
                 out.append({"demo": sp})
-            elif sp == "hangUp":
-                out.append(builtin_tools.validate({"builtin": "hangUp"}))
+            elif sp in ("hangUp", "playDtmf"):
+                out.append(builtin_tools.validate({"builtin": sp}))
             else:
                 raise ToolConfigError(f"unknown tool {sp!r}; use a name from "
-                                      f"{sorted(DEMO_SCHEMAS) + ['hangUp']} or a tool definition object")
+                                      f"{sorted(DEMO_SCHEMAS) + ['hangUp', 'playDtmf']} or a tool definition object")
         elif isinstance(sp, dict) and "tool" in sp:          # a named tool with options: {"tool": "book_slot", "confirm": true}
             if sp["tool"] not in DEMO_SCHEMAS:
                 raise ToolConfigError(f"unknown tool {sp['tool']!r}; options apply to {sorted(DEMO_SCHEMAS)}")
@@ -119,7 +138,7 @@ def validate_specs(specs: list) -> list[dict]:
             out.append(http_tools.validate(sp))
     seen: set[str] = set()
     for d in out:
-        n = d.get("name") or d.get("demo") or d.get("builtin")
+        n = d.get("name") or d.get("demo") or d.get("builtin")      # client tools are named by their own name
         if n in seen:
             raise ToolConfigError(f"tool {n!r} is listed twice")
         seen.add(n)
@@ -157,7 +176,8 @@ def build(specs: list, ctx: Optional[CallContext] = None, client: Any = None):
                 sch, fn = with_confirmation(fn, sch, ctx)
             schemas[d["demo"]], fns[d["demo"]] = sch, fn
         elif "builtin" in d:
-            schemas[d["builtin"]], fns[d["builtin"]] = builtin_tools.schema(d), builtin_tools.make(d, ctx, client)
+            key = d.get("name") or d["builtin"]
+            schemas[key], fns[key] = builtin_tools.schema(d), builtin_tools.make(d, ctx, client)
         else:
             sch, fn = http_tools.schema(d), http_tools.make_http_tool(d, ctx, client)
             if d.get("confirm"):

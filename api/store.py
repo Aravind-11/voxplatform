@@ -40,11 +40,16 @@ CREATE TABLE IF NOT EXISTS corpora(
 CREATE TABLE IF NOT EXISTS docs(
   id TEXT PRIMARY KEY, corpus_id TEXT, tenant_id TEXT, title TEXT, text TEXT, created {REAL});
 CREATE INDEX IF NOT EXISTS docs_corpus ON docs(corpus_id);
+CREATE TABLE IF NOT EXISTS ledger(
+  id {SERIAL}, tenant_id TEXT, t {REAL}, kind TEXT, micros BIGINT, ref TEXT, detail TEXT);
+CREATE INDEX IF NOT EXISTS ledger_tenant ON ledger(tenant_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS ledger_ref ON ledger(kind, ref);
 """
 
 # columns added after the first release: (table, column, type)
 MIGRATIONS = [("api_keys", "id", "TEXT"), ("api_keys", "revoked", "{REAL}"), ("tenants", "rate_per_minute", "{REAL}"),
-              ("api_keys", "role", "TEXT"), ("tenants", "retention_days", "INTEGER")]
+              ("api_keys", "role", "TEXT"), ("tenants", "retention_days", "INTEGER"),
+              ("tenants", "email", "TEXT"), ("tenants", "prepaid", "INTEGER")]
 ROLES = ("admin", "developer", "viewer")      # viewer: read only; developer: read + change agents/tools/calls; admin: also keys, audit, webhook, deletes
 
 
@@ -72,6 +77,7 @@ class Store:
                     self._run(stmt)
             for table, col, typ in MIGRATIONS:
                 self._add_column(table, col, typ.format(REAL=real))
+            self._run("CREATE UNIQUE INDEX IF NOT EXISTS tenants_email ON tenants(email)")    # after the email column exists
             self._x("UPDATE api_keys SET role='admin' WHERE role IS NULL")      # keys from before roles existed keep full rights
             for r in self._all("SELECT key_hash FROM api_keys WHERE id IS NULL"):
                 self._x("UPDATE api_keys SET id=? WHERE key_hash=?", (new_id("key"), r["key_hash"]))
@@ -116,11 +122,40 @@ class Store:
             self.db.close()
 
     # ---- tenants / keys
-    def create_tenant(self, name: str, concurrency_limit: Optional[int] = None) -> str:
+    def create_tenant(self, name: str, concurrency_limit: Optional[int] = None, email: Optional[str] = None,
+                      prepaid: bool = False) -> str:
         tid = new_id("tnt")
-        self._x("INSERT INTO tenants(id, name, webhook_url, webhook_secret, concurrency_limit, created) VALUES(?,?,?,?,?,?)",
-                (tid, name, None, None, concurrency_limit, time.time()))
+        self._x("INSERT INTO tenants(id, name, webhook_url, webhook_secret, concurrency_limit, created, email, prepaid) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (tid, name, None, None, concurrency_limit, time.time(), email.lower() if email else None, 1 if prepaid else 0))
         return tid
+
+    def tenant_by_email(self, email: str) -> Optional[dict]:
+        return self._one("SELECT * FROM tenants WHERE email=?", (email.lower(),))
+
+    def set_prepaid(self, tenant_id: str, prepaid: bool) -> None:
+        self._x("UPDATE tenants SET prepaid=? WHERE id=?", (1 if prepaid else 0, tenant_id))
+
+    # ---- prepaid balance. The ledger is the single source of truth: balance = sum of entries, in micro-dollars
+    # (1 USD = 1,000,000), so there is no separate counter that could drift. (kind, ref) is unique: a Stripe event
+    # or a call can be applied only once, however many times it is delivered.
+    def ledger_add(self, tenant_id: str, micros: int, kind: str, ref: str = "", detail: Optional[dict] = None) -> bool:
+        """Adds an entry. Returns False (and changes nothing) if an entry with this kind and ref already exists."""
+        ref = ref or new_id("ref")                     # entries without a natural reference are never deduplicated
+        return self._x("INSERT INTO ledger(tenant_id, t, kind, micros, ref, detail) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                       (tenant_id, time.time(), kind, int(micros), ref, json.dumps(detail or {}, default=str))) > 0
+
+    def balance_micros(self, tenant_id: str) -> int:
+        r = self._one("SELECT COALESCE(SUM(micros), 0) AS b FROM ledger WHERE tenant_id=?", (tenant_id,))
+        return int(r["b"])
+
+    def ledger_list(self, tenant_id: str, limit: int = 50) -> list[dict]:
+        rows = self._all("SELECT t, kind, micros, ref, detail FROM ledger WHERE tenant_id=? ORDER BY id DESC LIMIT ?",
+                         (tenant_id, max(1, min(limit, 500))))
+        for r in rows:
+            r["detail"] = json.loads(r["detail"] or "{}")
+            r["micros"] = int(r["micros"])
+        return rows
 
     def add_key(self, tenant_id: str, key_hash: str, label: str = "", role: str = "admin") -> str:
         assert role in ROLES, role

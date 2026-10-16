@@ -145,7 +145,7 @@ class Runtime:
                 store.add_message(cid, "user", e["text"], time.time())
             elif e["type"] == "agent_speech":
                 store.add_message(cid, "agent", e["text"], time.time())
-            if forward_events and hasattr(transport, "send_event") and e["type"] != "agent_speech":
+            if forward_events and hasattr(transport, "send_event"):
                 import asyncio
                 asyncio.get_running_loop().create_task(transport.send_event(e))
 

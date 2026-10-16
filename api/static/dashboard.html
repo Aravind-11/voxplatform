@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice platform dashboard</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --ink:#1c1c1a; --mute:#6b6b66; --line:#e3e3de; --acc:#2a5bd7; --ok:#1f9d6b; --warn:#c0392b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --card:#1f1f1d; --ink:#ececE8; --mute:#9a9a94; --line:#33332f; --acc:#6d95ff; --ok:#45c796; --warn:#ff7b6b; } }
+  * { box-sizing:border-box } body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--ink) }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); background:var(--card) }
+  header h1 { font-size:16px; margin:0 12px 0 0 } nav { display:flex; flex-wrap:wrap; gap:4px; flex:1 }
+  nav button { background:none; border:0; padding:6px 10px; border-radius:6px; color:var(--mute); cursor:pointer; font:inherit }
+  nav button.on { background:var(--bg); color:var(--ink); font-weight:600 }
+  main { max-width:1000px; margin:0 auto; padding:16px }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:12px; overflow-x:auto }
+  table { width:100%; border-collapse:collapse } th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; white-space:nowrap }
+  th { color:var(--mute); font-weight:500; font-size:12px } td.w { white-space:normal }
+  input, select, textarea { padding:7px 9px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--ink); font:inherit; max-width:100% }
+  textarea { width:100%; min-height:90px; font-family:ui-monospace,monospace; font-size:12px }
+  button.b { padding:7px 12px; border:0; border-radius:6px; background:var(--acc); color:#fff; cursor:pointer; font:inherit } button.d { background:var(--warn) } button.g { background:var(--mute) }
+  .stats { display:flex; flex-wrap:wrap; gap:12px } .stat { flex:1; min-width:130px } .stat b { display:block; font-size:22px }
+  .mute { color:var(--mute) } .err { color:var(--warn) } .ok { color:var(--ok) }
+  .bar { height:14px; background:var(--acc); border-radius:3px; min-width:2px } .barrow { display:grid; grid-template-columns:90px 1fr 80px; gap:8px; align-items:center; margin:3px 0 }
+  .chat div { padding:5px 0; border-bottom:1px solid var(--line) } .chat b { display:inline-block; width:56px; color:var(--mute); font-weight:500 }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0 }
+  code { font-family:ui-monospace,monospace; font-size:12px; background:var(--bg); padding:1px 5px; border-radius:4px }
+</style>
+</head>
+<body>
+<header>
+  <h1>Voice platform</h1>
+  <nav id="nav"></nav>
+  <input id="key" type="password" placeholder="API key" autocomplete="off" style="width:200px">
+  <button class="b" id="login">Connect</button>
+  <a href="/demo" class="mute">Live demo</a>
+</header>
+<main id="main"><div class="card mute">Enter your API key to begin.</div></main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const ss = { get(k){ try { return sessionStorage.getItem(k) } catch(e){ return null } }, set(k,v){ try { sessionStorage.setItem(k,v) } catch(e){} } };
+function h(tag, attrs, ...kids) {           // text is always set via textContent: nothing here is ever parsed as HTML
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) { if (k === "on") for (const [ev, fn] of Object.entries(v)) e.addEventListener(ev, fn); else if (k === "class") e.className = v; else e.setAttribute(k, v); }
+  for (const c of kids.flat()) if (c != null) e.append(c.nodeType ? c : document.createTextNode(String(c)));
+  return e;
+}
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { "X-API-Key": $("key").value.trim(), "Content-Type": "application/json", ...(opts.headers || {}) } });
+  const txt = await r.text(); let data = null; try { data = JSON.parse(txt) } catch (e) { data = txt }
+  if (!r.ok) throw new Error((data && data.detail) || txt.slice(0, 200) || r.status);
+  return data;
+}
+const when = (t) => t ? new Date(t * 1000).toLocaleString() : "";
+const dur = (c) => c.joined && c.ended ? Math.round(c.ended - c.joined) + " s" : "";
+const TABS = ["Calls", "Agents", "Usage", "Knowledge", "Tools", "Keys", "Audit"];
+let tab = "Calls";
+const main = $("main");
+function note(el, msg, ok) { el.textContent = msg; el.className = ok ? "ok" : "err"; }
+
+function nav() { const n = $("nav"); n.textContent = ""; for (const t of TABS) n.append(h("button", { class: t === tab ? "on" : "", on: { click: () => { tab = t; render(); } } }, t)); }
+async function render() {
+  nav(); main.textContent = "";
+  try { await VIEWS[tab](); } catch (e) { main.append(h("div", { class: "card err" }, String(e.message || e))); }
+}
+const VIEWS = {
+  async Calls() {
+    const [calls, me] = await Promise.all([api("/v1/calls"), api("/v1/me")]);
+    const body = h("tbody");
+    for (const c of calls) body.append(h("tr", {},
+      h("td", {}, h("a", { href: "#", on: { click: (e) => { e.preventDefault(); showCall(c); } } }, c.id.slice(0, 13))),
+      h("td", {}, c.status), h("td", {}, c.medium), h("td", {}, c.metadata && c.metadata.direction || ""), h("td", {}, when(c.created)), h("td", {}, dur(c)), h("td", {}, c.end_reason || "")));
+    main.append(h("div", { class: "card" }, h("span", { class: "mute" }, "Tenant " + me.name + " · cap " + me.concurrencyLimit + " concurrent calls"),
+      h("table", {}, h("thead", {}, h("tr", {}, ["Call", "Status", "Medium", "Dir", "Created", "Length", "Ended"].map((x) => h("th", {}, x)))), body)));
+    main.append(h("div", { id: "detail" }));
+  },
+  async Agents() {
+    const agents = await api("/v1/agents");
+    const out = h("div", { class: "mute" });
+    const f = { name: h("input", { placeholder: "name" }), prompt: h("textarea", { placeholder: "system prompt" }), greeting: h("input", { placeholder: "greeting (spoken first)", style: "width:100%" }),
+      voice: h("input", { value: "af_heart" }), rec: h("input", { type: "checkbox" }), tools: h("textarea", { placeholder: '["hangUp", {"library":"lookup"}]' }) };
+    f.tools.value = "[]";
+    main.append(h("div", { class: "card" }, h("b", {}, "New agent"), h("div", { class: "row" }, f.name, h("label", {}, "voice ", f.voice), h("label", {}, f.rec, " record calls (get consent)")),
+      f.prompt, h("div", { class: "row" }, f.greeting), h("div", { class: "mute" }, "tools (JSON list)"), f.tools,
+      h("div", { class: "row" }, h("button", { class: "b", on: { click: async () => { try {
+        await api("/v1/agents", { method: "POST", body: JSON.stringify({ name: f.name.value, systemPrompt: f.prompt.value, greeting: f.greeting.value, voice: f.voice.value, record: f.rec.checked, tools: JSON.parse(f.tools.value || "[]") }) });
+        render(); } catch (e) { note(out, e.message); } } } }, "Create"), out)));
+    for (const a of agents) {
+      const c = a.config, status = h("span", { class: "mute" });
+      const p = h("textarea", {}), g = h("input", { style: "width:100%" }), t = h("textarea", {});
+      p.value = c.systemPrompt || ""; g.value = c.greeting || ""; t.value = JSON.stringify(c.tools || [], null, 1);
+      main.append(h("div", { class: "card" }, h("b", {}, a.name), " ", h("code", {}, a.id), h("span", { class: "mute" }, " voice " + (c.voice || "") + (c.record ? " · recording on" : "")),
+        h("div", { class: "mute" }, "prompt"), p, h("div", { class: "mute" }, "greeting"), g, h("div", { class: "mute" }, "tools"), t,
+        h("div", { class: "row" }, h("button", { class: "b", on: { click: async () => { try {
+          await api("/v1/agents/" + a.id, { method: "PATCH", body: JSON.stringify({ systemPrompt: p.value, greeting: g.value, tools: JSON.parse(t.value || "[]") }) }); note(status, "saved", true); } catch (e) { note(status, e.message); } } } }, "Save"),
+          h("button", { class: "b d", on: { click: async () => { if (confirm("Delete agent " + a.name + "?")) { await api("/v1/agents/" + a.id, { method: "DELETE" }); render(); } } } }, "Delete"), status),
+        h("div", { class: "mute" }, "Phone webhook: POST /twilio/voice/" + a.id)));
+    }
+  },
+  async Usage() {
+    const u = await api("/v1/usage?days=30");
+    const max = Math.max(1, ...u.byDay.map((d) => d.minutes));
+    main.append(h("div", { class: "card stats" }, h("div", { class: "stat" }, h("b", {}, u.calls), "calls (30 days)"), h("div", { class: "stat" }, h("b", {}, u.minutes), "minutes"), h("div", { class: "stat" }, h("b", {}, u.active), "active now")));
+    main.append(h("div", { class: "card" }, h("b", {}, "Minutes per day"), u.byDay.map((d) => h("div", { class: "barrow" }, h("span", { class: "mute" }, d.key), h("div", { class: "bar", style: "width:" + (100 * d.minutes / max) + "%" }), d.minutes + " min"))));
+    main.append(h("div", { class: "card" }, h("b", {}, "By agent"), h("table", {}, u.byAgent.map((a) => h("tr", {}, h("td", {}, a.key), h("td", {}, a.calls + " calls"), h("td", {}, a.minutes + " min"))))));
+  },
+  async Knowledge() {
+    const cs = await api("/v1/corpora"); const out = h("span", { class: "mute" }); const name = h("input", { placeholder: "new knowledge base name" });
+    main.append(h("div", { class: "card" }, h("div", { class: "row" }, name, h("button", { class: "b", on: { click: async () => { try { await api("/v1/corpora", { method: "POST", body: JSON.stringify({ name: name.value }) }); render(); } catch (e) { note(out, e.message); } } } }, "Create"), out),
+      h("div", { class: "mute" }, "Give an agent the tool {\"builtin\":\"queryCorpus\",\"corpus\":\"<name>\"} so it can search these.")));
+    for (const c of cs) {
+      const title = h("input", { placeholder: "title" }), text = h("textarea", { placeholder: "paste text" }), q = h("input", { placeholder: "test a search" }), res = h("div", { class: "mute" }), st = h("span", { class: "mute" });
+      const docs = h("div", {});
+      const load = async () => { docs.textContent = ""; for (const d of await api("/v1/corpora/" + c.name + "/documents")) docs.append(h("div", {}, d.title + " (" + d.chars + " chars) ", h("a", { href: "#", on: { click: async (e) => { e.preventDefault(); await api("/v1/corpora/" + c.name + "/documents/" + d.id, { method: "DELETE" }); load(); } } }, "remove"))); };
+      load();
+      main.append(h("div", { class: "card" }, h("b", {}, c.name), h("span", { class: "mute" }, " · " + c.docs + " documents"), docs, h("div", { class: "row" }, title), text,
+        h("div", { class: "row" }, h("button", { class: "b", on: { click: async () => { try { await api("/v1/corpora/" + c.name + "/documents", { method: "POST", body: JSON.stringify({ title: title.value, text: text.value }) }); render(); } catch (e) { note(st, e.message); } } } }, "Add document"), st),
+        h("div", { class: "row" }, q, h("button", { class: "b g", on: { click: async () => { const r = await api("/v1/corpora/" + c.name + "/search", { method: "POST", body: JSON.stringify({ query: q.value }) }); res.textContent = ""; r.results.forEach((x) => res.append(h("div", {}, x.score + " · " + x.title + ": " + x.text.slice(0, 160)))); if (!r.results.length) res.textContent = "no match"; } } }, "Search")), res,
+        h("button", { class: "b d", on: { click: async () => { if (confirm("Delete " + c.name + "?")) { await api("/v1/corpora/" + c.name, { method: "DELETE" }); render(); } } } }, "Delete knowledge base")));
+    }
+  },
+  async Tools() {
+    const tools = await api("/v1/tools"); const name = h("input", { placeholder: "name" }), spec = h("textarea", {}), out = h("span", { class: "mute" });
+    spec.value = JSON.stringify({ name: "lookup_order", description: "Find an order by number.", parameters: { type: "object", properties: { order_id: { type: "string" } }, required: ["order_id"] }, http: { url: "https://example.com/orders", method: "POST", headers: {} } }, null, 1);
+    main.append(h("div", { class: "card" }, h("b", {}, "Shared tool library"), h("div", { class: "mute" }, "Define once; agents reference {\"library\":\"name\"}. Header values are write-only."),
+      h("div", { class: "row" }, name), spec, h("div", { class: "row" }, h("button", { class: "b", on: { click: async () => { try { await api("/v1/tools/" + name.value, { method: "PUT", body: JSON.stringify({ spec: JSON.parse(spec.value) }) }); render(); } catch (e) { note(out, e.message); } } } }, "Save tool"), out)));
+    for (const t of tools) main.append(h("div", { class: "card" }, h("b", {}, t.name), h("pre", { class: "mute" }, JSON.stringify(t.spec, null, 1)),
+      h("button", { class: "b d", on: { click: async () => { try { await api("/v1/tools/" + t.name, { method: "DELETE" }); render(); } catch (e) { alert(e.message); } } } }, "Delete")));
+  },
+  async Keys() {
+    const keys = await api("/v1/keys"); const label = h("input", { placeholder: "label" }); const shown = h("div", { class: "ok" });
+    const reveal = (r) => { shown.textContent = "New key (shown once): " + r.apiKey; };
+    main.append(h("div", { class: "card" }, h("div", { class: "row" }, label, h("button", { class: "b", on: { click: async () => { reveal(await api("/v1/keys", { method: "POST", body: JSON.stringify({ label: label.value }) })); } } }, "Create key")), shown));
+    const body = h("tbody");
+    for (const k of keys) body.append(h("tr", {}, h("td", {}, k.id), h("td", {}, k.label || ""), h("td", {}, when(k.created)), h("td", {}, k.revoked ? "revoked " + when(k.revoked) : (k.current ? "active (this browser)" : "active")),
+      h("td", {}, k.revoked ? "" : [h("button", { class: "b g", on: { click: async () => { const r = await api("/v1/keys/" + k.id + "/rotate", { method: "POST" }); reveal(r); if (k.current) { $("key").value = r.apiKey; ss.set("vox_key", r.apiKey); } setTimeout(render, 0); } } }, "Rotate"), " ",
+        h("button", { class: "b d", on: { click: async () => { try { await api("/v1/keys/" + k.id, { method: "DELETE" }); render(); } catch (e) { alert(e.message); } } } }, "Revoke")])));
+    main.append(h("div", { class: "card" }, h("table", {}, h("thead", {}, h("tr", {}, ["Id", "Label", "Created", "State", ""].map((x) => h("th", {}, x)))), body)));
+  },
+  async Audit() {
+    const log = await api("/v1/audit?limit=200"); const body = h("tbody");
+    for (const e of log) body.append(h("tr", {}, h("td", {}, when(e.t)), h("td", {}, e.actor), h("td", {}, e.action), h("td", {}, e.target), h("td", { class: "w mute" }, JSON.stringify(e.detail))));
+    main.append(h("div", { class: "card" }, h("table", {}, h("thead", {}, h("tr", {}, ["When", "Key", "Action", "Target", "Detail"].map((x) => h("th", {}, x)))), body)));
+  },
+};
+async function showCall(c) {
+  const box = $("detail"); box.textContent = "";
+  const msgs = await api("/v1/calls/" + c.id + "/messages");
+  const card = h("div", { class: "card" }, h("b", {}, "Call " + c.id), h("div", { class: "mute" }, [c.status, c.medium, c.end_reason].filter(Boolean).join(" · ")));
+  const chat = h("div", { class: "chat" }); for (const m of msgs) chat.append(h("div", {}, h("b", {}, m.role), m.text));
+  if (!msgs.length) chat.append(h("div", { class: "mute" }, "no transcript"));
+  card.append(chat);
+  try {
+    const r = await fetch("/v1/calls/" + c.id + "/recording", { headers: { "X-API-Key": $("key").value.trim() } });
+    if (r.ok) { const a = h("audio", { controls: "" }); a.src = URL.createObjectURL(await r.blob()); card.append(h("div", { class: "row" }, "Recording (left: caller, right: agent)", a)); }
+  } catch (e) {}
+  box.append(card); card.scrollIntoView();
+}
+$("login").addEventListener("click", () => { ss.set("vox_key", $("key").value.trim()); render(); });
+{ const k = ss.get("vox_key"); if (k) { $("key").value = k; render(); } else nav(); }
+</script>
+</body>
+</html>

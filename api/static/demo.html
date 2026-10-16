@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice agent demo</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --ink:#1c1c1a; --mute:#6b6b66; --line:#e3e3de; --acc:#2a5bd7; --acc2:#1f9d6b; --warn:#c0392b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --card:#1f1f1d; --ink:#ececE8; --mute:#9a9a94; --line:#33332f; --acc:#6d95ff; --acc2:#45c796; --warn:#ff7b6b; } }
+  * { box-sizing:border-box } body { margin:0; font:15px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--ink) }
+  main { max-width:760px; margin:0 auto; padding:24px 16px 64px }
+  h1 { font-size:20px; margin:0 0 4px } p.sub { color:var(--mute); margin:0 0 20px }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px }
+  label { display:block; font-size:12px; color:var(--mute); margin:0 0 4px }
+  input, select { width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--ink); font:inherit }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:12px } @media (max-width:560px){ .row{grid-template-columns:1fr} }
+  button { font:inherit; padding:10px 18px; border-radius:8px; border:0; cursor:pointer; background:var(--acc); color:#fff }
+  button.stop { background:var(--warn) } button:disabled { opacity:.5; cursor:default }
+  #status { font-size:13px; color:var(--mute); margin-left:12px }
+  #meter { height:6px; background:var(--line); border-radius:3px; overflow:hidden; margin-top:12px } #bar { height:100%; width:0; background:var(--acc2); transition:width .05s }
+  #log { min-height:200px; max-height:50vh; overflow:auto; display:flex; flex-direction:column; gap:8px }
+  .msg { padding:8px 12px; border-radius:10px; max-width:85%; white-space:pre-wrap; word-wrap:break-word }
+  .u { background:var(--bg); border:1px solid var(--line); align-self:flex-end } .a { background:var(--acc); color:#fff; align-self:flex-start }
+  .ev { font-size:12px; color:var(--mute); align-self:center }
+  .err { color:var(--warn); font-size:13px }
+</style>
+</head>
+<body>
+<main>
+  <h1>Talk to your agent</h1>
+  <p class="sub">Uses your microphone. Audio goes to this server only. Wear headphones to avoid the agent hearing itself.</p>
+  <div class="card">
+    <div class="row">
+      <div><label for="key">API key</label><input id="key" type="password" autocomplete="off" placeholder="vox_..."></div>
+      <div><label for="agent">Agent</label><select id="agent"><option value="">(enter key to load agents)</option></select></div>
+    </div>
+    <div style="margin-top:14px"><button id="go">Start call</button><span id="status">idle</span></div>
+    <div id="meter"><div id="bar"></div></div>
+    <div id="error" class="err"></div>
+  </div>
+  <div class="card"><div id="log" aria-live="polite"></div></div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const store = { get(k){ try { return sessionStorage.getItem(k) } catch(e){ return null } }, set(k,v){ try { sessionStorage.setItem(k,v) } catch(e){} } };
+let ws = null, micCtx = null, outCtx = null, stream = null, playhead = 0, sources = [];
+
+// Client tools: functions the agent can call in this page. Add your own: voxClientTools.my_tool = async (args) => result
+window.voxClientTools = {
+  show_notice: async (a) => { add("ev", "client tool: " + String(a.text || "")); return { shown: true }; },
+};
+
+function add(cls, text) {
+  const d = document.createElement("div"); d.className = "msg " + cls; d.textContent = text;
+  $("log").appendChild(d); $("log").scrollTop = $("log").scrollHeight;
+}
+function setStatus(s) { $("status").textContent = s; }
+function fail(msg) { $("error").textContent = msg; setStatus("idle"); }
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { "X-API-Key": $("key").value.trim(), "Content-Type": "application/json", ...(opts.headers || {}) } });
+  if (!r.ok) throw new Error((await r.text()).slice(0, 200) || r.status);
+  return r.json();
+}
+async function loadAgents() {
+  $("error").textContent = "";
+  try {
+    const agents = await api("/v1/agents"); const sel = $("agent"); const keep = sel.value; sel.textContent = "";
+    sel.appendChild(new Option("(no agent: default assistant)", ""));
+    for (const a of agents) sel.appendChild(new Option(a.name + " (" + a.id.slice(0, 8) + ")", a.id));
+    if ([...sel.options].some((o) => o.value === keep)) sel.value = keep;
+    store.set("vox_key", $("key").value.trim());
+  } catch (e) { fail("Could not load agents: " + e.message); }
+}
+$("key").addEventListener("change", loadAgents);
+{ const k = store.get("vox_key"); if (k) { $("key").value = k; loadAgents(); } }
+
+function playPcm(buf) {
+  const i16 = new Int16Array(buf), f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+  const ab = outCtx.createBuffer(1, f32.length, 24000); ab.copyToChannel(f32, 0);
+  const src = outCtx.createBufferSource(); src.buffer = ab; src.connect(outCtx.destination);
+  playhead = Math.max(playhead, outCtx.currentTime + 0.02); src.start(playhead); playhead += ab.duration;
+  sources.push(src); src.onended = () => { sources = sources.filter((s) => s !== src); };
+}
+function clearPlayback() { for (const s of sources) { try { s.stop() } catch (e) {} } sources = []; playhead = 0; }
+
+async function onEvent(m) {
+  if (m.type === "clear") { clearPlayback(); return; }
+  if (m.type === "user_transcript") add("u", m.text);
+  
+  else if (m.type === "agent_speech") add("a", m.text);
+  else if (m.type === "user_interrupted") add("ev", "interrupted");
+  else if (m.type === "tool_call") add("ev", "tool: " + m.name + " " + JSON.stringify(m.arguments));
+  else if (m.type === "client_tool_invocation") {
+    const fn = window.voxClientTools[m.name]; let reply;
+    try { reply = fn ? { result: await fn(m.args || {}) } : { error: "no such client tool: " + m.name }; }
+    catch (e) { reply = { error: String(e.message || e) }; }
+    ws.send(JSON.stringify({ type: "client_tool_result", id: m.id, ...reply }));
+  }
+}
+
+async function start() {
+  $("error").textContent = ""; $("go").disabled = true; setStatus("connecting…");
+  try {
+    const body = $("agent").value ? { agentId: $("agent").value } : {};
+    const call = await api("/v1/calls", { method: "POST", body: JSON.stringify(body) });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+    micCtx = new AudioContext({ sampleRate: 16000 }); outCtx = new AudioContext({ sampleRate: 24000 });
+    await micCtx.audioWorklet.addModule("data:text/javascript;base64," + btoa(`
+      class P extends AudioWorkletProcessor {
+        constructor(){ super(); this.b = new Int16Array(512); this.n = 0; }
+        process(inputs){ const x = inputs[0][0]; if (!x) return true; let peak = 0;
+          for (let i = 0; i < x.length; i++) { const s = Math.max(-1, Math.min(1, x[i])); peak = Math.max(peak, Math.abs(s));
+            this.b[this.n++] = s < 0 ? s * 32768 : s * 32767;
+            if (this.n === 512) { this.port.postMessage({ pcm: this.b.buffer.slice(0), peak }); this.n = 0; } }
+          return true; } }
+      registerProcessor("pcm-capture", P);`));
+    const node = new AudioWorkletNode(micCtx, "pcm-capture"); micCtx.createMediaStreamSource(stream).connect(node);
+    ws = new WebSocket(call.joinUrl); ws.binaryType = "arraybuffer";
+    node.port.onmessage = (e) => { $("bar").style.width = Math.min(100, e.data.peak * 140) + "%"; if (ws.readyState === 1) ws.send(e.data.pcm); };
+    ws.onopen = () => { setStatus("connected: speak"); $("go").textContent = "End call"; $("go").className = "stop"; $("go").disabled = false; };
+    ws.onmessage = (e) => { if (typeof e.data === "string") onEvent(JSON.parse(e.data)); else playPcm(e.data); };
+    ws.onclose = (e) => { stop(e.code === 1013 ? "Concurrency limit reached" : ""); };
+    ws.onerror = () => fail("connection error");
+  } catch (e) { fail(e.message || String(e)); stop(); }
+}
+function stop(msg) {
+  if (ws && ws.readyState <= 1) ws.close(); ws = null; clearPlayback();
+  if (stream) stream.getTracks().forEach((t) => t.stop()); stream = null;
+  for (const c of [micCtx, outCtx]) if (c && c.state !== "closed") c.close(); micCtx = outCtx = null;
+  $("go").textContent = "Start call"; $("go").className = ""; $("go").disabled = false; $("bar").style.width = "0";
+  setStatus("idle"); if (msg) $("error").textContent = msg;
+}
+$("go").addEventListener("click", () => (ws ? stop() : start()));
+</script>
+</body>
+</html>

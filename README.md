@@ -8,8 +8,18 @@ It runs on open-source parts only, on a GPU you control, with no calls to the pa
 - **Kokoro-82M** speaks the reply, **Silero** detects when someone is talking
 - **Twilio** connects phone calls (optional; the browser demo needs no phone)
 
-> **Honest status:** this repo does not claim to beat the paid service. See [docs/FINDINGS.md](docs/FINDINGS.md) for what was
-> measured, what was only written, and what is unproven.
+### What is proven and what is not
+
+| Works (tested on a real phone call, 1 rented H100 GPU) | Not done yet |
+|---|---|
+| Natural back-and-forth: the agent starts answering about 0.9 s after the caller stops talking | Connection to VoxSun (no access to it) |
+| Caller can interrupt; the agent stops in about a quarter of a second | Running for hours or days without a break (no long test yet) |
+| Agent uses business tools during the call (check a calendar, book a slot, hang up, transfer) | Accuracy on a large set of recorded real calls; voice naturalness; comparison with the paid service |
+| 24 calls at once on one GPU, comfortably | Docker and Kubernetes files were written but never built or run |
+| Two servers behind a load balancer survive one server being killed (tested with stand-in models) | Customer sign-up and billing |
+
+On your live test calls the agent sometimes mis-heard words, so booking tools can read details back and wait for a "yes" first.
+Full details: [docs/ASSESSMENT.md](docs/ASSESSMENT.md) and [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ---
 
@@ -51,12 +61,13 @@ transcripts and usage; Redis is only needed when running several API servers.
 
 **Phone number: `+1 XXX XXX XXXX`** <!-- TODO: replace with your Twilio number -->
 
-Say: *"Hi, I'd like to book an appointment."* The agent is a dental-clinic receptionist. It can check
-availability, read the day and time back to you, and book once you say yes. Interrupt it mid-sentence to see
-barge-in. Say *"goodbye"* and it hangs up.
+The number answers **only while the system is running on a GPU machine** (section 3). If you hear "application error", it is switched off.
 
-The number only answers while the stack is running on a GPU machine (steps below). If it says "application error",
-the server is off: start it with section 3.
+When it answers, try:
+1. Say *"Hi, I'd like to book an appointment."* The demo agent is a dental-clinic receptionist. That is only the sample agent that `deploy.sh` creates; you can make an agent for any business (section 3).
+2. It checks availability, reads the day and time back, and books once you say yes.
+3. Interrupt it in the middle of a sentence. It stops and listens.
+4. Say *"goodbye"*. It hangs up.
 
 ---
 
@@ -178,6 +189,14 @@ Capped at 50 calls per account per day by default (`VOX_OUTBOUND_PER_DAY`). Twil
 ```
 Put that object in an agent's `tools` list. More in [docs/TOOLS.md](docs/TOOLS.md).
 
+### More things you can do
+- **Fill in details per call** (customer name, offer): put `{{customerName}}` in the prompt or greeting and send `"variables": {"customerName": "Priya"}` when starting a call. See [docs/INTEGRATION.md](docs/INTEGRATION.md).
+- **Import your whole API as tools** from an OpenAPI file: `POST /v1/tools/import-openapi`. See [docs/INTEGRATION.md](docs/INTEGRATION.md).
+- **Get the transcript after every call** at your own URL (signed notice): `PUT /v1/webhook`.
+- **Other languages**: set `"language": "es"` on an agent. Off by default for licence reasons and never tested with audio; see [docs/LANGUAGES.md](docs/LANGUAGES.md).
+- **Save calls to measure accuracy**: set `"record": true` on the agent and `VOX_DATASET=1` on the server. Each caller turn is saved with its transcript.
+- **Estimate cost**: `python scripts/cost_model.py`. **Log GPU/CPU use during calls**: `bash scripts/resource_log.sh`.
+
 ### Stop
 `tmux kill-server`, then terminate the GPU instance. Weights stay on the persistent folder, so the next start skips
 step 3. The phone number rings into nothing until you run `deploy.sh` again on a new machine.
@@ -224,9 +243,7 @@ pip install -r requirements-dev.txt && pytest          # 240+ unit tests
 | [docs/TUNING.md](docs/TUNING.md) | Turn-taking and latency settings |
 | [docs/LICENSES.md](docs/LICENSES.md) | Every component's license (commercial use) |
 
-Cost estimate: `python scripts/cost_model.py`. Resource logging on a GPU box: `scripts/resource_log.sh`.
-
-Not built: billing/sign-up, VoxSun integration, SIP trunking (Twilio is the phone layer), voice cloning, single sign-on.
+Not built: customer sign-up and billing, VoxSun integration, SIP trunking (Twilio is the phone layer), voice cloning, single sign-on.
 
 Code layout: `core/` (turn-taking, VAD, speech, session), `transports/` (Twilio, browser), `api/` (REST, WebSocket,
 dashboard, storage), `scripts/` (setup and deploy), `deploy/` (Docker, Kubernetes), `tests/`.

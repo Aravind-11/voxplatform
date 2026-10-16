@@ -13,6 +13,40 @@ It runs on open-source parts only, on a GPU you control, with no calls to the pa
 
 ---
 
+## How it fits together
+
+```mermaid
+flowchart TB
+    P["Phone caller"] --> TW["Twilio<br/>phone network"]
+    TW <-->|"audio over WebSocket"| EDGE
+    B["Browser<br/>/demo page"] <-->|"audio over WebSocket"| EDGE
+    EDGE["HTTPS entry point<br/>tunnel or Caddy"] <-->|"caller audio in, agent audio out"| VAD
+
+    subgraph GPU["GPU machine"]
+        direction TB
+        subgraph API["VoxPlatform API - FastAPI"]
+            direction LR
+            VAD["1. Silero VAD<br/>is someone speaking?"] --> TURN["2. Turn manager<br/>finished? interrupted?"]
+            TURN --> CHUNK["4. Sentence splitter"] --> TTS["5. Kokoro TTS<br/>text to speech"]
+        end
+        LLM["3. Ultravox on vLLM<br/>hears the audio, writes the reply,<br/>chooses tools"]
+        TURN <--> LLM
+    end
+
+    API --> DB[("Database<br/>SQLite or Postgres")]
+    API -.-> R[("Redis<br/>optional")]
+    API --> EXT["Tools: your web services, calendar,<br/>hang up, transfers via Twilio"]
+    DASH["Dashboard and REST API<br/>/dashboard"] --> API
+```
+
+**Following one call:** the caller speaks, and the audio reaches the API. Silero spots speech and the turn manager waits
+until the caller has finished (or lets them interrupt the agent mid-sentence). The audio goes straight to Ultravox,
+which understands it and writes the reply, calling a tool if needed. The reply is split into sentences, Kokoro turns
+each sentence into speech as soon as it is ready, and the audio streams back to the caller. The database keeps
+transcripts and usage; Redis is only needed when running several API servers.
+
+---
+
 ## 1. Call it (phone)
 
 **Phone number: `+1 XXX XXX XXXX`** <!-- TODO: replace with your Twilio number -->

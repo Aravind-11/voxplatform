@@ -62,7 +62,7 @@ def test_admin_and_api_key_auth():
     key, tid = tenant(c)
     assert c.get("/v1/agents", headers={"X-API-Key": key}).json() == []
     # only the hash is stored
-    assert key not in json.dumps([dict(r) for r in store.db.execute("SELECT * FROM api_keys")])
+    assert key not in json.dumps(store._all("SELECT * FROM api_keys"))
 
 
 def test_admin_disabled_when_no_admin_key():

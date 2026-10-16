@@ -56,6 +56,75 @@ class ConcurrencyLimiter:
             return sum(len(v) for v in self._active.values())
 
 
+class RedisLimiter:
+    """Per-tenant active-call cap shared by every API node (Redis). Same interface as ConcurrencyLimiter.
+
+    Each active call is a member of a sorted set whose score is its expiry time. The check-and-add is one Lua script
+    (atomic across nodes). A node that crashes stops refreshing its calls, so they expire after `ttl_s` instead of
+    holding capacity forever; live nodes refresh theirs every ttl_s/3 via `heartbeat()`."""
+
+    LUA = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+if redis.call('ZSCORE', KEYS[1], ARGV[3]) then redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3]) return 1 end
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[4]) then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+return 1
+"""
+
+    def __init__(self, url: str = "", default_limit: int = 10, ttl_s: float = 90.0, client=None, prefix: str = "vox:active:"):
+        if client is None:
+            import redis
+            client = redis.Redis.from_url(url, decode_responses=True)
+        self.r, self.default_limit, self.ttl_s, self.prefix = client, default_limit, ttl_s, prefix
+        self._script = self.r.register_script(self.LUA)
+        self._held: dict[str, set[str]] = {}
+        self._lock = threading.Lock()
+
+    def _key(self, tenant_id: str) -> str:
+        return self.prefix + tenant_id
+
+    def acquire(self, tenant_id: str, call_id: str, limit: Optional[int] = None) -> bool:
+        import time
+        now = time.time()
+        cap = limit if limit is not None else self.default_limit
+        ok = self._script(keys=[self._key(tenant_id)], args=[now, now + self.ttl_s, call_id, cap]) == 1
+        if ok:
+            with self._lock:
+                self._held.setdefault(tenant_id, set()).add(call_id)
+        return ok
+
+    def release(self, tenant_id: str, call_id: str) -> None:
+        self.r.zrem(self._key(tenant_id), call_id)
+        with self._lock:
+            self._held.get(tenant_id, set()).discard(call_id)
+
+    def active(self, tenant_id: str) -> int:
+        import time
+        return int(self.r.zcount(self._key(tenant_id), time.time(), "+inf"))
+
+    def total_active(self) -> int:
+        import time
+        now = time.time()
+        return sum(int(self.r.zcount(k, now, "+inf")) for k in self.r.scan_iter(self.prefix + "*"))
+
+    def refresh(self) -> None:
+        """Extends the expiry of every call this node holds."""
+        import time
+        exp = time.time() + self.ttl_s
+        with self._lock:
+            held = [(t, c) for t, cs in self._held.items() for c in cs]
+        for t, c in held:
+            self.r.zadd(self._key(t), {c: exp}, xx=True)
+
+    async def heartbeat(self) -> None:
+        while True:
+            await asyncio.sleep(self.ttl_s / 3)
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, self.refresh)
+            except Exception:  # noqa: BLE001  (Redis blip: try again next tick)
+                pass
+
+
 # ------------------------------------------------------- Twilio signatures
 def twilio_signature(auth_token: str, url: str, params: dict[str, str]) -> str:
     """base64(HMAC-SHA1(auth_token, url + sorted key/value pairs concatenated))."""

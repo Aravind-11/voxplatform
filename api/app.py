@@ -173,6 +173,12 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     app.state.store, app.state.limiter = store, limiter
     METRICS.gauge("vox_active_calls", limiter.total_active)
 
+    @app.on_event("startup")
+    async def _start_heartbeat():
+        if hasattr(limiter, "heartbeat"):             # Redis limiter: keep this node's calls alive
+            import asyncio
+            app.state.heartbeat = asyncio.create_task(limiter.heartbeat())
+
     def tenant(x_api_key: str = Header(default="")) -> dict:
         t = store.tenant_by_key(security.hash_key(x_api_key)) if x_api_key else None
         if not t:

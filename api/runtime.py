@@ -169,10 +169,14 @@ class Runtime:
             name = LANG_NAME[cfg["language"]]
             prompt += (f"\n\nAlways speak and reply in {name}, whatever language the caller uses; "
                        f"if they speak another language, politely stay in {name}.")
+        # Lost-stream reconnects replace the greeting with a "cut off" apology. A failed warm transfer also
+        # sets resumedFrom, but its own greeting is the "not available" line and must be kept.
+        greeting = varmod.render(str(cfg.get("greeting") or ""), values)
+        if resumed and meta.get("resumeReason") != "transfer":
+            greeting = RESUME_PHRASE.get(cfg.get("language") or "en", RESUME_PHRASE["en"])
         scfg = SessionConfig(system_prompt=prompt,
                              out_rate=transport.out_rate, tools_schema=schemas,
-                             greeting=(RESUME_PHRASE.get(cfg.get("language") or "en", RESUME_PHRASE["en"]) if resumed
-                                       else varmod.render(str(cfg.get("greeting") or ""), values)),
+                             greeting=greeting,
                              turn=TurnConfig(end_ms=float(os.environ.get("VOX_END_MS", "640")),
                                              eot_threshold=float(os.environ.get("VOX_EOT_THRESHOLD", "0.8")),
                                              patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000"))))

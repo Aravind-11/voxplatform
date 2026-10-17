@@ -90,6 +90,28 @@ def test_lost_stream_reconnects_with_history_and_frees_the_slot():
     assert "cut off" in sess.cfg.greeting and "Hello" not in sess.cfg.greeting
 
 
+def test_failed_warm_transfer_keeps_history_and_the_apology():
+    c, store, _ = make()
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a", "systemPrompt": "Be brief.", "greeting": "Hello!"},
+               headers={"X-API-Key": k}).json()
+    call = store.create_call(tid, a["id"], "twilio", a["config"], {"from": "+1555", "to": "+1666"})
+    store.add_message(call["id"], "agent", "Hello, how can I help?", time.time())
+    store.add_message(call["id"], "user", "I want Tuesday at eleven.", time.time())
+    path, q = f"/twilio/transfer-result/{call['id']}", "to=billing"
+    form = {"DialCallStatus": "no-answer"}
+    r = c.post(f"{path}?{q}", data=form, headers=sign(f"{BASE}{path}?{q}", form))
+    assert r.status_code == 200 and "<Connect>" in r.text
+    new = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == call["id"]][0]
+    assert new["metadata"].get("resumeReason") == "transfer"
+    sess = c.app.state.runtime.build_session(new, type("T", (), {"out_rate": 8000, "call_sid": "CA1",
+                                                                  "send_audio": lambda s, *a: None, "clear": lambda s: None,
+                                                                  "end": lambda s: None})())
+    assert [m["content"] for m in sess.history[1:]] == ["Hello, how can I help?", "I want Tuesday at eleven."]
+    assert [m["role"] for m in sess.history[1:]] == ["assistant", "user"]
+    assert "not available" in sess.cfg.greeting and "cut off" not in sess.cfg.greeting
+
+
 def test_resumes_are_capped_so_a_broken_call_cannot_loop():
     c, store, _ = make()
     k, tid = tenant(c)

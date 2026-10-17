@@ -1024,7 +1024,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         cfg = dict(call["config"])
         cfg["greeting"] = f"Sorry, {who} is not available right now. Is there anything else I can help you with?"
         cfg["systemPrompt"] = (cfg.get("systemPrompt") or "") + f"\nThe caller asked to be transferred to {who}, who did not answer. Offer to help or to take a message."
-        meta = {**call["metadata"], "resumedFrom": call_id}
+        meta = {**call["metadata"], "resumedFrom": call_id, "resumeReason": "transfer"}
         resumed = store.create_call(call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
         return Response(stream_twiml(resumed), media_type="text/xml")
 

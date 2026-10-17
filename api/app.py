@@ -21,6 +21,7 @@ from core.tts import DEFAULT_VOICE, LANG_NAME, VOICES
 from transports.browser import BrowserTransport
 from transports.twilio import TwilioTransport
 from . import security, tools as toolmod
+from . import experiments as expmod
 from . import openapi_import, retention, variables as varmod
 from .runtime import Runtime
 from .store import ROLES, Store
@@ -56,6 +57,7 @@ class AgentIn(BaseModel):
     tools: list[Union[str, dict[str, Any]]] = Field(default_factory=list)
     speed: float = Field(1.0, ge=0.7, le=1.3)
     record: bool = False                            # stereo recording of calls; you need the caller's consent
+    experiment: Optional[dict[str, Any]] = None     # optional A/B: {id, variants:[{id, weight, voice?, systemPrompt?, model?}]}
 
 
 class AgentPatch(BaseModel):
@@ -68,6 +70,7 @@ class AgentPatch(BaseModel):
     tools: Optional[list[Union[str, dict[str, Any]]]] = None
     speed: Optional[float] = Field(None, ge=0.7, le=1.3)
     record: Optional[bool] = None
+    experiment: Optional[dict[str, Any]] = None
 
 
 class CallIn(BaseModel):
@@ -249,6 +252,16 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         except toolmod.ToolConfigError as e:
             raise HTTPException(422, str(e)) from e
 
+    def check_experiment(experiment: dict) -> dict:
+        try:
+            cleaned = expmod.validate_experiment(experiment)
+        except expmod.ExperimentError as e:
+            raise HTTPException(422, str(e)) from e
+        for variant in cleaned["variants"]:
+            if variant.get("voice"):
+                check_voice(variant["voice"])
+        return cleaned
+
     def check_voice(voice, language=None) -> None:
         if voice is not None and voice not in VOICES:
             raise HTTPException(422, f"unknown voice {voice!r}; see GET /v1/voices")
@@ -384,6 +397,9 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     async def create_agent(body: AgentIn, t: dict = Depends(tenant_write)):
         check_tools(body.tools, t["id"])
         cfg0 = body.model_dump(exclude={"name"})
+        exp = cfg0.pop("experiment", None)
+        if exp is not None:
+            cfg0["experiment"] = check_experiment(exp)
         cfg0["voice"], cfg0["language"] = pick_voice("af_heart", None, body.voice, body.language, "voice" in body.model_fields_set)
         check_voice(cfg0["voice"], cfg0["language"])
         call_variables(cfg0, None, strict=False)
@@ -409,6 +425,12 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             if v is not None:
                 cfg[k] = v
                 changed.append(k)
+        if "experiment" in body.model_fields_set:
+            if body.experiment is None:
+                cfg.pop("experiment", None)
+            else:
+                cfg["experiment"] = check_experiment(body.experiment)
+            changed.append("experiment")
         call_variables(cfg, None, strict=False)
         if eff_voice != cfg.get("voice"):
             cfg["voice"] = eff_voice
@@ -426,6 +448,29 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     @app.get("/v1/agents")
     async def list_agents(t: dict = Depends(tenant)):
         return [redacted(a) for a in store.list_agents(t["id"])]
+
+    @app.get("/v1/experiments/{experiment_id}")
+    async def experiment_report(experiment_id: str, t: dict = Depends(tenant)):
+        """Per-variant call counts for this tenant. First-audio means need stored timings, which this build does not keep."""
+        counts: dict[str, int] = {}
+        known = False
+        for agent in store.list_agents(t["id"]):
+            exp = (agent.get("config") or {}).get("experiment") or {}
+            if isinstance(exp, dict) and exp.get("id") == experiment_id:
+                known = True
+                for variant in exp.get("variants") or []:
+                    if isinstance(variant, dict) and variant.get("id"):
+                        counts.setdefault(str(variant["id"]), 0)
+        for call in store.list_calls(t["id"], 1000):
+            meta = call.get("metadata") or {}
+            if not isinstance(meta, dict) or meta.get("experiment") != experiment_id:
+                continue
+            known = True
+            vid = str(meta.get("variant") or "")
+            counts[vid] = counts.get(vid, 0) + 1
+        if not known:
+            raise HTTPException(404, "experiment not found")
+        return {"id": experiment_id, "variants": [{"id": vid, "calls": counts[vid]} for vid in sorted(counts)]}
 
     # ------------------------------------------------------------- calls
     @app.post("/v1/calls")

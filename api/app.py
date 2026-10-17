@@ -1,6 +1,7 @@
 """HTTP/WebSocket API. Auth: X-API-Key (tenant), X-Admin-Key (tenant provisioning)."""
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import os
@@ -24,6 +25,7 @@ from . import security, tools as toolmod
 from . import openapi_import, retention, variables as varmod
 from .runtime import Runtime
 from .store import ROLES, Store
+from .writebehind import to_thread
 
 
 @dataclass
@@ -730,23 +732,30 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return page("dashboard.html")
 
     # ------------------------------------------------------ call lifecycle
-    def admit(call: dict) -> dict:
-        """Common admission: status check + per-tenant concurrency. Raises _Reject."""
+    async def admit(call: dict) -> dict:
+        """Common admission: status check + per-tenant concurrency. Raises _Reject.
+
+        Every store call runs in a worker thread. webhook() stays on this task: dispatcher.spawn
+        needs a running loop.
+        """
         if call["status"] != "created":
             raise _Reject(4401, "call not joinable")
         if app.state.draining:
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="draining")
+            await to_thread(store.update_call, call["id"], status="ended", ended=time.time(), end_reason="draining")
             raise _Reject(1013, "node is draining")
-        t = store.get_tenant(call["tenant_id"])
+        t = await to_thread(store.get_tenant, call["tenant_id"])
         cap = t["concurrency_limit"] or settings.default_concurrency
         if not limiter.acquire(call["tenant_id"], call["id"], cap):
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="concurrency_limit")
+            await to_thread(store.update_call, call["id"], status="ended", ended=time.time(),
+                            end_reason="concurrency_limit")
             raise _Reject(1013, "concurrency limit")
-        store.update_call(call["id"], status="active", joined=time.time())
-        webhook(t, "call.started", store.get_call_any(call["id"]))
+        await to_thread(store.update_call, call["id"], status="active", joined=time.time())
+        fresh = await to_thread(store.get_call_any, call["id"])
+        webhook(t, "call.started", fresh)
         return t
 
-    def finish(call: dict, t: dict, reason: str) -> None:
+    async def finish(call: dict, t: dict, reason: str) -> None:
+        await to_thread(runtime.flush_messages)  # transcript rows are queued; don't read them early
         limiter.release(call["tenant_id"], call["id"])
         cur = store.get_call_any(call["id"])
         if cur["status"] == "active":
@@ -769,7 +778,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             await ws.close(4401)
             return
         try:
-            t = admit(call)
+            t = await admit(call)
         except _Reject as r:
             await ws.close(r.code, r.reason)
             return
@@ -784,7 +793,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             reason = "error"
             raise
         finally:
-            finish(call, t, reason)
+            await finish(call, t, reason)
 
     # ---------------------------------------------------------- telephony
     def stream_twiml(call: dict) -> str:
@@ -832,7 +841,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         async def factory(tr, custom):
             if not hmac.compare_digest(str(custom.get("token", "")), call["join_token"]):
                 raise _Reject(4401, "bad token")
-            state["t"] = admit(call)
+            state["t"] = await admit(call)
             return runtime.build_session(call, tr)
 
         tr = TwilioTransport(_TwilioWS(ws), factory)
@@ -843,7 +852,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             await ws.close(r.code, r.reason)
         finally:
             if "t" in state:
-                finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+                await finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
 
     async def audiosocket_call(reader, writer) -> None:
         """One SIP call arriving from Asterisk over AudioSocket: create the call, admit it, run the agent."""
@@ -857,7 +866,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
         async def factory(tr, custom):
             store.update_call(call["id"], metadata={"callSid": custom.get("uuid", ""), "channel": "sip"})
-            state["t"] = admit(call)
+            state["t"] = await admit(call)
             return runtime.build_session(call, tr)
 
         tr = AudioSocketTransport(reader, writer, factory)
@@ -868,7 +877,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             writer.close()
         finally:
             if "t" in state:
-                finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+                await finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
 
     @app.on_event("startup")
     async def _start_audiosocket():
@@ -882,6 +891,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         srv = getattr(app.state, "audiosocket", None)
         if srv:
             srv.close()
+
+    @app.on_event("shutdown")
+    async def _stop_message_log():
+        await asyncio.to_thread(runtime.message_log.close)
 
     @app.post("/twilio/resume/{call_id}")
     async def twilio_resume(call_id: str, request: Request):

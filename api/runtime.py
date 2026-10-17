@@ -14,6 +14,7 @@ from core.session import Session, SessionConfig
 from core.turn import TurnConfig
 from . import tools as toolmod
 from .store import Store
+from .writebehind import MessageLog
 
 
 class LimitedTTS:
@@ -81,6 +82,13 @@ class Runtime:
     record_dir: str = ""                   # where recordings / the utterance dataset go; "" -> VOX_RECORD_DIR env
     live: dict = field(default_factory=dict)       # call_id -> (Session, transport): lets webhooks reach a live call
     recorders: dict = field(default_factory=dict)  # call_id -> CallRecorder
+
+    def __post_init__(self) -> None:
+        self.message_log = MessageLog(self.store)
+
+    def flush_messages(self) -> None:
+        """Block until queued transcripts are in the store. Call via asyncio.to_thread."""
+        self.message_log.flush()
 
     def finalize(self, call_id: str) -> Optional[str]:
         """Called when a call ends: forgets the live session and writes the recording. Returns the WAV path."""
@@ -176,16 +184,17 @@ class Runtime:
                              turn=TurnConfig(end_ms=float(os.environ.get("VOX_END_MS", "640")),
                                              eot_threshold=float(os.environ.get("VOX_EOT_THRESHOLD", "0.8")),
                                              patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000"))))
-        store, cid = self.store, call["id"]
+        cid = call["id"]
+        log = self.message_log
 
         def on_event(e: dict) -> None:
             if os.environ.get('VOX_LOG_EVENTS'):
                 print('EV', cid, e, flush=True)
             _count(e)
             if e["type"] == "user_transcript":
-                store.add_message(cid, "user", e["text"], time.time())
+                log.add(cid, "user", e["text"], time.time())
             elif e["type"] == "agent_speech":
-                store.add_message(cid, "agent", e["text"], time.time())
+                log.add(cid, "agent", e["text"], time.time())
             if forward_events and hasattr(transport, "send_event"):
                 import asyncio
                 asyncio.get_running_loop().create_task(transport.send_event(e))

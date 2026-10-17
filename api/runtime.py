@@ -209,4 +209,7 @@ class Runtime:
             sess.seed_history(self._earlier_messages(meta["resumedFrom"]))
         self.live[call["id"]] = (sess, transport)
         ctx.turn_fn = lambda: sess.stats["turns"]      # lets confirm-before-acting tools tell turns apart
+        ctx.last_user_text = lambda: next(
+            (str(m.get("content") or "") for m in reversed(sess.history) if m.get("role") == "user"), "")
+        ctx.audit = lambda action, detail: store.audit(tid, "tool", action, cid, detail)
         return sess

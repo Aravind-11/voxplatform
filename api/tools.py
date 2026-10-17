@@ -65,6 +65,8 @@ class CallContext:
     client_call: Optional[Callable[..., Awaitable[Any]]] = None     # run a tool in the caller's browser
     embedder: Any = None                                            # optional core.embed.OpenAIEmbedder (hybrid KB search)
     base_url: str = ""                                              # public URL of this API (warm-transfer callbacks)
+    last_user_text: Callable[[], str] = lambda: ""                  # latest caller transcript (set by the runtime)
+    audit: Callable[[str, dict], None] = lambda *a, **k: None       # (action, detail) -> audit log
 
 
 def _canon(args: dict) -> str:
@@ -73,11 +75,42 @@ def _canon(args: dict) -> str:
     return json.dumps(norm, sort_keys=True, default=str)
 
 
+# Whole-utterance agreements. A longer phrase is listed before the word it contains ("that's right" before "right")
+# so a stack of them ("yes that's right") still matches, and a hedge ("yes but make it Monday") does not.
+_AFFIRM = (
+    "that's right", "thats right", "that is right", "go ahead", "do it",
+    "yes", "yeah", "yep", "correct", "right", "ok", "okay", "sure", "confirm",
+    "sí", "si", "oui", "correcto", "vale", "haan", "hai",
+)
+_REJECT = re.compile(r"\b(?:not|don't|dont|actually)\b")
+_PUNCT = re.compile(r"[^\w\s']+", re.UNICODE)
+_SPACE = re.compile(r"\s+")
+
+
+def _normalize_utterance(text: str) -> str:
+    t = _PUNCT.sub(" ", str(text).strip().lower())
+    return _SPACE.sub(" ", t).strip()
+
+
+def _is_affirmative(text: str) -> bool:
+    """True only when the caller agreed: the whole line is one or more affirmative phrases, with no hedge."""
+    norm = _normalize_utterance(text)
+    if not norm or _REJECT.search(norm):
+        return False
+    rest = norm
+    while rest:
+        match = next((p for p in _AFFIRM if rest == p or rest.startswith(p + " ")), None)
+        if match is None:
+            return False
+        rest = rest[len(match):].lstrip()
+    return True
+
+
 def with_confirmation(fn, schema: dict, ctx):
     """Makes a tool that changes things safe against mishearing. The first call does NOT run it: the model gets
     the details to read back and must ask the caller. Only a second call with confirmed=true, with the same
-    arguments, made in a LATER caller turn, runs it. A mis-heard booking becomes an audible 'Tuesday at 11,
-    correct?' that the caller can fix, instead of a silent action."""
+    arguments, made in a LATER caller turn, AND an affirmative caller transcript, runs it. A mis-heard booking
+    becomes an audible 'Tuesday at 11, correct?' that the caller can fix, instead of a silent action."""
     sch = copy.deepcopy(schema)
     f = sch["function"]
     f["parameters"].setdefault("properties", {})["confirmed"] = {
@@ -85,14 +118,17 @@ def with_confirmation(fn, schema: dict, ctx):
         "description": "true ONLY after the caller heard these exact details read back and clearly said yes."}
     f["description"] += (" This changes things for real. First call it WITHOUT confirmed to get the details to read "
                          "back to the caller; call again with confirmed=true only after they agree.")
+    name = f.get("name", "")
     pending: dict[str, int] = {}
 
     async def run(args: dict):
         args = dict(args or {})
         confirmed = args.pop("confirmed", False) is True
         key, turn = _canon(args), ctx.turn_fn()
-        if confirmed and key in pending and pending[key] < turn:
+        transcript = ctx.last_user_text()
+        if confirmed and key in pending and pending[key] < turn and _is_affirmative(transcript):
             pending.pop(key)
+            ctx.audit("tool.confirmed", {"name": name, "args": dict(args), "transcript": transcript})
             return await fn(args)
         pending[key] = turn
         return {"executed": False,

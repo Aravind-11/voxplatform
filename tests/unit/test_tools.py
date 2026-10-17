@@ -212,6 +212,9 @@ def _confirmed_booker():
     ctx = Ctx()
     ctx.turn = 0
     ctx.turn_fn = lambda: ctx.turn
+    ctx.last_user_text = lambda: "yes, that's right"
+    ctx.audit_log = []
+    ctx.audit = lambda action, detail: ctx.audit_log.append((action, detail))
     schemas, fns = toolmod.build([{"tool": "book_slot", "confirm": True}], ctx, None)
     return ctx, schemas[0], fns["book_slot"]
 
@@ -235,10 +238,14 @@ async def test_confirmation_in_a_later_turn_with_same_details_runs_it_once():
     ctx, _, run = _confirmed_booker()
     await run({"day": "Tuesday ", "time": "11:00"})
     ctx.turn = 1                                                              # the caller spoke again and said yes
+    ctx.last_user_text = lambda: "yes, that's right"
     out = await run({"day": "tuesday", "time": "11:00", "confirmed": True})   # case/whitespace differences are fine
     assert out == {"booked": True, "day": "tuesday", "time": "11:00"}
+    assert ctx.audit_log == [("tool.confirmed", {"name": "book_slot",
+                                                 "args": {"day": "tuesday", "time": "11:00"},
+                                                 "transcript": "yes, that's right"})]
     again = await run({"day": "tuesday", "time": "11:00", "confirmed": True})
-    assert again["executed"] is False                                         # one confirmation = one action
+    assert again["executed"] is False and len(ctx.audit_log) == 1            # one confirmation = one action
 
 
 async def test_changed_details_after_confirmation_must_be_confirmed_again():
@@ -261,6 +268,8 @@ async def test_http_tool_with_confirm_never_sends_the_confirmed_flag_to_the_endp
     ctx = Ctx()
     ctx.turn = 0
     ctx.turn_fn = lambda: ctx.turn
+    ctx.last_user_text = lambda: "yes, that's right"
+    ctx.audit = lambda action, detail: None
     spec = good(confirm=True)
     _, fns = toolmod.build([spec], ctx, client(handler))
     await fns["lookup_order"]({"order_id": "A1"})
@@ -268,6 +277,73 @@ async def test_http_tool_with_confirm_never_sends_the_confirmed_flag_to_the_endp
     ctx.turn = 1
     assert await fns["lookup_order"]({"order_id": "A1", "confirmed": True}) == {"ok": 1}
     assert "confirmed" not in sent[0] and sent[0]["order_id"] == "A1"
+
+
+async def test_later_turn_um_does_not_confirm():
+    ctx, _, run = _confirmed_booker()
+    await run({"day": "tuesday", "time": "11:00"})
+    ctx.turn = 1
+    ctx.last_user_text = lambda: "um"
+    out = await run({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert out["executed"] is False and ctx.audit_log == []
+
+
+async def test_yes_but_monday_does_not_book_the_tuesday_slot():
+    ctx, _, run = _confirmed_booker()
+    await run({"day": "tuesday", "time": "11:00"})
+    ctx.turn = 1
+    ctx.last_user_text = lambda: "yes but make it Monday"
+    out = await run({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert out["executed"] is False and "booked" not in out and ctx.audit_log == []
+
+
+@pytest.mark.parametrize("text,ok", [
+    ("yes", True), ("YES!", True), ("yes, that's right", True), ("that's right", True),
+    ("sí", True), ("haan", True), ("go ahead", True), ("ok.", True),
+    ("", False), ("uh", False), ("um", False), ("no", False), ("wait", False),
+    ("yes but change it", False), ("don't", False), ("actually", False), ("please not that", False),
+])
+def test_affirmative_is_the_whole_utterance(text, ok):
+    assert toolmod._is_affirmative(text) is ok
+
+
+async def test_runtime_confirms_from_the_latest_user_line_and_writes_audit():
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    tid = store.create_tenant("t")
+    call = store.create_call(tid, None, "web",
+                             {"systemPrompt": "p", "tools": [{"tool": "book_slot", "confirm": True}]}, {})
+
+    class T:
+        out_rate = 24000
+
+        async def send_audio(self, pcm, rate):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            return None
+
+    sess = rt.build_session(call, T())
+    fn = sess.tools["book_slot"]
+    assert (await fn({"day": "tuesday", "time": "11:00"}))["executed"] is False
+    sess.stats["turns"] = 1
+    sess.history.append({"role": "user", "content": "um"})
+    assert (await fn({"day": "tuesday", "time": "11:00", "confirmed": True}))["executed"] is False
+    sess.stats["turns"] = 2
+    sess.history.append({"role": "user", "content": "yes, that's right"})
+    assert (await fn({"day": "tuesday", "time": "11:00", "confirmed": True}))["booked"] is True
+    rows = store.list_audit(tid)
+    assert len(rows) == 1
+    assert rows[0]["actor"] == "tool" and rows[0]["action"] == "tool.confirmed" and rows[0]["target"] == call["id"]
+    assert rows[0]["detail"] == {"name": "book_slot", "args": {"day": "tuesday", "time": "11:00"},
+                                 "transcript": "yes, that's right"}
 
 
 def test_tool_options_validate():

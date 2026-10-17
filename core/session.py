@@ -344,6 +344,10 @@ class Session:
                 if not calls:
                     break
                 await gen.commit.wait()  # never run side effects for an uncommitted reply
+                # The confirming turn's transcript is what with_confirmation reads. Wait for it, or the
+                # latest user line is still the "[caller audio]" placeholder and a real "yes" never counts.
+                if self._transcript_task is not None:
+                    await self._transcript_task
                 followups.append({"role": "assistant", "content": "".join(text_parts) or None,
                                   "tool_calls": [{"id": c.id, "type": "function",
                                                   "function": {"name": c.name,

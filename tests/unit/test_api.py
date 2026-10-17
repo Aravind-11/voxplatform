@@ -70,6 +70,30 @@ def test_admin_disabled_when_no_admin_key():
     assert c.post("/admin/tenants", json={"name": "x"}, headers={"X-Admin-Key": ""}).status_code == 403
 
 
+def test_call_timings_are_tenant_scoped_and_recorded_from_events():
+    c, store, _ = make()
+    ka, _ = tenant(c, "a")
+    kb, _ = tenant(c, "b")
+    ha, hb = {"X-API-Key": ka}, {"X-API-Key": kb}
+    call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=ha).json()
+    store.add_timing(call["id"], 1, "llm_first_token", 120, 1.0)
+    store.add_timing(call["id"], 1, "tts_done", 80, 2.0)
+    rows = c.get(f"/v1/calls/{call['id']}/timings", headers=ha).json()
+    assert [(r["turn"], r["stage"], r["ms"]) for r in rows] == [(1, "llm_first_token", 120.0), (1, "tts_done", 80.0)]
+    assert c.get(f"/v1/calls/{call['id']}/timings", headers=hb).status_code == 404
+    sess = c.app.state.runtime.build_session(store.get_call_any(call["id"]), type("T", (), {
+        "out_rate": 16000, "send_audio": lambda s, *a: None, "clear": lambda s: None, "end": lambda s: None})())
+    sess.stats["turns"] = 3
+    sess.on_event({"type": "llm_first_token", "ms": 40})
+    sess.on_event({"type": "agent_first_audio", "latency_ms": 90})
+    sess.on_event({"type": "tts_done", "ms": 15})
+    sess.on_event({"type": "tool_result", "name": "lookup", "ms": 7})
+    sess.on_event({"type": "user_transcript", "text": "hi"})
+    got = [(r["turn"], r["stage"], r["ms"]) for r in store.timings(call["id"])]
+    assert got[2:] == [(3, "llm_first_token", 40.0), (3, "agent_first_audio", 90.0),
+                       (3, "tts_done", 15.0), (3, "tool_result", 7.0)]
+
+
 def test_tenant_isolation():
     c, *_ = make()
     ka, _ = tenant(c, "a")

@@ -153,6 +153,31 @@ async function showCall(c) {
   if (!msgs.length) chat.append(h("div", { class: "mute" }, "no transcript"));
   card.append(chat);
   try {
+    const timings = await api("/v1/calls/" + c.id + "/timings");
+    const labels = { llm_first_token: "llm", tts_done: "tts", agent_first_audio: "first audio", tool_result: "tool" };
+    const turns = [];
+    for (const r of timings) {
+      let row = turns.find((t) => t.turn === r.turn);
+      if (!row) { row = { turn: r.turn, stages: [] }; turns.push(row); }
+      row.stages.push(r);
+    }
+    if (turns.length) {
+      const max = Math.max(1, ...timings.map((r) => Number(r.ms) || 0));
+      const water = h("div", {}, h("div", { class: "mute" }, "Latency by turn"));
+      for (const t of turns) {
+        water.append(h("div", { class: "mute" }, "Turn " + t.turn));
+        for (const r of t.stages) {
+          const ms = Number(r.ms) || 0;
+          water.append(h("div", { class: "barrow" },
+            h("span", {}, labels[r.stage] || String(r.stage)),
+            h("div", { class: "bar", style: "width:" + (100 * ms / max) + "%" }),
+            Math.round(ms) + " ms"));
+        }
+      }
+      card.append(water);
+    }
+  } catch (e) {}
+  try {
     const r = await fetch("/v1/calls/" + c.id + "/recording", { headers: { "X-API-Key": $("key").value.trim() } });
     if (r.ok) { const a = h("audio", { controls: "" }); a.src = URL.createObjectURL(await r.blob()); card.append(h("div", { class: "row" }, "Recording (left: caller, right: agent)", a)); }
   } catch (e) {}

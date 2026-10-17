@@ -30,6 +30,9 @@ CREATE INDEX IF NOT EXISTS calls_tenant ON calls(tenant_id, created);
 CREATE TABLE IF NOT EXISTS messages(
   id {SERIAL}, call_id TEXT, role TEXT, text TEXT, t {REAL});
 CREATE INDEX IF NOT EXISTS messages_call ON messages(call_id, id);
+CREATE TABLE IF NOT EXISTS timings(
+  id {SERIAL}, call_id TEXT, turn INTEGER, stage TEXT, ms {REAL}, t {REAL});
+CREATE INDEX IF NOT EXISTS timings_call ON timings(call_id, id);
 CREATE TABLE IF NOT EXISTS audit(
   id {SERIAL}, tenant_id TEXT, t {REAL}, actor TEXT, action TEXT, target TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS audit_tenant ON audit(tenant_id, id);
@@ -213,6 +216,7 @@ class Store:
         if self.get_call(tenant_id, call_id) is None:
             return False
         self._x("DELETE FROM messages WHERE call_id=?", (call_id,))
+        self._x("DELETE FROM timings WHERE call_id=?", (call_id,))
         return self._x("DELETE FROM calls WHERE id=? AND tenant_id=?", (call_id, tenant_id)) > 0
 
     def get_tenant(self, tenant_id: str) -> Optional[dict]:
@@ -397,3 +401,10 @@ class Store:
 
     def messages(self, call_id: str) -> list[dict]:
         return self._all("SELECT role, text, t FROM messages WHERE call_id=? ORDER BY id", (call_id,))
+
+    def add_timing(self, call_id: str, turn: int, stage: str, ms: float, t: float) -> None:
+        self._x("INSERT INTO timings(call_id, turn, stage, ms, t) VALUES(?,?,?,?,?)",
+                (call_id, int(turn), stage, float(ms), float(t)))
+
+    def timings(self, call_id: str) -> list[dict]:
+        return self._all("SELECT turn, stage, ms, t FROM timings WHERE call_id=? ORDER BY id", (call_id,))

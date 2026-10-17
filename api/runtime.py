@@ -177,6 +177,16 @@ class Runtime:
                                              eot_threshold=float(os.environ.get("VOX_EOT_THRESHOLD", "0.8")),
                                              patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000"))))
         store, cid = self.store, call["id"]
+        tts = self.make_tts(cfg.get("voice", "af_heart"))
+        if hasattr(tts, "speed"):
+            tts.speed = float(cfg.get("speed", 1.0))
+        lim = int(os.environ.get("VOX_TTS_CONCURRENCY", "4"))
+        if lim > 0:
+            tts = LimitedTTS(tts, lim)
+        sess = Session(llm=self.llm, tts=tts, vad=self.make_vad(),
+                       send_audio=transport.send_audio, clear_audio=transport.clear, clock=self.clock,
+                       cfg=scfg, tools=fns, on_event=None, eot_fn=self._eot_sync(),
+                       eot_async=self._eot_async(), recorder=recorder, on_utterance=on_utt)
 
         def on_event(e: dict) -> None:
             if os.environ.get('VOX_LOG_EVENTS'):
@@ -186,20 +196,16 @@ class Runtime:
                 store.add_message(cid, "user", e["text"], time.time())
             elif e["type"] == "agent_speech":
                 store.add_message(cid, "agent", e["text"], time.time())
+            # agent_first_audio carries latency_ms; the other three stages carry ms.
+            if e["type"] in ("llm_first_token", "tts_done", "agent_first_audio", "tool_result"):
+                ms = e["ms"] if "ms" in e else e.get("latency_ms")
+                if ms is not None:
+                    store.add_timing(cid, int(sess.stats["turns"]), e["type"], ms, time.time())
             if forward_events and hasattr(transport, "send_event"):
                 import asyncio
                 asyncio.get_running_loop().create_task(transport.send_event(e))
 
-        tts = self.make_tts(cfg.get("voice", "af_heart"))
-        if hasattr(tts, "speed"):
-            tts.speed = float(cfg.get("speed", 1.0))
-        lim = int(os.environ.get("VOX_TTS_CONCURRENCY", "4"))
-        if lim > 0:
-            tts = LimitedTTS(tts, lim)
-        sess = Session(llm=self.llm, tts=tts, vad=self.make_vad(),
-                       send_audio=transport.send_audio, clear_audio=transport.clear, clock=self.clock,
-                       cfg=scfg, tools=fns, on_event=on_event, eot_fn=self._eot_sync(),
-                       eot_async=self._eot_async(), recorder=recorder, on_utterance=on_utt)
+        sess.on_event = on_event          # public; the closure has to see sess.stats["turns"]
 
         async def voicemail(message: str) -> None:
             await sess.say_and_wait(message)

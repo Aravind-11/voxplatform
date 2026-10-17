@@ -4,8 +4,9 @@ Design points
   * Speculative generation: a reply starts on a short pause (SPECULATE) but its audio is held
     until END_OF_TURN commits it; SPEECH_RESUME cancels it. Tool calls also wait for commit so a
     cancelled speculation can never cause a side effect.
-  * Barge-in: caller speech during playback clears the far-end buffer, cancels generation and
-    trims history to the text the caller actually heard.
+  * Barge-in: caller speech during playback pauses the far end at once. If the burst
+    ends before barge_confirm_ms it was a cough: playback resumes and history is not
+    trimmed. If speech keeps going, that pause becomes a real interrupt.
   * The speech model emits text only and the server accepts one audio clip per request, so
     earlier caller turns live in history as transcripts (produced by a side request that runs in
     parallel with the reply and is awaited before the next turn).
@@ -99,6 +100,11 @@ class _Generation:
         self.produce_done = False
         self.first_audio_sent = False
         self.cancelled = False
+        self.holding = False           # tentative barge-in: drain must not send until this clears
+        self.barge_paused = False
+        self.paused_heard = ""
+        self.paused_cut = False
+        self.paused_spoken: list[str] = []
         self.after: Optional[ToolResult] = None   # deferred call action requested by a tool this reply
 
 
@@ -146,6 +152,10 @@ class Session:
         (self._utt if self.turn.in_turn else self._pre).append(frame)
         for ev in self.turn.process(prob):
             await self._handle(ev)
+        g = self._gen
+        # barge_confirm_ms is measured from the start of the utterance, not from the pause.
+        if g and g.holding and not g.cancelled and self.turn.speech_ms >= self.cfg.turn.barge_confirm_ms:
+            await self._interrupt(g)
 
     async def start(self) -> None:
         """Called by the transport once the call is connected: speaks the configured greeting, if any."""
@@ -225,7 +235,7 @@ class Session:
             self._pre.clear()
             g = self._gen
             if g and g.committed and self._agent_active():
-                await self._interrupt(g)
+                await self._pause_for_barge(g)
             self._emit("user_speech_start")
         elif ev.kind is Ev.SPECULATE:
             self.stats["speculations"] += 1
@@ -249,6 +259,9 @@ class Session:
             self._cancel_eot()
             self._utt = []
             self._emit("speech_abort")
+            g = self._gen
+            if g and g.holding:
+                await self._resume_after_barge(g)
 
     def _cancel_eot(self) -> None:
         t, self._eot_task = self._eot_task, None
@@ -434,7 +447,17 @@ class Session:
     async def _drain(self, gen: _Generation) -> None:
         await gen.commit.wait()
         while True:
+            # A tentative barge-in holds the buffer. A strict hang-up must not run until the
+            # interrupt is confirmed (or the hold is released); a cough must not drop the call.
+            while gen.holding and not gen.cancelled:
+                await asyncio.sleep(self.cfg.tts_poll_s)
+            if gen.cancelled:
+                return
             item = await gen.outbox.get()
+            while gen.holding and not gen.cancelled:
+                await asyncio.sleep(self.cfg.tts_poll_s)
+            if gen.cancelled:
+                return
             if item is None:
                 if gen.after is not None and not gen.cancelled:
                     await self._finish_action(gen)
@@ -456,12 +479,65 @@ class Session:
                 self.history[-1]["content"] = " ".join(gen.spoken)
 
     # ----------------------------------------------------------- barge-in
-    async def _interrupt(self, gen: _Generation) -> None:
+    async def _pause_for_barge(self, gen: _Generation) -> None:
+        """Stop the far end without cancelling the reply. Speech may still turn out to be noise."""
+        if gen.holding or gen.cancelled:
+            return
         heard, cut = self.tracker.heard()
+        gen.barge_paused = True
+        gen.paused_heard = heard
+        gen.paused_cut = cut
+        gen.paused_spoken = list(gen.spoken)
+        gen.holding = True                 # before the first await, so drain cannot send another chunk
+        await self.clear_audio()
+        if self.recorder is not None:
+            self.recorder.clear()
+
+    def _barge_remainder(self, gen: _Generation) -> str:
+        """Text the caller has not heard: the unheard tail of what was sent, plus chunks still queued."""
+        spoken = [s.strip() for s in (gen.paused_spoken or gen.spoken) if s and s.strip()]
+        joined = " ".join(spoken).strip()
+        heard = (gen.paused_heard or "").strip()
+        if not heard:
+            rest = joined
+        elif joined.startswith(heard):
+            rest = joined[len(heard):].strip()
+        else:
+            rest = ""
+        pending: list[str] = []
+        for item in list(getattr(gen.outbox, "_queue", ())):
+            if isinstance(item, tuple) and item and isinstance(item[0], str) and item[0].strip():
+                pending.append(item[0].strip())
+        for item in list(getattr(gen.textq, "_queue", ())):
+            if isinstance(item, str) and item.strip():
+                pending.append(item.strip())
+        if pending:
+            extra = " ".join(pending)
+            rest = f"{rest} {extra}".strip() if rest else extra
+        if rest:
+            return rest
+        return spoken[-1] if spoken else ""
+
+    async def _resume_after_barge(self, gen: _Generation) -> None:
+        """A cough: do not trim history. Re-speak whatever the clear() cut off."""
+        remainder = self._barge_remainder(gen)
+        await self._cancel(gen)           # the held reply must not also flush; this does not trim or count
+        gen.holding = False
+        self._emit("barge_aborted", text=remainder)
+        if remainder.strip():
+            self.say(remainder.strip())
+
+    async def _interrupt(self, gen: _Generation) -> None:
+        # After a pause the transport buffer is already gone, so the clock must not advance "heard".
+        if gen.barge_paused:
+            heard, cut = gen.paused_heard, gen.paused_cut
+        else:
+            heard, cut = self.tracker.heard()
         await self.clear_audio()          # stop the far end first: that is what the caller hears
         if self.recorder is not None:
             self.recorder.clear()
         await self._cancel(gen)
+        gen.holding = False
         a, gen.after = gen.after, None
         if a is not None and a.strict:
             self._spawn_action(a)         # strict: the caller talking over the goodbye does not keep the call alive

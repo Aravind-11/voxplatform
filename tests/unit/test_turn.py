@@ -65,9 +65,23 @@ def test_barge_in_needs_longer_speech_while_agent_speaks():
     assert feed(tm, [(True, 4), (False, 3)]) == []          # 128 ms burst: ignored
     tm2 = TurnManager()
     tm2.set_agent_speaking(True)
-    ev = feed(tm2, [(True, 7)])                              # 224 ms: interrupts
+    ev = feed(tm2, [(True, 7)])                              # 224 ms: turn starts; still under barge_confirm_ms
     assert kinds(ev) == [Ev.SPEECH_START]
     assert ev[0][1] == 5 * F                                 # 6th frame reaches 192 ms
+
+
+def test_short_barge_aborts_and_a_long_one_does_not():
+    # 7 speech frames = 224 ms, then 6 silence frames (192 ms). Under barge_confirm_ms (400).
+    tm = TurnManager()
+    tm.set_agent_speaking(True)
+    ev = feed(tm, [(True, 7), (False, 6)])
+    assert kinds(ev) == [Ev.SPEECH_START, Ev.SPEECH_ABORT]
+    assert not tm.in_turn
+    # 14 speech frames = 448 ms, past 400: silence speculates, it does not abort.
+    tm2 = TurnManager()
+    tm2.set_agent_speaking(True)
+    ev2 = feed(tm2, [(True, 14), (False, 6)])
+    assert kinds(ev2) == [Ev.SPEECH_START, Ev.SPECULATE]
 
 
 def test_onset_time_is_reported():

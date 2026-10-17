@@ -150,9 +150,9 @@ async def test_barge_in_clears_audio_and_trims_history_to_what_was_heard():
     await r.settle()
     assert len(r.sent) == 3            # synthesized just in time, before the listener runs out
     sent_before = len(r.sent)
-    await r.frames("s", 6)            # caller talks over the agent (needs 192 ms while it speaks)
+    await r.frames("s", 14)           # 448 ms: past barge_confirm_ms, so the pause becomes an interrupt
     await r.settle()
-    assert r.clears == 1
+    assert r.clears >= 1
     ev = r.last("user_interrupted")
     assert ev["cut"] is True
     assert ev["heard"] == "One two three four five. Six seven eight"
@@ -166,6 +166,31 @@ async def test_barge_in_clears_audio_and_trims_history_to_what_was_heard():
     second = llm.calls[1]["history"]
     assert second[-1]["content"].endswith("[interrupted]")
     assert second[1]["content"] == "caller said 1"
+
+
+async def test_short_barge_in_pauses_and_resumes_without_trimming():
+    reply = ["One ", "two ", "three ", "four ", "five. ", "Six ", "seven ", "eight ", "nine ", "ten. ",
+             "Eleven ", "twelve ", "thirteen ", "fourteen ", "fifteen."]
+    llm = FakeLLM([reply])
+    r = Rig(llm, tts=FakeTTS(word_ms=200))
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    await r.frames("q", 45)
+    await r.settle()
+    await r.frames("s", 6)            # 192 ms: pause only, not a confirmed interrupt
+    await r.settle()
+    assert r.clears >= 1 and "user_interrupted" not in r.types()
+    assert r.s.stats["interruptions"] == 0
+    before = list(r.tts.texts)
+    await r.frames("q", 8)            # silence aborts the short burst
+    await r.settle()
+    assert "barge_aborted" in r.types()
+    assert not any("[interrupted]" in (m.get("content") or "") for m in r.s.history)
+    resumed = r.last("barge_aborted")["text"]
+    assert resumed
+    new = " ".join(r.tts.texts[len(before):])
+    assert new and resumed.split()[0] in new
 
 
 async def test_no_barge_in_after_agent_finished_playing():
@@ -375,9 +400,9 @@ async def test_strict_hangup_still_happens_if_caller_talks_over_the_goodbye():
     await r.frames("s", 15)
     await r.frames("q", 22)
     await r.settle()
-    await r.frames("s", 6)             # barge-in while the goodbye is playing
+    await r.frames("s", 14)            # long enough to confirm the barge-in; a cough must not hang up
     await r.settle()
-    assert r.clears == 1 and ended == [1]
+    assert r.clears >= 1 and ended == [1]
 
 
 async def test_non_strict_hangup_is_cancelled_by_the_caller_talking():
@@ -385,11 +410,11 @@ async def test_non_strict_hangup_is_cancelled_by_the_caller_talking():
     await r.frames("s", 15)
     await r.frames("q", 22)
     await r.settle()
-    await r.frames("s", 6)
+    await r.frames("s", 14)
     await r.settle()
     r.clk.t += 5000
     await asyncio.sleep(0.2)
-    assert r.clears == 1 and ended == []
+    assert r.clears >= 1 and ended == []
 
 
 # ---------------------------------------------------------------------------------- greeting
@@ -419,9 +444,9 @@ async def test_caller_can_talk_over_the_greeting_and_the_next_turn_proceeds():
     await r.s.start()
     await r.settle()
     await r.frames("q", 30)            # ~1 s of the greeting plays...
-    await r.frames("s", 8)             # ...then the caller starts talking over it
+    await r.frames("s", 14)            # long enough to confirm the interrupt
     await r.settle()
-    assert r.clears == 1 and r.last("user_interrupted")["cut"] is True
+    assert r.clears >= 1 and r.last("user_interrupted")["cut"] is True
     await r.frames("s", 10)
     await r.frames("q", 30)
     await r.settle()

@@ -8,6 +8,8 @@ import hmac
 import json
 import secrets
 import threading
+import time
+from contextlib import contextmanager
 from typing import Awaitable, Callable, Optional
 
 import httpx
@@ -134,6 +136,47 @@ return 1
                 await asyncio.get_running_loop().run_in_executor(None, self.refresh)
             except Exception:  # noqa: BLE001  (Redis blip: try again next tick)
                 pass
+
+
+class OutboundCap:
+    """Daily outbound cap. Redis INCR is atomic across nodes; without Redis the count runs under store.lock.
+
+    A rejected attempt must not consume a slot: the Lua script DECRs when the INCR goes over the cap.
+    """
+
+    LUA = """
+local n = redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+if tonumber(n) > tonumber(ARGV[2]) then
+  redis.call('DECR', KEYS[1])
+  return 0
+end
+return 1
+"""
+    TTL_S = 48 * 60 * 60
+
+    def __init__(self, limiter, store):
+        self.limiter, self.store = limiter, store
+        self._script = limiter.r.register_script(self.LUA) if isinstance(limiter, RedisLimiter) else None
+
+    def allow(self, tenant_id: str, per_day: int) -> bool:
+        """True if this tenant may place another outbound call. Redis key is vox:outbound:{tenant}:{UTC date}."""
+        if self._script is not None:
+            from datetime import datetime, timezone
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            key = f"vox:outbound:{tenant_id}:{day}"
+            return int(self._script(keys=[key], args=[self.TTL_S, int(per_day)])) == 1
+        since = time.time() - 86400
+        return self.store.count_outbound(tenant_id, since) < int(per_day)
+
+    @contextmanager
+    def hold(self, tenant_id: str, per_day: int):
+        """Yield the allow() result. No Redis: hold store.lock across the yield so create_call cannot race the count."""
+        if self._script is not None:
+            yield self.allow(tenant_id, per_day)
+            return
+        with self.store.lock:
+            yield self.allow(tenant_id, per_day)
 
 
 # ------------------------------------------------------- Twilio signatures

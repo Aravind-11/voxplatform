@@ -207,6 +207,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     if not getattr(runtime, "public_url", ""):
         runtime.public_url = settings.public_base_url
     app.state.store, app.state.limiter, app.state.runtime = store, limiter, runtime
+    outbound_cap = security.OutboundCap(limiter, store)
     METRICS.gauge("vox_active_calls", limiter.local_active)            # this node's calls
     METRICS.gauge("vox_active_calls_cluster", limiter.total_active)   # every node's calls (Redis scan)
 
@@ -939,11 +940,6 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         agent = store.get_agent(t["id"], body.agentId)
         if not agent:
             raise HTTPException(404, "agent not found")
-        day_ago = time.time() - 86400
-        recent = sum(1 for c in store.list_calls(t["id"], limit=10_000)
-                     if c["created"] >= day_ago and c["metadata"].get("direction") == "outbound")
-        if recent >= settings.outbound_per_day:
-            raise HTTPException(429, f"outbound limit reached ({settings.outbound_per_day} per 24 h)")
         cfg = dict(agent["config"])
         if body.record is not None:
             cfg["record"] = body.record
@@ -953,7 +949,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             meta["variables"] = given_vars
         if body.voicemailMessage:
             meta["voicemail"] = body.voicemailMessage
-        call = store.create_call(t["id"], body.agentId, "twilio", cfg, meta)
+        with outbound_cap.hold(t["id"], settings.outbound_per_day) as allowed:
+            if not allowed:
+                raise HTTPException(429, f"outbound limit reached ({settings.outbound_per_day} per 24 h)")
+            call = store.create_call(t["id"], body.agentId, "twilio", cfg, meta)
         ws = settings.public_base_url.replace("http", "ws", 1)
         twiml = stream_twiml(call)
         data = {"To": body.to, "From": caller_id, "Twiml": twiml,

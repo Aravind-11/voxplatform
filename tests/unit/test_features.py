@@ -599,6 +599,71 @@ def test_outbound_status_and_amd_callbacks_need_a_valid_signature():
     assert spoke == ["hi", "END"]
 
 
+def test_count_outbound_is_not_limited_by_list_calls_page_size():
+    from api.store import Store
+    store = Store()
+    tid = store.create_tenant("acme")
+    since = time.time() - 60
+    for i in range(5):
+        store.create_call(tid, None, "twilio", {}, {"direction": "outbound", "n": i})
+    store.create_call(tid, None, "webSocket", {}, {"from": "+15550001"})  # not outbound
+    old = store.create_call(tid, None, "twilio", {}, {"direction": "outbound", "n": "old"})
+    store._x("UPDATE calls SET created=? WHERE id=?", (since - 86400, old["id"]))
+    assert len(store.list_calls(tid, limit=1)) == 1
+    assert store.count_outbound(tid, since) == 5
+    # the route must not go back to scanning a short page
+
+    def ok(req):
+        return httpx.Response(201, json={"sid": "CA9"})
+    c, store2, _ = make_outbound(ok, outbound_per_day=5)
+    k, tid2 = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    for i in range(5):
+        store2.create_call(tid2, a["id"], "twilio", {}, {"direction": "outbound", "n": i})
+    assert len(store2.list_calls(tid2, limit=1)) == 1
+    assert store2.count_outbound(tid2, time.time() - 86400) == 5
+    store2.list_calls = lambda tenant_id, limit=50: []  # a truncated scan would under-count and allow the call
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551230000"}, headers=H(k))
+    assert r.status_code == 429
+
+
+def test_redis_outbound_cap_second_acquire_does_not_consume_a_slot():
+    from datetime import datetime, timezone
+    from api import security
+    from api.store import Store
+
+    class FakeRedis:
+        def __init__(self):
+            self.kv, self.expire, self.scripts = {}, {}, []
+
+        def register_script(self, script):
+            self.scripts.append(script)
+
+            def call(keys=None, args=None, client=None):
+                if "INCR" not in script:
+                    return 1
+                key = keys[0]
+                ttl, cap = int(args[0]), int(args[1])
+                n = int(self.kv.get(key, 0)) + 1
+                self.kv[key] = n
+                self.expire[key] = ttl
+                if n > cap:
+                    self.kv[key] = n - 1
+                    return 0
+                return 1
+
+            return call
+
+    fake = FakeRedis()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), Store())
+    assert cap.allow("tnt_a", 1) is True
+    assert cap.allow("tnt_a", 1) is False
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = f"vox:outbound:tnt_a:{day}"
+    assert fake.kv[key] == 1 and fake.expire[key] == 48 * 60 * 60
+    assert any("INCR" in s and "DECR" in s for s in fake.scripts)
+
+
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)
 def test_drain_stops_new_calls_but_reports_readiness():
     from test_api import speech, silence

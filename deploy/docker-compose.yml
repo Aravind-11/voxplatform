@@ -75,7 +75,7 @@ services:
 
   redis:
     image: redis:7
-    command: [ "redis-server", "--save", "", "--appendonly", "no" ]    # only call counters live here; losing them is harmless
+    command: [ "redis-server", "--save", "", "--appendonly", "no" ]    # call counters and the call-bus pub/sub; losing them is harmless
     restart: unless-stopped
 
   proxy:

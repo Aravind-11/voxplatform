@@ -81,9 +81,17 @@ class Runtime:
     record_dir: str = ""                   # where recordings / the utterance dataset go; "" -> VOX_RECORD_DIR env
     live: dict = field(default_factory=dict)       # call_id -> (Session, transport): lets webhooks reach a live call
     recorders: dict = field(default_factory=dict)  # call_id -> CallRecorder
+    bus: object = None                             # CallBus; create_app sets one. None in unit tests that build a Runtime by hand.
+    _bus_handlers: dict = field(default_factory=dict)  # call_id -> handler subscribed on bus
+
+    def _drop_bus(self, call_id: str) -> None:
+        handler = self._bus_handlers.pop(call_id, None)
+        if self.bus is not None and handler is not None:
+            self.bus.unsubscribe(call_id, handler)
 
     def finalize(self, call_id: str) -> Optional[str]:
         """Called when a call ends: forgets the live session and writes the recording. Returns the WAV path."""
+        self._drop_bus(call_id)
         self.live.pop(call_id, None)
         rec = self.recorders.pop(call_id, None)
         rec_dir = self.record_dir or os.environ.get("VOX_RECORD_DIR", "")
@@ -205,6 +213,23 @@ class Runtime:
             await sess.say_and_wait(message)
             await transport.end()
         ctx.voicemail = voicemail
+        # AMD may be delivered on another node, or on the Redis listener thread. Schedule onto
+        # the loop that owns this session; there is no loop when a sync test builds a session.
+        if self.bus is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                def on_bus(msg: dict, _loop=loop, _vm=voicemail) -> None:
+                    if not isinstance(msg, dict) or msg.get("op") != "voicemail":
+                        return
+                    text = msg.get("text") or ""
+                    if text:
+                        asyncio.run_coroutine_threadsafe(_vm(str(text)), _loop)
+                self._drop_bus(call["id"])
+                self.bus.subscribe(call["id"], on_bus)
+                self._bus_handlers[call["id"]] = on_bus
         if resumed:
             sess.seed_history(self._earlier_messages(meta["resumedFrom"]))
         self.live[call["id"]] = (sess, transport)

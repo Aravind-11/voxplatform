@@ -594,9 +594,92 @@ def test_outbound_status_and_amd_callbacks_need_a_valid_signature():
     assert r.json()["action"] == "none" and spoke == []
     machine = {"AnsweredBy": "machine_end_beep"}
     r = c.post(f"/twilio/amd/{o2['id']}", data=machine, headers={"X-Twilio-Signature": security.twilio_signature("tok", url2, machine)})
-    assert r.json()["action"] == "voicemail"
+    assert r.json()["action"] == "voicemail" and r.json()["delivered"] is True
     time.sleep(0.3)
     assert spoke == ["hi", "END"]
+
+
+async def test_amd_voicemail_is_spoken_by_the_runtime_that_owns_the_call():
+    import asyncio
+    from api import security
+    from api.callbus import LocalCallBus
+    from api.runtime import LimitedTTS, Runtime
+    from test_session import EnergyVAD, FakeLLM, FakeTTS
+
+    bus = LocalCallBus()
+    c, store, rt = make_outbound(lambda r: httpx.Response(201, json={"sid": "CA1"}))
+    rt.bus = bus
+    k, _ = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    o = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551234567",
+                                           "voicemailMessage": "please call back"}, headers=H(k)).json()
+    url = f"https://vox.example.com/twilio/amd/{o['id']}"
+    machine = {"AnsweredBy": "machine_end_beep"}
+    sig = {"X-Twilio-Signature": security.twilio_signature("tok", url, machine)}
+    assert c.post(f"/twilio/amd/{o['id']}", data=machine).status_code == 403
+    assert rt.live.get(o["id"]) is None
+    missed = c.post(f"/twilio/amd/{o['id']}", data=machine, headers=sig)
+    assert missed.json() == {"action": "voicemail", "delivered": False}
+    human = {"AnsweredBy": "human"}
+    seen = []
+    bus.subscribe(o["id"], seen.append)
+    hum = c.post(f"/twilio/amd/{o['id']}", data=human,
+                 headers={"X-Twilio-Signature": security.twilio_signature("tok", url, human)})
+    assert hum.json()["action"] == "none" and seen == []
+    bus.unsubscribe(o["id"])
+
+    tts = FakeTTS(word_ms=20)
+    ended = []
+
+    class T:
+        out_rate = 8000
+        call_sid = "CA1"
+
+        async def send_audio(self, pcm, rate):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            ended.append("END")
+
+    LimitedTTS._sem = None
+    try:
+        other = Runtime(FakeLLM([["x"]]), lambda v: tts, EnergyVAD, store, bus=bus)
+        other.build_session(store.get_call_any(o["id"]), T())
+        assert o["id"] not in rt.live and o["id"] in other.live
+        hit = c.post(f"/twilio/amd/{o['id']}", data=machine, headers=sig)
+        assert hit.json() == {"action": "voicemail", "delivered": True}
+        for _ in range(40):
+            if tts.texts and ended:
+                break
+            await asyncio.sleep(0.05)
+        assert tts.texts == ["please call back"] and ended == ["END"]
+        # This node has the call in `live`, so it must speak directly and not also publish
+        # (the other runtime is still subscribed and would speak a second time).
+        before = list(tts.texts)
+        spoke = []
+
+        class S:
+            async def say_and_wait(self, m):
+                spoke.append(m)
+
+        class Tr:
+            async def end(self):
+                spoke.append("END")
+
+        rt.live[o["id"]] = (S(), Tr())
+        local = c.post(f"/twilio/amd/{o['id']}", data=machine, headers=sig)
+        assert local.json()["delivered"] is True
+        await asyncio.sleep(0.3)
+        assert spoke == ["please call back", "END"] and tts.texts == before
+        rt.live.pop(o["id"], None)
+        other.finalize(o["id"])
+        again = c.post(f"/twilio/amd/{o['id']}", data=machine, headers=sig)
+        assert again.json() == {"action": "voicemail", "delivered": False}
+    finally:
+        LimitedTTS._sem = None
 
 
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)

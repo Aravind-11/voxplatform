@@ -3,7 +3,8 @@
   VOX_ADMIN_KEY            admin key for POST /admin/tenants and /metrics (required to create tenants)
   VOX_PUBLIC_URL           public https URL Twilio and browsers reach (wss is derived from it)
   VOX_DB                   SQLite path (default vox.db) or postgresql://user:pass@host/db
-  VOX_REDIS_URL            redis://host:6379/0 -> concurrency cap shared by all API nodes (default: in-process)
+  VOX_REDIS_URL            redis://host:6379/0 -> concurrency cap shared by all API nodes, and the call bus
+                           (AMD voicemail when the webhook hits a different node). Default: in-process.
   VOX_VLLM_URL             Ultravox server, default http://127.0.0.1:8000/v1
   VOX_AUDIO_STYLE          input_audio | audio_url
   VOX_DEFAULT_CONCURRENCY  per-tenant active-call cap, default 10

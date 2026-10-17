@@ -356,6 +356,24 @@ class Store:
         r = self._one("SELECT * FROM calls WHERE id=?", (call_id,))
         return self._call(r) if r else None
 
+    def find_call_by_sid(self, call_sid: str, medium: Optional[str] = None) -> Optional[dict]:
+        """Newest call whose metadata JSON contains this callSid (AudioSocket UUID or Twilio SID).
+
+        json.dumps writes a space after the colon. LIKE wildcards in the id are escaped so a
+        sid cannot widen the match.
+        """
+        if not call_sid:
+            return None
+        needle = '"callSid": ' + json.dumps(call_sid)
+        safe = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = self._all("SELECT * FROM calls WHERE metadata LIKE ? ESCAPE '\\' ORDER BY created DESC",
+                         (f"%{safe}%",))
+        for r in rows:
+            call = self._call(r)
+            if medium is None or call["medium"] == medium:
+                return call
+        return None
+
     def list_calls(self, tenant_id: str, limit: int = 50) -> list[dict]:
         return [self._call(r) for r in self._all(
             "SELECT * FROM calls WHERE tenant_id=? ORDER BY created DESC LIMIT ?", (tenant_id, limit))]

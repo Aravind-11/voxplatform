@@ -118,6 +118,39 @@ def test_real_stream_close_by_twilio_is_marked_stream_closed_and_agent_end_marke
     assert "<Stream" in resume(c, call["id"]).text
 
 
+def test_sip_recover_seeds_history_from_the_lost_audiosocket_call():
+    """POST /sip/recover with the AudioSocket uuid (not the call id) continues the transcript on a new sip call."""
+    c, store, lim = make(Settings(admin_key="adm", public_base_url=BASE, twilio_auth_token="tok", sip_token="sip-secret"))
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "n", "greeting": "Hello!"}, headers={"X-API-Key": k}).json()
+    call = store.create_call(tid, a["id"], "sip", a["config"],
+                             {"callSid": "sip-uuid-1", "from": "+15550001", "to": "+15550002", "channel": "sip"})
+    store.update_call(call["id"], status="active", joined=time.time())
+    assert lim.acquire(tid, call["id"], 5)
+    store.add_message(call["id"], "agent", "Hello, how can I help?", time.time())
+    store.add_message(call["id"], "user", "I want Tuesday at eleven.", time.time())
+    assert c.post("/sip/recover", json={"uuid": "sip-uuid-1"}).status_code == 403
+    r = c.post("/sip/recover", json={"uuid": "sip-uuid-1"}, headers={"X-Vox-Sip-Token": "sip-secret"})
+    assert r.status_code == 200 and r.json()["agentId"] == a["id"] and r.json()["callId"] != call["id"]
+    old = store.get_call_any(call["id"])
+    assert old["status"] == "ended" and old["end_reason"] == "stream_lost" and lim.total_active() == 0
+    new = store.get_call_any(r.json()["callId"])
+    assert new["medium"] == "sip" and new["metadata"]["resumedFrom"] == call["id"] and new["metadata"]["resumes"] == 1
+    sess = c.app.state.runtime.build_session(new, type("T", (), {"out_rate": 8000, "call_sid": "sip-uuid-1",
+                                                                  "send_audio": lambda s, *a: None, "clear": lambda s: None,
+                                                                  "end": lambda s: None})())
+    assert [m["content"] for m in sess.history[1:]] == ["Hello, how can I help?", "I want Tuesday at eleven."]
+    assert [m["role"] for m in sess.history[1:]] == ["assistant", "user"]
+    hung = store.create_call(tid, a["id"], "sip", a["config"], {"callSid": "sip-uuid-2", "channel": "sip"})
+    store.update_call(hung["id"], status="ended", ended=time.time(), end_reason="agent_hangup")
+    refused = c.post("/sip/recover", json={"uuid": "sip-uuid-2"}, headers={"X-Vox-Sip-Token": "sip-secret"})
+    assert refused.status_code == 200 and refused.json()["action"] == "hangup"
+    assert not [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == hung["id"]]
+    assert c.post("/sip/recover", json={"uuid": "missing"}, headers={"X-Vox-Sip-Token": "sip-secret"}).status_code == 404
+    off, *_ = make()
+    assert off.post("/sip/recover", json={"uuid": "sip-uuid-1"}, headers={"X-Vox-Sip-Token": "sip-secret"}).status_code == 404
+
+
 def test_unknown_or_browser_calls_just_hang_up_and_draining_node_refuses():
     c, store, _ = make()
     k, tid = tenant(c)

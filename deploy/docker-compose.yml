@@ -32,6 +32,7 @@ x-api: &api
     VOX_AUDIOSOCKET_PORT: ${VOX_AUDIOSOCKET_PORT:-0}          # SIP path (docs/SIP.md): 0 = off
     VOX_AUDIOSOCKET_AGENT: ${VOX_SIP_AGENT:-}
     VOX_AUDIOSOCKET_HOST: 0.0.0.0                              # private compose network only; never publish this port
+    VOX_SIP_TOKEN: ${VOX_SIP_TOKEN:-}                          # POST /sip/recover; empty = endpoint off (404)
   volumes: [ "models:/models", "recordings:/data/recordings" ]
   deploy: { resources: { reservations: { devices: [ { driver: nvidia, count: 1, capabilities: [ gpu ] } ] } } }
   stop_grace_period: 1h          # live calls finish after the drain (see deploy/drain.py)
@@ -59,11 +60,22 @@ services:
 
   asterisk:
     # SIP front end for VoxSun or any SIP provider: `docker compose --profile sip up -d`. Configure deploy/sip/pjsip.conf first.
+    # One Asterisk is a single point of failure. `asterisk2` is the second registrar; put Kamailio
+    # (deploy/sip/kamailio.cfg) or carrier failover in front of both. See docs/SIP.md.
     profiles: [ sip ]
     build: { context: ., dockerfile: Dockerfile.asterisk }
     hostname: asterisk
     depends_on: [ api1 ]
     ports: [ "5060:5060/udp", "10000-10100:10000-10100/udp" ]
+    restart: unless-stopped
+
+  asterisk2:
+    # Same image, profile sip. Both register to the carrier or sit behind a SIP proxy (deploy/sip/kamailio.cfg).
+    # Do not publish 5060 here: that host port belongs to `asterisk`. Give this node its own address, or let the proxy reach it on the compose network.
+    profiles: [ sip ]
+    build: { context: ., dockerfile: Dockerfile.asterisk }
+    hostname: asterisk2
+    depends_on: [ api2 ]
     restart: unless-stopped
 
   postgres:

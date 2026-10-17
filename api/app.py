@@ -44,6 +44,7 @@ class Settings:
     audiosocket_port: int = 0          # >0: listen for Asterisk AudioSocket connections (the SIP path) on this TCP port
     audiosocket_agent: str = ""        # agent id that answers calls arriving on that port
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
+    sip_token: str = ""                # VOX_SIP_TOKEN; empty disables POST /sip/recover (404)
 
 
 class AgentIn(BaseModel):
@@ -909,6 +910,48 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         METRICS.inc("vox_call_resumes_total")
         store.audit(call["tenant_id"], "system", "call.resume", nxt["id"], {"from": call_id, "attempt": n + 1})
         return Response(stream_twiml(nxt), media_type="text/xml")
+
+    @app.post("/sip/recover")
+    async def sip_recover(request: Request, x_vox_sip_token: str = Header(default="")):
+        """Lost AudioSocket call. Body `uuid` is the AudioSocket id (metadata callSid), not our call id:
+        a re-dial does not know the id. Same history rules as /twilio/resume, but JSON instead of TwiML.
+        When the socket EOF was not our hang-up, finish has already stored end_reason=stream_closed."""
+        if not settings.sip_token:
+            raise HTTPException(404, "not found")
+        if not hmac.compare_digest(x_vox_sip_token or "", settings.sip_token):
+            raise HTTPException(403, "bad sip token")
+        if app.state.draining:
+            raise HTTPException(503, "node is draining")
+        if "json" in request.headers.get("content-type", ""):
+            try:
+                data = await request.json()
+            except Exception:  # noqa: BLE001
+                data = {}
+            uid = str(data.get("uuid", "")).strip() if isinstance(data, dict) else ""
+        else:
+            form = {k: str(v) for k, v in (await request.form()).items()}
+            uid = form.get("uuid", "").strip()
+        if not uid:
+            raise HTTPException(422, "uuid is required")
+        call = store.find_call_by_sid(uid, medium="sip")
+        if not call:
+            raise HTTPException(404, "call not found")
+        if call.get("end_reason") in ("agent_hangup", "transfer", "no_credit"):
+            return {"action": "hangup"}
+        meta = call["metadata"] if isinstance(call["metadata"], dict) else json.loads(call["metadata"] or "{}")
+        n = int(meta.get("resumes", 0))
+        if n >= MAX_RESUMES:
+            METRICS.inc("vox_call_resume_refused_total")
+            return {"action": "hangup", "reason": "resume cap"}
+        if call["status"] in ("created", "active"):
+            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="stream_lost")
+            limiter.release(call["tenant_id"], call["id"])
+        nxt = store.create_call(call["tenant_id"], call["agent_id"], "sip", call["config"],
+                                {**meta, "resumedFrom": call["id"], "resumes": n + 1})
+        METRICS.inc("vox_call_resumes_total")
+        store.audit(call["tenant_id"], "system", "call.resume", nxt["id"],
+                    {"from": call["id"], "attempt": n + 1, "channel": "sip"})
+        return {"callId": nxt["id"], "agentId": nxt["agent_id"]}
 
     # ----------------------------------------------------- outbound calls
     def twilio_check(request: Request, form: dict) -> None:

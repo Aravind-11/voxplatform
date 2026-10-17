@@ -33,8 +33,13 @@ Without Docker: install Asterisk 18+ (needs the AudioSocket modules), copy the f
 
 ## Known limits
 - **Caller number is not passed:** AudioSocket carries only a call UUID. The agent does not know who is calling until we add it (Asterisk can pass it another way; not built).
-- **One engine node per Asterisk:** the dialplan points at `api1`. A TCP load balancer in front of several nodes is not built, and a call is lost if its node dies (the Twilio path can reconnect a call; the SIP path cannot).
+- **One engine node per Asterisk:** the sample dialplan points at `api1`. For two SIP front ends and continuing a call whose node died, see below.
 - **Security:** the AudioSocket port has no authentication. Keep it on a private network and never publish it.
 - **Outbound calls over SIP** (through VoxSun's `calls/initiate`) are not built.
 - **Open ports for Asterisk:** UDP 5060 and the RTP range 10000-10100. Behind NAT, set the public address in `pjsip.conf`.
 - Asterisk is GPL-2.0 software run as a separate program; this repo does not include or link it. Get the same licence check you would for any GPL component.
+
+## More than one Asterisk
+One Asterisk is a single point of failure. The intended layout is carrier failover, or Kamailio (`deploy/sip/kamailio.cfg`, not run in CI) in front of the compose services `asterisk` and `asterisk2` (both profile `sip`), plus a TCP load balancer in front of AudioSocket. Each API process still applies its own concurrency cap before it admits a call, so a dead node stops taking new sockets once the balancer stops using it.
+
+If the AudioSocket stream ends and the engine did not hang up (`ended_by_us` is false), `finish` already stores `end_reason=stream_closed`. A re-dial does not know the old call id. Whoever still has the AudioSocket UUID (the dialplan's `CALLUUID`, or the proxy) POSTs it as `uuid` to `/sip/recover` with header `X-Vox-Sip-Token` (`VOX_SIP_TOKEN`). The handler finds the call by metadata `callSid` and, when the agent did not hang up, creates a new SIP call with `resumedFrom` set so the next session keeps the transcript. An empty token leaves the endpoint off. An agent hang-up is not resumed.

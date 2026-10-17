@@ -23,7 +23,7 @@ from transports.twilio import TwilioTransport
 from . import security, tools as toolmod
 from . import openapi_import, retention, variables as varmod
 from .runtime import Runtime
-from .store import ROLES, Store
+from .store import ROLES, Store, normalize_e164
 
 
 @dataclass
@@ -42,8 +42,9 @@ class Settings:
     outbound_prefixes: tuple = ()      # e.g. ("+1",) restricts dialing to these country prefixes; empty = any
     static_dir: str = os.path.join(os.path.dirname(__file__), "static")
     audiosocket_port: int = 0          # >0: listen for Asterisk AudioSocket connections (the SIP path) on this TCP port
-    audiosocket_agent: str = ""        # agent id that answers calls arriving on that port
+    audiosocket_agent: str = ""        # agent id that answers calls arriving on that port when no number is mapped
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
+    sip_token: str = ""                # VOX_SIP_TOKEN; empty disables POST /internal/sip/setup (404)
 
 
 class AgentIn(BaseModel):
@@ -68,6 +69,10 @@ class AgentPatch(BaseModel):
     tools: Optional[list[Union[str, dict[str, Any]]]] = None
     speed: Optional[float] = Field(None, ge=0.7, le=1.3)
     record: Optional[bool] = None
+
+
+class NumberIn(BaseModel):
+    agentId: str
 
 
 class CallIn(BaseModel):
@@ -307,6 +312,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                              {"type": type_, "t": time.time(), "call": public_call(call), **extra})
 
     app.state.draining = False
+    app.state.sip_setups = {}          # uuid -> {caller, exten, created}; same rows as sip_setup, so tests need no extra process
 
     @app.get("/healthz")
     async def healthz():
@@ -426,6 +432,37 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     @app.get("/v1/agents")
     async def list_agents(t: dict = Depends(tenant)):
         return [redacted(a) for a in store.list_agents(t["id"])]
+
+    # ----------------------------------------------------- SIP numbers (dialed number -> agent)
+    def _e164_or_422(raw: str) -> str:
+        num = normalize_e164(raw)
+        if not E164.match(num):
+            raise HTTPException(422, "number must be E.164, e.g. +15551234567")
+        return num
+
+    @app.put("/v1/numbers/{e164}")
+    async def put_number(e164: str, body: NumberIn, t: dict = Depends(tenant_write)):
+        num = _e164_or_422(e164)
+        if not store.get_agent(t["id"], body.agentId):
+            raise HTTPException(422, "agent is not in this tenant")
+        other = store.get_number(num)
+        if other and other["tenant_id"] != t["id"]:
+            raise HTTPException(409, "number is assigned to another tenant")
+        store.put_number(t["id"], num, body.agentId)
+        log(t, "number.put", num, agentId=body.agentId)
+        return {"e164": num, "agentId": body.agentId}
+
+    @app.delete("/v1/numbers/{e164}")
+    async def delete_number(e164: str, t: dict = Depends(tenant_write)):
+        num = _e164_or_422(e164)
+        if not store.delete_number(t["id"], num):
+            raise HTTPException(404, "number not found")
+        log(t, "number.delete", num)
+        return {"deleted": num}
+
+    @app.get("/v1/numbers")
+    async def list_numbers(t: dict = Depends(tenant)):
+        return [{"e164": r["e164"], "agentId": r["agent_id"]} for r in store.list_numbers(t["id"])]
 
     # ------------------------------------------------------------- calls
     @app.post("/v1/calls")
@@ -845,30 +882,82 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             if "t" in state:
                 finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
 
+    def require_sip_token(header: str) -> None:
+        """Empty VOX_SIP_TOKEN turns SIP setup off (404). A wrong token is 403, not a silent accept."""
+        if not settings.sip_token:
+            raise HTTPException(404, "not found")
+        if not hmac.compare_digest(header or "", settings.sip_token):
+            raise HTTPException(403, "bad sip token")
+
+    def sip_setup_for(uid: str) -> Optional[dict]:
+        """In-memory row wins when it is fresh; the table covers a lookup from another worker. Older than 60 s is ignored."""
+        now = time.time()
+        mem = app.state.sip_setups.get(uid)
+        if mem and now - float(mem["created"]) <= 60:
+            return mem
+        return store.get_sip_setup(uid, max_age=60)
+
+    @app.post("/internal/sip/setup")
+    async def sip_setup(request: Request, x_vox_sip_token: str = Header(default="")):
+        """Asterisk calls this just before AudioSocket, so the UUID can be tied to the dialed number."""
+        require_sip_token(x_vox_sip_token)
+        form = {k: str(v) for k, v in (await request.form()).items()}
+        uid = form.get("uuid", "").strip()
+        if not uid:
+            raise HTTPException(422, "uuid is required")
+        caller, exten = form.get("caller", ""), form.get("exten", "")
+        created = time.time()
+        store.put_sip_setup(uid, caller, exten, created)
+        stale = [k for k, v in app.state.sip_setups.items() if created - float(v["created"]) > 60]
+        for k in stale:
+            app.state.sip_setups.pop(k, None)
+        app.state.sip_setups[uid] = {"uuid": uid, "caller": caller, "exten": exten, "created": created}
+        return {"ok": True}
+
     async def audiosocket_call(reader, writer) -> None:
-        """One SIP call arriving from Asterisk over AudioSocket: create the call, admit it, run the agent."""
+        """One SIP call from Asterisk. The call row is created only after the UUID is known: the dialplan's setup
+        row maps that UUID to the dialed number, and `numbers` picks the agent. No fresh setup (or no mapping)
+        falls back to settings.audiosocket_agent. If neither resolves, the socket is closed."""
         from transports.audiosocket import AudioSocketTransport
-        agent = store.get_agent_any(settings.audiosocket_agent)
-        if not agent or app.state.draining:
+        if app.state.draining:
             writer.close()
             return
-        call = store.create_call(agent["tenant_id"], agent["id"], "sip", agent["config"], {})
         state: dict = {}
 
         async def factory(tr, custom):
-            store.update_call(call["id"], metadata={"callSid": custom.get("uuid", ""), "channel": "sip"})
+            uid = str(custom.get("uuid", ""))
+            setup = sip_setup_for(uid) if uid else None
+            agent = None
+            if setup:
+                row = store.get_number(setup.get("exten") or "")
+                if row:
+                    agent = store.get_agent(row["tenant_id"], row["agent_id"])
+                    if agent is None:                 # number points at a deleted agent: do not silently use the default
+                        writer.close()
+                        raise EOFError("mapped agent is gone")
+            if agent is None and settings.audiosocket_agent:
+                agent = store.get_agent_any(settings.audiosocket_agent)
+            if agent is None:
+                writer.close()
+                raise EOFError("no agent for this SIP call")
+            meta = {"callSid": uid, "channel": "sip"}
+            if setup:
+                meta["from"] = setup.get("caller") or ""
+                meta["to"] = setup.get("exten") or ""
+            call = store.create_call(agent["tenant_id"], agent["id"], "sip", agent["config"], meta)
+            state["call"] = call
+            tr.before_end = lambda: store.update_call(call["id"], end_reason="agent_hangup")
             state["t"] = admit(call)
             return runtime.build_session(call, tr)
 
         tr = AudioSocketTransport(reader, writer, factory)
-        tr.before_end = lambda: store.update_call(call["id"], end_reason="agent_hangup")
         try:
             await tr.run()
         except _Reject:
             writer.close()
         finally:
             if "t" in state:
-                finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+                finish(state["call"], state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
 
     @app.on_event("startup")
     async def _start_audiosocket():

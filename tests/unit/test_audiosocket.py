@@ -168,3 +168,118 @@ def test_full_sip_call_through_the_app_creates_a_call_speaks_back_and_hangs_up()
                 break
             time.sleep(0.05)
         assert calls[0]["medium"] == "sip" and calls[0]["status"] == "ended"
+
+
+def test_number_normalize_and_setup_rows_expire():
+    from api.store import Store, normalize_e164
+    assert normalize_e164(" +1 555 111 0000 ") == "+15551110000"
+    s = Store()
+    s.put_number("tnt", "+1 555 111 0000", "agt_b")
+    got = s.get_number("+15551110000")
+    assert got["tenant_id"] == "tnt" and got["agent_id"] == "agt_b" and got["e164"] == "+15551110000"
+    assert s.delete_number("other", "+15551110000") is False
+    assert s.delete_number("tnt", "+15551110000") is True and s.get_number("+15551110000") is None
+    s.put_sip_setup("old", "+1", "+15551110000", created=time.time() - 90)
+    assert s.get_sip_setup("old") is None
+    s.put_sip_setup("new", "+1999", "+15551110000")
+    assert s.get_sip_setup("new")["exten"] == "+15551110000" and s.get_sip_setup("new")["caller"] == "+1999"
+
+
+def test_dialed_number_routes_to_the_mapped_agent_and_no_setup_uses_the_default():
+    """Two agents: +15551110000 belongs to B. A setup row for that exten answers as B; a call with no setup uses the default."""
+    import socket
+    from fastapi.testclient import TestClient
+    from api import security
+    from api.app import Settings, create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    tid = store.create_tenant("a")
+    key = security.generate_key()
+    store.add_key(tid, security.hash_key(key), "k")
+    cfg = {"systemPrompt": "", "voice": "af_heart", "greeting": "Hello from SIP", "tools": []}
+    ag_a = store.create_agent(tid, "A", cfg)
+    ag_b = store.create_agent(tid, "B", {**cfg, "systemPrompt": "mapped"})
+    other = store.create_tenant("b")
+    ag_other = store.create_agent(other, "C", cfg)
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    settings = Settings(admin_key="adm", audiosocket_port=port, audiosocket_agent=ag_a["id"], sip_token="sip-secret")
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=4), None, settings)
+    H = {"X-API-Key": key}
+
+    def wait_n(n):
+        for _ in range(100):
+            calls = store.list_calls(tid)
+            if len(calls) >= n and calls[0]["status"] in ("active", "ended"):
+                return calls
+            time.sleep(0.05)
+        raise AssertionError(store.list_calls(tid))
+
+    def wait_ended():
+        for _ in range(100):
+            calls = store.list_calls(tid)
+            if calls and all(c["status"] == "ended" for c in calls):
+                return
+            time.sleep(0.05)
+        raise AssertionError([(c["id"], c["status"]) for c in store.list_calls(tid)])
+
+    def connect(u):
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.settimeout(5)
+        sock.sendall(A.pack(A.KIND_UUID, u.bytes))
+        return sock
+
+    with TestClient(app) as c:
+        assert c.post("/internal/sip/setup", data={"uuid": "x", "caller": "1", "exten": "+15551110000"}).status_code == 403
+        assert c.post("/internal/sip/setup", data={"uuid": "x", "caller": "1", "exten": "+15551110000"},
+                      headers={"X-Vox-Sip-Token": "nope"}).status_code == 403
+        assert c.put("/v1/numbers/+15551110000", json={"agentId": "agt_missing"}, headers=H).status_code == 422
+        assert c.put("/v1/numbers/+15551110000", json={"agentId": ag_other["id"]}, headers=H).status_code == 422
+        put = c.put("/v1/numbers/+15551110000", json={"agentId": ag_b["id"]}, headers=H)
+        assert put.status_code == 200 and put.json() == {"e164": "+15551110000", "agentId": ag_b["id"]}
+        assert c.get("/v1/numbers", headers=H).json() == [{"e164": "+15551110000", "agentId": ag_b["id"]}]
+        assert c.delete("/v1/numbers/+15552220000", headers=H).status_code == 404
+
+        stale = uuid.uuid4()
+        old = time.time() - 120
+        store.put_sip_setup(str(stale), "+1999", "+15551110000", created=old)
+        app.state.sip_setups[str(stale)] = {"uuid": str(stale), "caller": "+1999", "exten": "+15551110000", "created": old}
+        sock = connect(stale)
+        assert wait_n(1)[0]["agent_id"] == ag_a["id"]          # expired setup does not route
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        wait_ended()
+
+        u = uuid.uuid4()
+        ok = c.post("/internal/sip/setup", data={"uuid": str(u), "caller": "+19998887777", "exten": "+15551110000"},
+                    headers={"X-Vox-Sip-Token": "sip-secret"})
+        assert ok.status_code == 200 and ok.json()["ok"] is True
+        assert app.state.sip_setups[str(u)]["exten"] == "+15551110000"
+        assert store.get_sip_setup(str(u))["caller"] == "+19998887777"
+        sock = connect(u)
+        routed = wait_n(2)[0]
+        assert routed["agent_id"] == ag_b["id"] and routed["medium"] == "sip"
+        assert routed["metadata"]["callSid"] == str(u) and routed["metadata"]["channel"] == "sip"
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        wait_ended()
+
+        plain = uuid.uuid4()
+        sock = connect(plain)
+        assert wait_n(3)[0]["agent_id"] == ag_a["id"]           # no setup row: the configured default agent
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        wait_ended()
+
+    store2 = Store()
+    rt2 = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store2)
+    app2 = create_app(store2, rt2, security.ConcurrencyLimiter(2), None, Settings(sip_token=""))
+    with TestClient(app2) as c2:
+        assert c2.post("/internal/sip/setup", data={"uuid": "z", "caller": "1", "exten": "+1555"},
+                       headers={"X-Vox-Sip-Token": "z"}).status_code == 404

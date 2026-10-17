@@ -12,7 +12,7 @@ It runs on open-source parts only, on a GPU you control, with no calls to the pa
 
 | Works (tested on a real phone call, 1 rented H100 GPU) | Not done yet |
 |---|---|
-| Natural back-and-forth: the agent starts answering about 0.9 s after the caller stops talking | Connection to VoxSun (no access to it) |
+| Natural back-and-forth: the agent starts answering about 0.9 s after the caller stops talking | Real call from VoxSun: the SIP connection is built and tested against a simulation only (needs VoxSun details, see [docs/SIP.md](docs/SIP.md)) |
 | Caller can interrupt; the agent stops in about a quarter of a second | Running for hours or days without a break (no long test yet) |
 | Agent uses business tools during the call (check a calendar, book a slot, hang up, transfer) | Accuracy on a large set of recorded real calls; voice naturalness; comparison with the paid service |
 | 24 calls at once on one GPU, comfortably | Docker and Kubernetes files were written but never built or run |
@@ -233,7 +233,8 @@ pip install -r requirements-dev.txt && pytest          # 240+ unit tests
 | Doc | What is in it |
 |---|---|
 | [docs/ASSESSMENT.md](docs/ASSESSMENT.md) | Engineering assessment: reuse vs build, architecture, cost per minute, scaling, plan, risks, proof-of-concept report |
-| [docs/INTEGRATION.md](docs/INTEGRATION.md) | OpenAPI tool import, call variables, signed webhooks, VoxSun adapter design |
+| [docs/INTEGRATION.md](docs/INTEGRATION.md) | OpenAPI tool import, call variables, signed webhooks |
+| [docs/SIP.md](docs/SIP.md) | VoxSun/SIP connection through Asterisk: what we found, setup, limits |
 | [docs/LANGUAGES.md](docs/LANGUAGES.md) | Supported languages, voices, licence caveats |
 | [docs/FINDINGS.md](docs/FINDINGS.md) | Measured latency and capacity, cost vs. the paid service, what is not proven |
 | [docs/STATUS.md](docs/STATUS.md) | Every capability labelled verified / written / designed |
@@ -243,7 +244,7 @@ pip install -r requirements-dev.txt && pytest          # 240+ unit tests
 | [docs/TUNING.md](docs/TUNING.md) | Turn-taking and latency settings |
 | [docs/LICENSES.md](docs/LICENSES.md) | Every component's license (commercial use) |
 
-Not built: customer sign-up and billing, VoxSun integration, SIP trunking (Twilio is the phone layer), voice cloning, single sign-on.
+Not built: customer sign-up and billing, outbound calls over SIP, load balancing of SIP calls, voice cloning, single sign-on.
 
 Code layout: `core/` (turn-taking, VAD, speech, session), `transports/` (Twilio, browser), `api/` (REST, WebSocket,
 dashboard, storage), `scripts/` (setup and deploy), `deploy/` (Docker, Kubernetes), `tests/`.

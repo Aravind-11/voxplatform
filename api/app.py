@@ -41,6 +41,9 @@ class Settings:
     outbound_per_day: int = 50         # per-tenant cap on outbound calls in 24 h
     outbound_prefixes: tuple = ()      # e.g. ("+1",) restricts dialing to these country prefixes; empty = any
     static_dir: str = os.path.join(os.path.dirname(__file__), "static")
+    audiosocket_port: int = 0          # >0: listen for Asterisk AudioSocket connections (the SIP path) on this TCP port
+    audiosocket_agent: str = ""        # agent id that answers calls arriving on that port
+    audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
 
 
 class AgentIn(BaseModel):
@@ -841,6 +844,44 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         finally:
             if "t" in state:
                 finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+
+    async def audiosocket_call(reader, writer) -> None:
+        """One SIP call arriving from Asterisk over AudioSocket: create the call, admit it, run the agent."""
+        from transports.audiosocket import AudioSocketTransport
+        agent = store.get_agent_any(settings.audiosocket_agent)
+        if not agent or app.state.draining:
+            writer.close()
+            return
+        call = store.create_call(agent["tenant_id"], agent["id"], "sip", agent["config"], {})
+        state: dict = {}
+
+        async def factory(tr, custom):
+            store.update_call(call["id"], metadata={"callSid": custom.get("uuid", ""), "channel": "sip"})
+            state["t"] = admit(call)
+            return runtime.build_session(call, tr)
+
+        tr = AudioSocketTransport(reader, writer, factory)
+        tr.before_end = lambda: store.update_call(call["id"], end_reason="agent_hangup")
+        try:
+            await tr.run()
+        except _Reject:
+            writer.close()
+        finally:
+            if "t" in state:
+                finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+
+    @app.on_event("startup")
+    async def _start_audiosocket():
+        if settings.audiosocket_port and settings.audiosocket_agent:
+            import asyncio
+            app.state.audiosocket = await asyncio.start_server(audiosocket_call, settings.audiosocket_host,
+                                                               settings.audiosocket_port)
+
+    @app.on_event("shutdown")
+    async def _stop_audiosocket():
+        srv = getattr(app.state, "audiosocket", None)
+        if srv:
+            srv.close()
 
     @app.post("/twilio/resume/{call_id}")
     async def twilio_resume(call_id: str, request: Request):

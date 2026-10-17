@@ -80,3 +80,4 @@ Remaining limit above ~16 calls: TTS throughput on one GPU (Kokoro runs batch-1)
 - **written + unit tested:** multilingual voices, call variables, OpenAPI import, signed call.ended webhook with transcript, call recovery, cost model, resource logging scripts.
 - **written, never run:** Docker images, deploy/up.sh against real Docker, Kubernetes; Stripe/billing ledger groundwork (not wired); non-English audio.
 - **not done:** VoxSun integration, soak test, GPU resource-consumption capture, paid-service baseline.
+- **written + tested against a simulated Asterisk:** SIP path via AudioSocket (transports/audiosocket.py, docs/SIP.md). **written, never run:** deploy/sip Asterisk config, Dockerfile.asterisk, compose `asterisk` service. **not done:** a real VoxSun call.

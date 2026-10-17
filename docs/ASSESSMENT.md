@@ -16,7 +16,7 @@ Written 2026-10-16. This answers the brief section by section. Every number is l
 | Production readiness | **Not yet.** It is a working, tested pilot platform. The gaps and the plan to close them are in sections 7-9. |
 | Recommendation | Proceed to a **pilot** behind three gates: (1) VoxSun's audio interface specification, (2) BoostMyDeal's API specifications, (3) an accuracy and quality test on BoostMyDeal's own call recordings next to the paid service. If gate 3 fails, the cost advantage does not matter. |
 
-The brief asks for two things: an assessment (sections 1-9 here) and a proof of concept (section 10). VoxSun integration is **not built or tested** (no access to VoxSun); section 5 designs it.
+The brief asks for two things: an assessment (sections 1-9 here) and a proof of concept (section 10). The VoxSun SIP path is built and tested against a simulation, but not against VoxSun itself (no access); see section 5 and `docs/SIP.md`.
 
 ## 1. What is reused and what is built
 
@@ -113,15 +113,11 @@ The boundary is HTTP in both directions, with credentials held by the platform:
 - **Platform -> BoostMyDeal (after a call):** a signed webhook (`call.started`, `call.ended`) carrying duration, end reason, metadata and the full transcript, so the CRM can log the outcome.
 - Details, examples and a hypothetical sample API: `docs/INTEGRATION.md`.
 
-### VoxSun audio/call infrastructure (designed, not built, not tested)
-I have no VoxSun documentation or access, so **everything here is an assumption to confirm**. The engine needs a transport adapter (~200 lines, modelled on `transports/twilio.py`) implementing: receive caller audio frames; send agent audio frames; clear queued audio on interruption; end the call; optional DTMF. Questions to answer first:
-1. How is audio delivered: WebSocket media stream, SIP/RTP, or an SDK? (SIP needs a SIP stack we have not built.)
-2. Codec and sample rate (G.711 8 kHz? Opus? 16 kHz PCM?), frame size, and whether frames are timestamped.
-3. Barge-in: can queued outbound audio be flushed (needed for interruption)?
-4. Call lifecycle: how do we learn the call started, ended, or failed, and can VoxSun re-route a call if our stream drops (the recovery feature depends on it)?
-5. Authentication of VoxSun to us and of us to VoxSun; network path (public internet or private link).
-6. Test access: a test number or call generator.
-Time for the adapter once those are answered: if VoxSun streams audio over a WebSocket like Twilio does, writing it is about a day (the Twilio transport was built in hours); allow 2-3 days including a clean test call and fixes. Waiting for access and documentation is not counted. If VoxSun is SIP/RTP only, a SIP stack is needed and this estimate does not apply (estimate).
+### VoxSun audio/call infrastructure (SIP path built and tested against a simulation; never run against VoxSun)
+VoxSun's own published description (https://voxsun.com/llms-full.txt) shows a SIP/PBX platform (SIP authentication, G.711/G.722/G.729/Opus codecs, SRTP/TLS, a REST API and call webhooks; detailed API docs only through sales). It does not describe WebSocket audio streaming, so the route in is **SIP**.
+**Built:** an Asterisk-based SIP front end (`deploy/sip/`) that streams each call's audio to the engine over AudioSocket (`transports/audiosocket.py`): 8 kHz audio in, real-time-paced audio out, interruption (queued audio cleared), keypad digits, hangup. Tested with a simulated Asterisk against the real app (4 unit tests). **Not done:** the Asterisk configuration has never been run, and no call from VoxSun has been made.
+**Needed from VoxSun:** the SIP server address, credentials (or the IP they call from), permission to route a number to an outside SIP server, and a test number. Details, setup steps and limits (caller number not passed yet, no failover for SIP calls, outbound not built): `docs/SIP.md`.
+Remaining work once those arrive: configure and test the trunk against VoxSun, pass the caller number, add a TCP load balancer for several nodes: about 2-4 days (estimate).
 
 ### Security boundaries
 TLS at the proxy only (nodes are on a private network). Accounts are isolated by an account id on every query (tested for cross-account access). API keys are stored as hashes, have roles (admin, developer, viewer), can be rotated and revoked, and every change is audited. Tool credentials are write-only. Tools cannot reach private or internal addresses. Phone webhooks are signature-checked and fail closed. `/metrics` needs a token and is not exposed publicly. Recording is opt-in per agent. **Known risks:** caller speech can attempt prompt injection against tools (mitigated by read-back and fixed parameters, not eliminated); the DNS-rebinding race on tool URLs (production should add an egress proxy); no external penetration test.

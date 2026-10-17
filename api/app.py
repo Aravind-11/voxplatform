@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
 
 from core.metrics import METRICS
+from core.redact import redact_text
 from core import tts as ttsmod
 from core.tts import DEFAULT_VOICE, LANG_NAME, VOICES
 from transports.browser import BrowserTransport
@@ -56,6 +57,7 @@ class AgentIn(BaseModel):
     tools: list[Union[str, dict[str, Any]]] = Field(default_factory=list)
     speed: float = Field(1.0, ge=0.7, le=1.3)
     record: bool = False                            # stereo recording of calls; you need the caller's consent
+    redact: bool = False                            # strip card, SSN, email, phone, and street address from stored text
 
 
 class AgentPatch(BaseModel):
@@ -68,6 +70,7 @@ class AgentPatch(BaseModel):
     tools: Optional[list[Union[str, dict[str, Any]]]] = None
     speed: Optional[float] = Field(None, ge=0.7, le=1.3)
     record: Optional[bool] = None
+    redact: Optional[bool] = None
 
 
 class CallIn(BaseModel):
@@ -404,7 +407,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                                          "voice" in body.model_fields_set)
         check_voice(eff_voice, eff_lang)
         changed = []
-        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record"):
+        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record", "redact"):
             v = getattr(body, k)
             if v is not None:
                 cfg[k] = v
@@ -758,8 +761,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             METRICS.inc("vox_errors_total", where="finalize")
         done = store.get_call_any(call["id"])
         secs = round((done["ended"] - done["joined"]), 2) if done.get("joined") and done.get("ended") else 0.0
-        webhook(t, "call.ended", done, durationSeconds=secs,
-                transcript=[{"role": m["role"], "text": m["text"], "t": m["t"]} for m in store.messages(call["id"])[:500]])
+        transcript = [{"role": m["role"], "text": m["text"], "t": m["t"]} for m in store.messages(call["id"])[:500]]
+        if (call.get("config") or {}).get("redact"):
+            transcript = [{**m, "text": redact_text(m["text"])} for m in transcript]
+        webhook(t, "call.ended", done, durationSeconds=secs, transcript=transcript)
 
     @app.websocket("/ws/calls/{call_id}")
     async def ws_call(ws: WebSocket, call_id: str, token: str = ""):

@@ -10,6 +10,7 @@ from typing import Callable, Optional
 
 from core.metrics import METRICS
 from core.recorder import CallRecorder, write_wav16
+from core.redact import redact_text
 from core.session import Session, SessionConfig
 from core.turn import TurnConfig
 from . import tools as toolmod
@@ -177,15 +178,16 @@ class Runtime:
                                              eot_threshold=float(os.environ.get("VOX_EOT_THRESHOLD", "0.8")),
                                              patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000"))))
         store, cid = self.store, call["id"]
+        redact = bool(cfg.get("redact"))
 
         def on_event(e: dict) -> None:
             if os.environ.get('VOX_LOG_EVENTS'):
                 print('EV', cid, e, flush=True)
             _count(e)
-            if e["type"] == "user_transcript":
-                store.add_message(cid, "user", e["text"], time.time())
-            elif e["type"] == "agent_speech":
-                store.add_message(cid, "agent", e["text"], time.time())
+            if e["type"] in ("user_transcript", "agent_speech"):
+                text = redact_text(e["text"]) if redact else e["text"]
+                role = "user" if e["type"] == "user_transcript" else "agent"
+                store.add_message(cid, role, text, time.time())
             if forward_events and hasattr(transport, "send_event"):
                 import asyncio
                 asyncio.get_running_loop().create_task(transport.send_event(e))

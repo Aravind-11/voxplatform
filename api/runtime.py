@@ -141,6 +141,8 @@ class Runtime:
         ctx.client_call = getattr(transport, "client_call", None)
         specs = toolmod.resolve_library(cfg.get("tools", []),
                                         lambda n: (self.store.get_tool(tid, n) or {}).get("spec"))
+        # Any confirm tool, or the agent flag, turns the read-back guard on for this call.
+        ctx.guard_slots = bool(cfg.get("confirmSlots")) or toolmod.needs_slot_guard(specs)
         schemas, fns = toolmod.build(specs, ctx, self.http)
         rec_dir = self.record_dir or os.environ.get("VOX_RECORD_DIR", "")
         recorder = None
@@ -169,6 +171,8 @@ class Runtime:
             name = LANG_NAME[cfg["language"]]
             prompt += (f"\n\nAlways speak and reply in {name}, whatever language the caller uses; "
                        f"if they speak another language, politely stay in {name}.")
+        if ctx.guard_slots:
+            prompt += "\n\n" + toolmod.READBACK_INSTRUCTION
         scfg = SessionConfig(system_prompt=prompt,
                              out_rate=transport.out_rate, tools_schema=schemas,
                              greeting=(RESUME_PHRASE.get(cfg.get("language") or "en", RESUME_PHRASE["en"]) if resumed
@@ -209,4 +213,11 @@ class Runtime:
             sess.seed_history(self._earlier_messages(meta["resumedFrom"]))
         self.live[call["id"]] = (sess, transport)
         ctx.turn_fn = lambda: sess.stats["turns"]      # lets confirm-before-acting tools tell turns apart
+
+        def last_assistant_text() -> str:
+            for message in reversed(sess.history):
+                if message.get("role") == "assistant" and str(message.get("content") or "").strip():
+                    return str(message["content"])
+            return ""
+        ctx.last_assistant_text = last_assistant_text
         return sess

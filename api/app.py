@@ -56,6 +56,7 @@ class AgentIn(BaseModel):
     tools: list[Union[str, dict[str, Any]]] = Field(default_factory=list)
     speed: float = Field(1.0, ge=0.7, le=1.3)
     record: bool = False                            # stereo recording of calls; you need the caller's consent
+    confirmSlots: bool = False                      # read names, dates, times, numbers and amounts back before acting
 
 
 class AgentPatch(BaseModel):
@@ -68,6 +69,7 @@ class AgentPatch(BaseModel):
     tools: Optional[list[Union[str, dict[str, Any]]]] = None
     speed: Optional[float] = Field(None, ge=0.7, le=1.3)
     record: Optional[bool] = None
+    confirmSlots: Optional[bool] = None
 
 
 class CallIn(BaseModel):
@@ -384,6 +386,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     async def create_agent(body: AgentIn, t: dict = Depends(tenant_write)):
         check_tools(body.tools, t["id"])
         cfg0 = body.model_dump(exclude={"name"})
+        if not cfg0.get("confirmSlots"):
+            cfg0.pop("confirmSlots", None)
         cfg0["voice"], cfg0["language"] = pick_voice("af_heart", None, body.voice, body.language, "voice" in body.model_fields_set)
         check_voice(cfg0["voice"], cfg0["language"])
         call_variables(cfg0, None, strict=False)
@@ -404,11 +408,13 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                                          "voice" in body.model_fields_set)
         check_voice(eff_voice, eff_lang)
         changed = []
-        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record"):
+        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record", "confirmSlots"):
             v = getattr(body, k)
             if v is not None:
                 cfg[k] = v
                 changed.append(k)
+        if cfg.get("confirmSlots") is False:
+            cfg.pop("confirmSlots", None)
         call_variables(cfg, None, strict=False)
         if eff_voice != cfg.get("voice"):
             cfg["voice"] = eff_voice

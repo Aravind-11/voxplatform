@@ -65,6 +65,57 @@ class CallContext:
     client_call: Optional[Callable[..., Awaitable[Any]]] = None     # run a tool in the caller's browser
     embedder: Any = None                                            # optional core.embed.OpenAIEmbedder (hybrid KB search)
     base_url: str = ""                                              # public URL of this API (warm-transfer callbacks)
+    guard_slots: bool = False                                       # require spoken read-back before state-changing tools
+    last_assistant_text: Any = ""                                   # str, or a callable -> the previous assistant message
+
+
+# Spoken read-back the model is told to do. It does not correct a mishearing: a wrong value that was
+# said out loud still passes the guard below.
+READBACK_INSTRUCTION = ("Critical slots (names, dates, times, numbers, amounts) must be read back "
+                        "in the agent's own words before a tool that changes state.")
+_SLOT_MARKS = ("book", "create", "update", "delete", "transfer", "purchase")
+_READBACK_STEP = "Read these values back to the caller before calling the tool."
+
+
+def needs_slot_guard(specs: list) -> bool:
+    """True when any tool asks for confirmation or an explicit slot read-back."""
+    for sp in specs or []:
+        if isinstance(sp, dict) and (sp.get("confirm") or sp.get("confirmSlots")):
+            return True
+    return False
+
+
+def _changes_state(name: str, confirmed: bool) -> bool:
+    low = name.lower()
+    return bool(confirmed) or any(mark in low for mark in _SLOT_MARKS)
+
+
+def _assistant_text(ctx) -> str:
+    raw = getattr(ctx, "last_assistant_text", "")
+    if callable(raw):
+        try:
+            raw = raw()
+        except Exception:  # noqa: BLE001  (a read-back lookup must not become a tool error)
+            return ""
+    return "" if raw is None else str(raw)
+
+
+def slot_guard(fn, ctx):
+    """Block a state-changing call until each string argument (length >= 3) was in the assistant's last message.
+
+    Runs outside `with_confirmation`. A value the model invented and never said is refused; a value it
+    misheard and then repeated is not. That limit stays with the speech model.
+    """
+    async def run(args: dict):
+        args = dict(args or {})
+        if not getattr(ctx, "guard_slots", False):
+            return await fn(args)
+        said = _assistant_text(ctx).lower()
+        for value in args.values():
+            if isinstance(value, str) and len(value.strip()) >= 3 and value.strip().lower() not in said:
+                return {"executed": False, "next_step": _READBACK_STEP, "details": args}
+        return await fn(args)
+    return run
 
 
 def _canon(args: dict) -> str:
@@ -171,18 +222,25 @@ def build(specs: list, ctx: Optional[CallContext] = None, client: Any = None):
     demo = {"check_availability": check_availability, "book_slot": book_slot}
     schemas: dict[str, dict] = {}
     fns: dict[str, Callable] = {}
+
+    def prepare(name: str, sch: dict, fn, confirmed: bool):
+        if confirmed:
+            sch, fn = with_confirmation(fn, sch, ctx)
+        # Slot guard is the outer wrapper, so a missing read-back never reaches the confirm bookkeeping.
+        if getattr(ctx, "guard_slots", False) and _changes_state(name, confirmed):
+            fn = slot_guard(fn, ctx)
+        return sch, fn
+
     for d in validate_specs(specs):
         if "demo" in d:
-            sch, fn = DEMO_SCHEMAS[d["demo"]], demo[d["demo"]]
-            if d.get("confirm"):
-                sch, fn = with_confirmation(fn, sch, ctx)
+            sch, fn = prepare(d["demo"], DEMO_SCHEMAS[d["demo"]], demo[d["demo"]], bool(d.get("confirm")))
             schemas[d["demo"]], fns[d["demo"]] = sch, fn
         elif "builtin" in d:
             key = d.get("name") or d["builtin"]
-            schemas[key], fns[key] = builtin_tools.schema(d), builtin_tools.make(d, ctx, client)
+            sch, fn = prepare(key, builtin_tools.schema(d), builtin_tools.make(d, ctx, client), bool(d.get("confirm")))
+            schemas[key], fns[key] = sch, fn
         else:
-            sch, fn = http_tools.schema(d), http_tools.make_http_tool(d, ctx, client)
-            if d.get("confirm"):
-                sch, fn = with_confirmation(fn, sch, ctx)
+            sch, fn = prepare(d["name"], http_tools.schema(d), http_tools.make_http_tool(d, ctx, client),
+                              bool(d.get("confirm")))
             schemas[d["name"]], fns[d["name"]] = sch, fn
     return list(schemas.values()), fns

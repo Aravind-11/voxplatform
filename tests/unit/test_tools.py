@@ -274,3 +274,131 @@ def test_tool_options_validate():
     assert toolmod.validate_specs([{"tool": "book_slot", "confirm": True}]) == [{"demo": "book_slot", "confirm": True}]
     with pytest.raises(ToolConfigError):
         toolmod.validate_specs([{"tool": "nope"}])
+
+
+def _guarded_booker(text):
+    ctx = toolmod.CallContext()
+    ctx.guard_slots = True
+    ctx.last_assistant_text = text
+    ctx.turn = 0
+    ctx.turn_fn = lambda: ctx.turn
+    _, fns = toolmod.build([{"tool": "book_slot", "confirm": True}], ctx, None)
+    return ctx, fns["book_slot"]
+
+
+async def test_slot_guard_refuses_book_slot_when_tuesday_was_not_read_back():
+    ctx, run = _guarded_booker("I can check Monday.")
+    out = await run({"day": "tuesday", "time": "11:00"})
+    assert out == {"executed": False,
+                   "next_step": "Read these values back to the caller before calling the tool.",
+                   "details": {"day": "tuesday", "time": "11:00"}}
+    ctx.turn = 1
+    again = await run({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert again["executed"] is False and again["details"]["day"] == "tuesday"
+
+
+async def test_slot_guard_allows_tuesday_read_back_and_then_the_confirm_rules():
+    ctx, run = _guarded_booker("Tuesday at 11")
+    # "11" is shorter than 3 characters, so only "tuesday" has to appear in the assistant text
+    first = await run({"day": "tuesday", "time": "11"})
+    assert first["executed"] is False and "read these details back" in first["next_step"].lower()
+    ctx.turn = 1
+    out = await run({"day": "tuesday", "time": "11", "confirmed": True})
+    assert out == {"booked": True, "day": "tuesday", "time": "11:00"}
+
+
+async def test_confirm_tool_without_a_state_name_still_checks_slots(allow_private):
+    sent = []
+
+    def handler(req):
+        sent.append(json.loads(req.content))
+        return httpx.Response(200, json={"ok": 1})
+
+    ctx = toolmod.CallContext()
+    ctx.guard_slots = True
+    ctx.last_assistant_text = "nothing relevant"
+    ctx.turn = 0
+    ctx.turn_fn = lambda: ctx.turn
+    _, fns = toolmod.build([good(confirm=True)], ctx, client(handler))
+    refused = await fns["lookup_order"]({"order_id": "ABC"})
+    assert refused["executed"] is False and sent == []
+    assert refused["next_step"] == "Read these values back to the caller before calling the tool."
+    ctx.last_assistant_text = "The order is ABC."
+    await fns["lookup_order"]({"order_id": "ABC"})
+    assert sent == []
+    ctx.turn = 1
+    assert await fns["lookup_order"]({"order_id": "ABC", "confirmed": True}) == {"ok": 1}
+    assert sent[0]["order_id"] == "ABC"
+
+
+def test_readback_prompt_is_added_only_when_slots_are_guarded_and_history_feeds_the_guard():
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD, make, tenant
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    tid = store.create_tenant("t")
+
+    class T:
+        out_rate = 8000
+
+        async def send_audio(self, pcm, rate=8000):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            return None
+
+    guarded = store.create_call(tid, None, "webSocket",
+                                {"systemPrompt": "Be brief.", "tools": [{"tool": "book_slot", "confirm": True}]}, {})
+    sess = rt.build_session(guarded, T())
+    assert toolmod.READBACK_INSTRUCTION in sess.history[0]["content"]
+    plain = store.create_call(tid, None, "webSocket",
+                              {"systemPrompt": "Be brief.", "tools": ["check_availability"]}, {})
+    assert toolmod.READBACK_INSTRUCTION not in rt.build_session(plain, T()).history[0]["content"]
+    flagged = store.create_call(tid, None, "webSocket",
+                                {"systemPrompt": "Be brief.", "confirmSlots": True, "tools": ["book_slot"]}, {})
+    sess2 = rt.build_session(flagged, T())
+    assert toolmod.READBACK_INSTRUCTION in sess2.history[0]["content"]
+    sess2.history.append({"role": "assistant", "content": "Monday works."})
+
+    c, _, _ = make()
+    key, _ = tenant(c)
+    saved = c.post("/v1/agents", json={"name": "n", "confirmSlots": True, "tools": ["book_slot"]},
+                   headers={"X-API-Key": key})
+    assert saved.status_code == 200 and saved.json()["config"]["confirmSlots"] is True
+    off = c.post("/v1/agents", json={"name": "plain"}, headers={"X-API-Key": key})
+    assert "confirmSlots" not in off.json()["config"]
+
+
+async def test_runtime_readback_uses_the_assistant_history():
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    tid = store.create_tenant("t")
+
+    class T:
+        out_rate = 8000
+
+        async def send_audio(self, pcm, rate=8000):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            return None
+
+    call = store.create_call(tid, None, "webSocket",
+                             {"systemPrompt": "Be brief.", "confirmSlots": True, "tools": ["book_slot"]}, {})
+    sess = rt.build_session(call, T())
+    sess.history.append({"role": "assistant", "content": "Monday works."})
+    refused = await sess.tools["book_slot"]({"day": "tuesday", "time": "11:00"})
+    assert refused["executed"] is False and "tuesday" in json.dumps(refused["details"]).lower()
+    sess.history.append({"role": "assistant", "content": "Tuesday at 11"})
+    booked = await sess.tools["book_slot"]({"day": "tuesday", "time": "11"})
+    assert booked["booked"] is True

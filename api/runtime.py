@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from core.backchannel import BACKCHANNEL_MS
 from core.metrics import METRICS
 from core.recorder import CallRecorder, write_wav16
 from core.session import Session, SessionConfig
@@ -175,7 +176,9 @@ class Runtime:
                                        else varmod.render(str(cfg.get("greeting") or ""), values)),
                              turn=TurnConfig(end_ms=float(os.environ.get("VOX_END_MS", "640")),
                                              eot_threshold=float(os.environ.get("VOX_EOT_THRESHOLD", "0.8")),
-                                             patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000"))))
+                                             patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000")),
+                                             backchannel_ms=BACKCHANNEL_MS.get(str(cfg.get("bargeIn") or "normal"),
+                                                                                BACKCHANNEL_MS["normal"])))
         store, cid = self.store, call["id"]
 
         def on_event(e: dict) -> None:

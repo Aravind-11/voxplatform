@@ -40,7 +40,8 @@ class TurnConfig:
     frame_ms: float = 32.0              # Silero VAD frame at 16 kHz = 512 samples
     threshold: float = 0.5
     start_ms: float = 96.0              # consecutive speech needed to start a turn
-    start_ms_agent_speaking: float = 192.0  # stricter while the agent talks (barge-in)
+    start_ms_agent_speaking: float = 192.0  # floor for barge-in; backchannel_ms may hold longer
+    backchannel_ms: float = 450.0       # while the agent talks, bursts shorter than this are not turns
     min_speech_ms: float = 160.0        # shorter utterances are treated as noise
     speculate_ms: float = 192.0         # silence before speculative generation starts
     fast_end_ms: float = 320.0          # end of turn when the scorer is confident
@@ -59,6 +60,7 @@ class TurnManager:
         self.eot_scorer = eot_scorer
         self.agent_speaking = False
         self._frame = 0
+        self.last_speech_ms = 0.0   # speech inside the utterance that just ended
         self._reset()
 
     def _reset(self) -> None:
@@ -90,9 +92,13 @@ class TurnManager:
         if self._silence_ms >= self._end_target:
             t = self._frame * c.frame_ms
             ev = [TurnEvent(Ev.END_OF_TURN, t, self._onset_ms)]
-            self._reset()
+            self._close_utterance()
             return ev
         return []
+
+    def _close_utterance(self) -> None:
+        self.last_speech_ms = self._speech_ms
+        self._reset()
 
     def set_agent_speaking(self, speaking: bool) -> None:
         self.agent_speaking = speaking
@@ -113,7 +119,12 @@ class TurnManager:
                 if self._run_ms == 0.0:
                     self._run_start_ms = t
                 self._run_ms += c.frame_ms
-                need = c.start_ms_agent_speaking if self.agent_speaking else c.start_ms
+                if self.agent_speaking:
+                    # Hold SPEECH_START until backchannel_ms so "yeah" (~300 ms) never opens a turn.
+                    # A smaller backchannel_ms must not undercut start_ms_agent_speaking.
+                    need = max(c.start_ms_agent_speaking, c.backchannel_ms)
+                else:
+                    need = c.start_ms
                 if self._run_ms >= need:
                     self._speaking = True
                     self._onset_ms = self._run_start_ms
@@ -137,7 +148,7 @@ class TurnManager:
         self._silence_ms += c.frame_ms
         if self._speech_ms < c.min_speech_ms and self._silence_ms >= c.speculate_ms:
             out.append(TurnEvent(Ev.SPEECH_ABORT, t, self._onset_ms))
-            self._reset()
+            self._close_utterance()
             return out
         if not self._speculated and self._silence_ms >= c.speculate_ms:
             self._speculated = True
@@ -146,5 +157,5 @@ class TurnManager:
             out.append(TurnEvent(Ev.SPECULATE, t, self._onset_ms))
         if self._speculated and self._silence_ms >= self._end_target:
             out.append(TurnEvent(Ev.END_OF_TURN, t, self._onset_ms))
-            self._reset()
+            self._close_utterance()
         return out

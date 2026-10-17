@@ -60,14 +60,16 @@ def test_burst_just_over_start_threshold_is_aborted_as_noise():
 
 
 def test_barge_in_needs_longer_speech_while_agent_speaks():
+    # While the agent talks, SPEECH_START waits for backchannel_ms (450), not the old 192 ms
+    # barge floor, so a short "yeah" never opens a turn (no start, and therefore no abort).
     tm = TurnManager()
     tm.set_agent_speaking(True)
-    assert feed(tm, [(True, 4), (False, 3)]) == []          # 128 ms burst: ignored
+    assert feed(tm, [(True, 14), (False, 10)]) == []        # 448 ms < 450: ignored
     tm2 = TurnManager()
     tm2.set_agent_speaking(True)
-    ev = feed(tm2, [(True, 7)])                              # 224 ms: interrupts
+    ev = feed(tm2, [(True, 16)])                            # 512 ms: real interruption
     assert kinds(ev) == [Ev.SPEECH_START]
-    assert ev[0][1] == 5 * F                                 # 6th frame reaches 192 ms
+    assert ev[0][1] == 14 * F                               # 15th frame: 480 ms of speech >= 450
 
 
 def test_onset_time_is_reported():

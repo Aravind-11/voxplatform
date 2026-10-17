@@ -150,14 +150,15 @@ async def test_barge_in_clears_audio_and_trims_history_to_what_was_heard():
     await r.settle()
     assert len(r.sent) == 3            # synthesized just in time, before the listener runs out
     sent_before = len(r.sent)
-    await r.frames("s", 6)            # caller talks over the agent (needs 192 ms while it speaks)
+    await r.frames("s", 16)           # 512 ms: backchannel gate is 450 ms, so this still interrupts
     await r.settle()
     assert r.clears == 1
     ev = r.last("user_interrupted")
     assert ev["cut"] is True
-    assert ev["heard"] == "One two three four five. Six seven eight"
+    # the longer gate lets one more word play than the old 192 ms barge threshold
+    assert ev["heard"] == "One two three four five. Six seven eight nine"
     assert r.s.history[-1] == {"role": "assistant",
-                               "content": "One two three four five. Six seven eight [interrupted]"}
+                               "content": "One two three four five. Six seven eight nine [interrupted]"}
     assert len(r.sent) == sent_before                 # nothing more is sent after the interruption
     await r.frames("s", 10)
     await r.frames("q", 30)
@@ -375,7 +376,7 @@ async def test_strict_hangup_still_happens_if_caller_talks_over_the_goodbye():
     await r.frames("s", 15)
     await r.frames("q", 22)
     await r.settle()
-    await r.frames("s", 6)             # barge-in while the goodbye is playing
+    await r.frames("s", 16)            # 512 ms: past the 450 ms backchannel gate, so the goodbye is cut
     await r.settle()
     assert r.clears == 1 and ended == [1]
 
@@ -385,7 +386,7 @@ async def test_non_strict_hangup_is_cancelled_by_the_caller_talking():
     await r.frames("s", 15)
     await r.frames("q", 22)
     await r.settle()
-    await r.frames("s", 6)
+    await r.frames("s", 16)            # 512 ms of overlap: a real interruption, not a backchannel
     await r.settle()
     r.clk.t += 5000
     await asyncio.sleep(0.2)
@@ -419,7 +420,7 @@ async def test_caller_can_talk_over_the_greeting_and_the_next_turn_proceeds():
     await r.s.start()
     await r.settle()
     await r.frames("q", 30)            # ~1 s of the greeting plays...
-    await r.frames("s", 8)             # ...then the caller starts talking over it
+    await r.frames("s", 16)            # 512 ms over the greeting: past the 450 ms backchannel gate
     await r.settle()
     assert r.clears == 1 and r.last("user_interrupted")["cut"] is True
     await r.frames("s", 10)

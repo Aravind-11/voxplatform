@@ -7,7 +7,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Literal, Optional, Union
 from xml.sax.saxutils import quoteattr
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
@@ -56,6 +56,7 @@ class AgentIn(BaseModel):
     tools: list[Union[str, dict[str, Any]]] = Field(default_factory=list)
     speed: float = Field(1.0, ge=0.7, le=1.3)
     record: bool = False                            # stereo recording of calls; you need the caller's consent
+    bargeIn: Literal["high", "normal", "low"] = "normal"  # how easily the caller can talk over the agent
 
 
 class AgentPatch(BaseModel):
@@ -68,6 +69,7 @@ class AgentPatch(BaseModel):
     tools: Optional[list[Union[str, dict[str, Any]]]] = None
     speed: Optional[float] = Field(None, ge=0.7, le=1.3)
     record: Optional[bool] = None
+    bargeIn: Optional[Literal["high", "normal", "low"]] = None
 
 
 class CallIn(BaseModel):
@@ -404,7 +406,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                                          "voice" in body.model_fields_set)
         check_voice(eff_voice, eff_lang)
         changed = []
-        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record"):
+        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record", "bargeIn"):
             v = getattr(body, k)
             if v is not None:
                 cfg[k] = v

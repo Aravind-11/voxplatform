@@ -21,6 +21,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Protocol
 import numpy as np
 
 from .audio import resample, pcm_duration_ms
+from .backchannel import is_backchannel
 from .barge import PlaybackTracker, trim_history
 from .chunker import SentenceChunker
 from .turn import Ev, TurnConfig, TurnEvent, TurnManager
@@ -132,6 +133,8 @@ class Session:
         self._last_speech_clock = 0.0
         self._transcript_task: Optional[asyncio.Task] = None
         self._bg: set[asyncio.Task] = set()
+        self._overlapped = False          # this caller utterance started while the agent was playing
+        self._overlap_unscored = 0        # interrupts waiting on a transcript before they count
         self.stats = {"turns": 0, "speculations": 0, "speculations_cancelled": 0, "interruptions": 0}
 
     # ------------------------------------------------------------------ input
@@ -243,11 +246,13 @@ class Session:
             self._cancel_eot()
             self.stats["turns"] += 1
             self._emit("user_end_of_turn")
+            overlapped, self._overlapped = self._overlapped, False
             if self._gen and not self._gen.committed:
-                self._commit(self._gen)
+                self._commit(self._gen, overlapped=overlapped, speech_ms=self.turn.last_speech_ms)
         elif ev.kind is Ev.SPEECH_ABORT:
             self._cancel_eot()
             self._utt = []
+            self._overlapped = False
             self._emit("speech_abort")
 
     def _cancel_eot(self) -> None:
@@ -295,22 +300,46 @@ class Session:
                      asyncio.create_task(self._drain(gen))]
         self._gen = gen
 
-    def _commit(self, gen: _Generation) -> None:
+    def _commit(self, gen: _Generation, overlapped: bool = False, speech_ms: float = 0.0) -> None:
         gen.committed = True
         self.history.append({"role": "user", "content": "[caller audio]"})
         self.history.append({"role": "assistant", "content": ""})
         user_idx = len(self.history) - 2
-        self._transcript_task = asyncio.create_task(self._transcribe(gen.audio, user_idx))
+        self._transcript_task = asyncio.create_task(self._transcribe(gen.audio, user_idx, overlapped, speech_ms))
         gen.commit.set()
 
-    async def _transcribe(self, audio: np.ndarray, idx: int) -> None:
+    def note_overlap_transcript(self, text: str, duration_ms: float) -> None:
+        """Transcript of caller audio that overlapped the agent.
+
+        A backchannel emits `backchannel` and does not count as an interruption. Playback was already
+        cleared at SPEECH_START; this cannot put that audio back.
+        """
+        pending = self._overlap_unscored > 0
+        if pending:
+            self._overlap_unscored -= 1
+        if not is_backchannel(text, duration_ms):
+            return
+        if pending:
+            self.stats["interruptions"] = max(0, self.stats["interruptions"] - 1)
+        self._emit("backchannel", text=text, duration_ms=duration_ms)
+
+    async def _transcribe(self, audio: np.ndarray, idx: int, overlapped: bool = False,
+                          speech_ms: float = 0.0) -> None:
+        failed = False
+        raw = ""
         try:
-            text = (await self.llm.transcribe(audio)).strip() or "[inaudible]"
+            raw = (await self.llm.transcribe(audio)).strip()
+            text = raw or "[inaudible]"
         except Exception as e:  # noqa: BLE001
+            failed = True
             text = "[inaudible]"
             self._emit("error", where="transcribe", error=repr(e))
         self.history[idx]["content"] = text
         self._emit("user_transcript", text=text)
+        if overlapped and not failed:
+            self.note_overlap_transcript(raw, speech_ms)
+        elif overlapped and self._overlap_unscored:
+            self._overlap_unscored -= 1          # a failed transcript must not un-count a later turn
         if self.on_utterance is not None:
             try:
                 self.on_utterance(audio, text, self._last_eot)
@@ -457,6 +486,8 @@ class Session:
 
     # ----------------------------------------------------------- barge-in
     async def _interrupt(self, gen: _Generation) -> None:
+        self._overlapped = True
+        self._overlap_unscored += 1
         heard, cut = self.tracker.heard()
         await self.clear_audio()          # stop the far end first: that is what the caller hears
         if self.recorder is not None:

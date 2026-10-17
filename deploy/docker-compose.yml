@@ -32,6 +32,10 @@ x-api: &api
     VOX_AUDIOSOCKET_PORT: ${VOX_AUDIOSOCKET_PORT:-0}          # SIP path (docs/SIP.md): 0 = off
     VOX_AUDIOSOCKET_AGENT: ${VOX_SIP_AGENT:-}
     VOX_AUDIOSOCKET_HOST: 0.0.0.0                              # private compose network only; never publish this port
+    VOX_SIP_TOKEN: ${VOX_SIP_TOKEN:-}                          # POST /sip/amd; empty keeps that route off
+    ASTERISK_ARI_URL: ${ASTERISK_ARI_URL:-}                    # SIP transfer and outbound; empty keeps Twilio
+    ASTERISK_ARI_USER: ${ASTERISK_ARI_USER:-}
+    ASTERISK_ARI_PASSWORD: ${ASTERISK_ARI_PASSWORD:-}
   volumes: [ "models:/models", "recordings:/data/recordings" ]
   deploy: { resources: { reservations: { devices: [ { driver: nvidia, count: 1, capabilities: [ gpu ] } ] } } }
   stop_grace_period: 1h          # live calls finish after the drain (see deploy/drain.py)

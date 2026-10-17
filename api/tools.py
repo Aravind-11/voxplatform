@@ -65,6 +65,7 @@ class CallContext:
     client_call: Optional[Callable[..., Awaitable[Any]]] = None     # run a tool in the caller's browser
     embedder: Any = None                                            # optional core.embed.OpenAIEmbedder (hybrid KB search)
     base_url: str = ""                                              # public URL of this API (warm-transfer callbacks)
+    call_control: Any = None                                        # TwilioCallControl or AsteriskCallControl; None uses ctx.twilio
 
 
 def _canon(args: dict) -> str:

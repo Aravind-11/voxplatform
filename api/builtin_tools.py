@@ -5,9 +5,9 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from xml.sax.saxutils import escape, quoteattr
 
 from core.session import ToolResult
+from .callcontrol import TwilioCallControl
 from .http_tools import NAME_RE, ToolConfigError
 
 E164 = re.compile(r"^\+[1-9]\d{6,14}$")
@@ -156,25 +156,22 @@ def make(defn: dict, ctx, client):
         number = defn["targets"].get(to)             # the model can only pick a configured name, never a raw number
         if number is None:
             return {"error": f"unknown target {to!r}", "targets": sorted(defn["targets"])}
-        if not ctx.call_sid or not ctx.twilio or client is None:
-            return {"error": "transfer is only available on phone calls with Twilio credentials configured"}
-
-        if defn.get("mode") == "warm":
-            if not ctx.base_url or not ctx.call_id:
+        mode = "warm" if defn.get("mode") == "warm" else "cold"
+        # A controller from the runtime (Asterisk ARI, or Twilio built from the env) replaces this branch.
+        # Tests that only set ctx.twilio leave it empty and keep the same credential and URL checks.
+        control = getattr(ctx, "call_control", None)
+        if control is None:
+            if not ctx.call_sid or not ctx.twilio or client is None:
+                return {"error": "transfer is only available on phone calls with Twilio credentials configured"}
+            # Older callers pass a small ctx with no base_url; cold transfer never needed it.
+            base_url = getattr(ctx, "base_url", "") or ""
+            if mode == "warm" and (not base_url or not getattr(ctx, "call_id", "")):
                 return {"error": "warm transfer needs the public URL configured"}
-            # Warm: the person who picks up first hears a short summary of what the caller wanted (<Number url=...>),
-            # and if nobody answers the caller is returned to the agent (the <Dial action=...> callback).
-            twiml = (f'<Response><Dial timeout="25" action={quoteattr(f"{ctx.base_url}/twilio/transfer-result/{ctx.call_id}?to={to}")}>'
-                     f'<Number url={quoteattr(f"{ctx.base_url}/twilio/whisper/{ctx.call_id}")}>{escape(number)}</Number></Dial></Response>')
-        else:
-            twiml = f"<Response><Dial>{escape(number)}</Dial></Response>"
+            control = TwilioCallControl(client, ctx.twilio["sid"], ctx.twilio["token"], base_url)
+        elif isinstance(control, TwilioCallControl) and mode == "warm" and (not control.base_url or not getattr(ctx, "call_id", "")):
+            return {"error": "warm transfer needs the public URL configured"}
 
         async def do() -> None:
-            r = await client.post(
-                f"https://api.twilio.com/2010-04-01/Accounts/{ctx.twilio['sid']}/Calls/{ctx.call_sid}.json",
-                auth=(ctx.twilio["sid"], ctx.twilio["token"]), timeout=10,
-                data={"Twiml": twiml})
-            if r.status_code >= 300:
-                raise RuntimeError(f"twilio transfer failed: HTTP {r.status_code}")
+            await control.transfer(ctx.call_sid, number, mode, call_id=getattr(ctx, "call_id", ""), target=to)
         return ToolResult({"transferring": to}, after=do, strict=True)
     return transfer

@@ -31,10 +31,15 @@ Calls are stored with medium `sip`.
 
 Without Docker: install Asterisk 18+ (needs the AudioSocket modules), copy the four files from `deploy/sip/` to `/etc/asterisk/`, and run the engine with `VOX_AUDIOSOCKET_PORT=9092 VOX_AUDIOSOCKET_AGENT=<id> VOX_AUDIOSOCKET_HOST=127.0.0.1` (change `api1:9092` in `extensions.conf` to `127.0.0.1:9092`).
 
+## Outbound, transfer, voicemail
+`POST /v1/calls/outbound` with `"channel": "sip"` (default is still `"twilio"`) originates through Asterisk ARI: `POST {ASTERISK_ARI_URL}/ari/channels` with `endpoint=PJSIP/{to}@voxsun`, `app=vox`, and basic auth from `ASTERISK_ARI_USER` / `ASTERISK_ARI_PASSWORD`. A `voicemailMessage` sets `appArgs` to `amd,<call id>`. The Stasis app posts `AnsweredBy` (form or JSON) to `POST /sip/amd/{call id}` with header `X-Vox-Sip-Token` (`VOX_SIP_TOKEN`). An empty token turns that route off (404); a mismatch is 403. On `machine_end` while the call is live, the engine speaks the message and hangs up, the same action as Twilio AMD.
+
+A transfer on a SIP call is `POST /ari/channels/{id}/redirect` with `endpoint=PJSIP/{number}`. Hangup is `DELETE /ari/channels/{id}`. The runtime picks Asterisk when `ASTERISK_ARI_URL` is set, otherwise Twilio when the Twilio credentials are set.
+
 ## Known limits
 - **Caller number is not passed:** AudioSocket carries only a call UUID. The agent does not know who is calling until we add it (Asterisk can pass it another way; not built).
 - **One engine node per Asterisk:** the dialplan points at `api1`. A TCP load balancer in front of several nodes is not built, and a call is lost if its node dies (the Twilio path can reconnect a call; the SIP path cannot).
 - **Security:** the AudioSocket port has no authentication. Keep it on a private network and never publish it.
-- **Outbound calls over SIP** (through VoxSun's `calls/initiate`) are not built.
+- **Outbound SIP audio:** `POST /v1/calls/outbound` with `"channel": "sip"` originates through Asterisk ARI (`ASTERISK_ARI_URL`), not VoxSun's `calls/initiate`. See below. Nothing in this repo answers Stasis app `vox`, so the new channel is not attached to AudioSocket by itself.
 - **Open ports for Asterisk:** UDP 5060 and the RTP range 10000-10100. Behind NAT, set the public address in `pjsip.conf`.
 - Asterisk is GPL-2.0 software run as a separate program; this repo does not include or link it. Get the same licence check you would for any GPL component.

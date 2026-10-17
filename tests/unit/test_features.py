@@ -599,6 +599,101 @@ def test_outbound_status_and_amd_callbacks_need_a_valid_signature():
     assert spoke == ["hi", "END"]
 
 
+def test_sip_outbound_originates_on_asterisk_and_not_twilio(monkeypatch):
+    from urllib.parse import parse_qs, urlparse
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append(req)
+        if "twilio" in str(req.url):
+            return httpx.Response(201, json={"sid": "CA123"})
+        return httpx.Response(200, json={"id": "chan-1"})
+    c, store, rt = make_outbound(handler, sip_token="s3cret")
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                           "voicemailMessage": "leave this"}, headers=H(k))
+    assert r.status_code == 200, r.text
+    url = str(seen[-1].url)
+    assert "api.twilio.com" not in url and url.startswith("http://asterisk:8088/ari/channels")
+    q = {k_: v[0] for k_, v in parse_qs(urlparse(url).query).items()}
+    assert q["endpoint"] == "PJSIP/+15552223333@voxsun" and q["app"] == "vox"
+    assert q["appArgs"] == f"amd,{r.json()['id']}" and q["callerId"] == "+15550001111"
+    call = store.get_call_any(r.json()["id"])
+    assert call["medium"] == "sip" and call["metadata"]["callSid"] == "chan-1"
+    # default channel stays on Twilio even when ARI is configured
+    r2 = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552224444"}, headers=H(k))
+    assert r2.status_code == 200 and "api.twilio.com" in str(seen[-1].url)
+    assert store.get_call_any(r2.json()["id"])["medium"] == "twilio"
+    # no voicemail: no amd appArgs
+    r3 = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552225555", "channel": "SIP"}, headers=H(k))
+    assert r3.status_code == 200
+    q3 = parse_qs(urlparse(str(seen[-1].url)).query)
+    assert "appArgs" not in q3 and store.get_call_any(r3.json()["id"])["medium"] == "sip"
+    assert c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552226666", "channel": "sms"},
+                  headers=H(k)).status_code == 422
+
+    # AMD: token required; machine_end on a live call speaks the message
+    spoke = []
+
+    class S:
+        async def say_and_wait(self, m):
+            spoke.append(m)
+
+    class Tr:
+        async def end(self):
+            spoke.append("END")
+    cid = r.json()["id"]
+    assert c.post(f"/sip/amd/{cid}", data={"AnsweredBy": "machine_end_beep"}).status_code == 403
+    assert c.post(f"/sip/amd/missing", json={"AnsweredBy": "human"},
+                  headers={"X-Vox-Sip-Token": "s3cret"}).status_code == 404
+    human = c.post(f"/sip/amd/{cid}", json={"AnsweredBy": "human"}, headers={"X-Vox-Sip-Token": "s3cret"})
+    assert human.json()["action"] == "none" and store.get_call_any(cid)["metadata"]["answeredBy"] == "human"
+    rt.live[cid] = (S(), Tr())
+    machine = c.post(f"/sip/amd/{cid}", data={"AnsweredBy": "machine_end_beep"},
+                     headers={"X-Vox-Sip-Token": "s3cret"})
+    assert machine.json()["action"] == "voicemail"
+    time.sleep(0.3)
+    assert spoke == ["leave this", "END"]
+    assert store.get_call_any(cid)["metadata"]["answeredBy"] == "machine_end_beep"
+    # endpoint off when the token is unset, even if a header is sent
+    c2, store2, _ = make_outbound(handler)
+    k2, tid2 = tenant(c2)
+    row = store2.create_call(tid2, None, "sip", {}, {"voicemail": "x"})
+    assert c2.post(f"/sip/amd/{row['id']}", data={"AnsweredBy": "machine_end_beep"},
+                   headers={"X-Vox-Sip-Token": "s3cret"}).status_code == 404
+
+
+def test_sip_outbound_without_ari_is_503_and_stores_nothing(monkeypatch):
+    monkeypatch.delenv("ASTERISK_ARI_URL", raising=False)
+    c, store, _ = make_outbound(lambda req: httpx.Response(500, json={"message": "no"}))
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip"}, headers=H(k))
+    assert r.status_code == 503 and "ASTERISK_ARI_URL" in r.text
+    assert store.list_calls(tid) == []
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+
+    def down(req):
+        raise RuntimeError("down")
+    c3, store3, _ = make_outbound(down)
+    k3, tid3 = tenant(c3)
+    a3 = c3.post("/v1/agents", json={"name": "a"}, headers=H(k3)).json()
+    r = c3.post("/v1/calls/outbound", json={"agentId": a3["id"], "to": "+15552223333", "channel": "sip"}, headers=H(k3))
+    assert r.status_code == 502 and "could not reach Asterisk" in r.text and "Twilio" not in r.text
+    assert store3.list_calls(tid3)[0]["end_reason"] == "asterisk_unreachable"
+    c4, store4, _ = make_outbound(lambda req: httpx.Response(500, json={"message": "no endpoint"}))
+    k4, tid4 = tenant(c4)
+    a4 = c4.post("/v1/agents", json={"name": "a"}, headers=H(k4)).json()
+    r = c4.post("/v1/calls/outbound", json={"agentId": a4["id"], "to": "+15552223333", "channel": "sip",
+                                            "voicemailMessage": "hi"}, headers=H(k4))
+    assert r.status_code == 502 and "Asterisk refused" in r.text and "no endpoint" in r.text
+    assert store4.list_calls(tid4)[0]["end_reason"] == "asterisk_rejected"
+
+
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)
 def test_drain_stops_new_calls_but_reports_readiness():
     from test_api import speech, silence

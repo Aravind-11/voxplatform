@@ -137,6 +137,9 @@ class Runtime:
         tid = call["tenant_id"]
         ctx.docs = lambda name: self.store.corpus_docs(tid, name)
         ctx.embedder, ctx.base_url = self.embedder, self.public_url
+        if self.http is not None:
+            from .callcontrol import control_from_env
+            ctx.call_control = control_from_env(self.http, self.public_url or "")
         ctx.send_dtmf = getattr(transport, "send_dtmf", None)
         ctx.client_call = getattr(transport, "client_call", None)
         specs = toolmod.resolve_library(cfg.get("tools", []),

@@ -22,6 +22,7 @@ from transports.browser import BrowserTransport
 from transports.twilio import TwilioTransport
 from . import security, tools as toolmod
 from . import openapi_import, retention, variables as varmod
+from .callcontrol import AsteriskCallControl, TwilioCallControl, control_from_env
 from .runtime import Runtime
 from .store import ROLES, Store
 
@@ -44,6 +45,7 @@ class Settings:
     audiosocket_port: int = 0          # >0: listen for Asterisk AudioSocket connections (the SIP path) on this TCP port
     audiosocket_agent: str = ""        # agent id that answers calls arriving on that port
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
+    sip_token: str = ""                  # shared secret for POST /sip/amd; empty disables that route (404)
 
 
 class AgentIn(BaseModel):
@@ -91,6 +93,7 @@ class OutboundIn(BaseModel):
     voicemailMessage: Optional[str] = Field(None, max_length=600)   # if an answering machine picks up, leave this
     variables: Optional[dict[str, Any]] = None                      # fills {{name}} in the agent's prompt and greeting
     metadata: dict = Field(default_factory=dict)
+    channel: str = "twilio"                                         # twilio (default) or sip (Asterisk ARI)
 
 
 class ToolIn(BaseModel):
@@ -920,12 +923,22 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not security.validate_twilio(settings.twilio_auth_token, url, form, request.headers.get("X-Twilio-Signature", "")):
             raise HTTPException(403, "bad twilio signature")
 
+    def require_sip_token(got: str) -> None:
+        """Empty VOX_SIP_TOKEN hides the route (404). A wrong token is 403. compare_digest is false for unequal lengths."""
+        if not settings.sip_token:
+            raise HTTPException(404, "not found")
+        if not hmac.compare_digest(got, settings.sip_token):
+            raise HTTPException(403, "bad sip token")
+
     @app.post("/v1/calls/outbound")
     async def outbound(body: OutboundIn, t: dict = Depends(tenant_write)):
-        """Places a phone call through your Twilio account and connects the answered call to the agent."""
+        """Places a phone call. "twilio" (default) uses your Twilio account; "sip" originates through Asterisk ARI."""
         if app.state.draining:
             raise HTTPException(503, "node is draining")
-        if not (settings.twilio_account_sid and settings.twilio_auth_token):
+        channel = (body.channel or "twilio").strip().lower()
+        if channel not in ("twilio", "sip"):
+            raise HTTPException(422, "channel must be 'twilio' or 'sip'")
+        if channel == "twilio" and not (settings.twilio_account_sid and settings.twilio_auth_token):
             raise HTTPException(503, "outbound calling needs TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN on the server")
         if runtime.http is None:
             raise HTTPException(503, "no HTTP client configured")
@@ -944,6 +957,14 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                      if c["created"] >= day_ago and c["metadata"].get("direction") == "outbound")
         if recent >= settings.outbound_per_day:
             raise HTTPException(429, f"outbound limit reached ({settings.outbound_per_day} per 24 h)")
+        # Refuse sip before create_call so a missing ARI url does not leave a call row.
+        if channel == "sip":
+            control = control_from_env(runtime.http, settings.public_base_url)
+            if not isinstance(control, AsteriskCallControl):
+                raise HTTPException(503, "sip outbound needs ASTERISK_ARI_URL")
+        else:
+            control = TwilioCallControl(runtime.http, settings.twilio_account_sid, settings.twilio_auth_token,
+                                        settings.public_base_url)
         cfg = dict(agent["config"])
         if body.record is not None:
             cfg["record"] = body.record
@@ -953,30 +974,47 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             meta["variables"] = given_vars
         if body.voicemailMessage:
             meta["voicemail"] = body.voicemailMessage
-        call = store.create_call(t["id"], body.agentId, "twilio", cfg, meta)
-        ws = settings.public_base_url.replace("http", "ws", 1)
-        twiml = stream_twiml(call)
-        data = {"To": body.to, "From": caller_id, "Twiml": twiml,
-                "StatusCallback": f"{settings.public_base_url}/twilio/status/{call['id']}",
-                "StatusCallbackEvent": "completed"}
-        if body.voicemailMessage:
-            data.update({"MachineDetection": "DetectMessageEnd", "AsyncAmd": "true",
-                         "AsyncAmdStatusCallback": f"{settings.public_base_url}/twilio/amd/{call['id']}"})
-        try:
-            r = await runtime.http.post(
-                f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Calls.json",
-                auth=(settings.twilio_account_sid, settings.twilio_auth_token), data=data, timeout=15)
-        except Exception as e:  # noqa: BLE001
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="twilio_unreachable")
-            raise HTTPException(502, f"could not reach Twilio: {type(e).__name__}") from e
-        if r.status_code >= 300:
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="twilio_rejected")
+        call = store.create_call(t["id"], body.agentId, "sip" if channel == "sip" else "twilio", cfg, meta)
+        if channel == "sip":
+            # appArgs is how the Stasis app learns the call id. It POSTs AnsweredBy to /sip/amd/{id}.
+            app_args = f"amd,{call['id']}" if body.voicemailMessage else None
             try:
-                msg = r.json().get("message", "")
+                r = await control.originate(body.to, caller_id, app_args)
+            except Exception as e:  # noqa: BLE001
+                store.update_call(call["id"], status="ended", ended=time.time(), end_reason="asterisk_unreachable")
+                raise HTTPException(502, f"could not reach Asterisk: {type(e).__name__}") from e
+            if r.status_code >= 300:
+                store.update_call(call["id"], status="ended", ended=time.time(), end_reason="asterisk_rejected")
+                try:
+                    msg = r.json().get("message", "")
+                except ValueError:
+                    msg = ""
+                raise HTTPException(502, f"Asterisk refused the call (HTTP {r.status_code}): {msg}")
+            try:
+                sid = r.json().get("id", "")
             except ValueError:
-                msg = ""
-            raise HTTPException(502, f"Twilio refused the call (HTTP {r.status_code}): {msg}")
-        sid = r.json().get("sid", "")
+                sid = ""
+        else:
+            twiml = stream_twiml(call)
+            data = {"To": body.to, "From": caller_id, "Twiml": twiml,
+                    "StatusCallback": f"{settings.public_base_url}/twilio/status/{call['id']}",
+                    "StatusCallbackEvent": "completed"}
+            if body.voicemailMessage:
+                data.update({"MachineDetection": "DetectMessageEnd", "AsyncAmd": "true",
+                             "AsyncAmdStatusCallback": f"{settings.public_base_url}/twilio/amd/{call['id']}"})
+            try:
+                r = await control.originate(body.to, caller_id, data)
+            except Exception as e:  # noqa: BLE001
+                store.update_call(call["id"], status="ended", ended=time.time(), end_reason="twilio_unreachable")
+                raise HTTPException(502, f"could not reach Twilio: {type(e).__name__}") from e
+            if r.status_code >= 300:
+                store.update_call(call["id"], status="ended", ended=time.time(), end_reason="twilio_rejected")
+                try:
+                    msg = r.json().get("message", "")
+                except ValueError:
+                    msg = ""
+                raise HTTPException(502, f"Twilio refused the call (HTTP {r.status_code}): {msg}")
+            sid = r.json().get("sid", "")
         store.update_call(call["id"], metadata={**meta, "callSid": sid})
         log(t, "call.outbound", call["id"], to=body.to)
         return {**public_call(store.get_call_any(call["id"])), "callSid": sid}
@@ -1038,6 +1076,39 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             raise HTTPException(404, "call not found")
         answered = form.get("AnsweredBy", "")
         msg = call["metadata"].get("voicemail")
+        live = runtime.live.get(call_id)
+        METRICS.inc("vox_amd_total", answered_by=answered or "unknown")
+        if msg and live and answered.startswith("machine_end"):
+            sess, transport = live
+
+            async def go():
+                await sess.say_and_wait(msg)
+                await transport.end()
+            import asyncio
+            asyncio.get_running_loop().create_task(go())
+            return {"action": "voicemail"}
+        return {"action": "none", "answeredBy": answered}
+
+    @app.post("/sip/amd/{call_id}")
+    async def sip_amd(call_id: str, request: Request, x_vox_sip_token: str = Header(default="")):
+        """Asterisk (or the Stasis app) posts AnsweredBy here. Same voicemail action as /twilio/amd, local live calls only."""
+        require_sip_token(x_vox_sip_token)
+        call = store.get_call_any(call_id)
+        if not call:
+            raise HTTPException(404, "call not found")
+        ctype = request.headers.get("content-type", "")
+        if "json" in ctype:
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            answered = str((body or {}).get("AnsweredBy") or (body or {}).get("answeredBy") or "") if isinstance(body, dict) else ""
+        else:
+            form = {k: str(v) for k, v in (await request.form()).items()}
+            answered = form.get("AnsweredBy", "")
+        meta = call["metadata"] if isinstance(call["metadata"], dict) else json.loads(call["metadata"] or "{}")
+        store.update_call(call_id, metadata={**meta, "answeredBy": answered})
+        msg = meta.get("voicemail")
         live = runtime.live.get(call_id)
         METRICS.inc("vox_amd_total", answered_by=answered or "unknown")
         if msg and live and answered.startswith("machine_end"):

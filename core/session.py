@@ -70,6 +70,38 @@ ClearAudio = Callable[[], Awaitable[None]]
 OnEvent = Callable[[dict], None]
 
 
+class _WordSlice:
+    """Tracker text for one audio chunk. `heard()` calls `split` and stringifies, so filling `.text`
+    after `on_sent` still fixes barge-in without holding the first chunk until synthesis finishes."""
+
+    def __init__(self, text: str = "") -> None:
+        self.text = text
+
+    def split(self, sep=None, maxsplit=-1):
+        return self.text.split() if sep is None else self.text.split(sep, maxsplit)
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def _fill_word_slices(slices: list[_WordSlice], lengths: list[int], sentence: str) -> None:
+    """Give each chunk the words that fall in its share of the samples. One chunk keeps the sentence verbatim."""
+    if len(slices) == 1:
+        slices[0].text = sentence
+        return
+    words = sentence.split()
+    total = sum(lengths) or 1
+    prev = 0
+    acc = 0
+    last = len(slices) - 1
+    for i, (sl, n) in enumerate(zip(slices, lengths)):
+        acc += n
+        k = len(words) if i == last else int(len(words) * acc / total)
+        k = min(len(words), max(prev, k))
+        sl.text = " ".join(words[prev:k])
+        prev = k
+
+
 @dataclass
 class SessionConfig:
     system_prompt: str = "You are a helpful voice assistant. Keep replies short and conversational."
@@ -423,13 +455,29 @@ class Session:
             self._spawn_action(a)
 
     async def _speak(self, gen: _Generation, text: str) -> None:
+        """Enqueue each TTS chunk as it arrives. The transcript keeps the sentence once; the tracker gets a word slice."""
         t_tts = self.clock()
-        parts = [p async for p in self.tts.synthesize(text)]
+        slices: list[_WordSlice] = []
+        lengths: list[int] = []
+        first = True
+        async for part in self.tts.synthesize(text):
+            pcm = resample(np.asarray(part), self.tts.sample_rate, self.cfg.out_rate)
+            if len(pcm) == 0:
+                continue
+            # Full sentence on the first chunk only, so _drain does not append it twice. The slice is what
+            # barge-in reads; it is rewritten to this chunk's share of the words once every length is known.
+            sl = _WordSlice(text if first else "")
+            slices.append(sl)
+            lengths.append(len(pcm))
+            spoken = text if first else ""
+            first = False
+            gen.pending_ms += pcm_duration_ms(len(pcm), self.cfg.out_rate)
+            await gen.outbox.put((spoken, sl, pcm))
         self._emit("tts_done", ms=self.clock() - t_tts, chars=len(text))
-        pcm = np.concatenate(parts) if parts else np.zeros(0, np.int16)
-        pcm = resample(pcm, self.tts.sample_rate, self.cfg.out_rate)
-        gen.pending_ms += pcm_duration_ms(len(pcm), self.cfg.out_rate)
-        await gen.outbox.put((text, pcm))
+        if slices:
+            _fill_word_slices(slices, lengths, text)
+        else:
+            await gen.outbox.put((text, text, np.zeros(0, np.int16)))
 
     async def _drain(self, gen: _Generation) -> None:
         await gen.commit.wait()
@@ -439,7 +487,7 @@ class Session:
                 if gen.after is not None and not gen.cancelled:
                     await self._finish_action(gen)
                 return
-            text, pcm = item
+            text, track, pcm = item
             if not gen.first_audio_sent:
                 gen.first_audio_sent = True
                 self._emit("agent_first_audio",
@@ -448,8 +496,10 @@ class Session:
             if self.recorder is not None:
                 self.recorder.agent(pcm, self.cfg.out_rate)
             dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
-            self.tracker.on_sent(text, dur)
+            self.tracker.on_sent(track, dur)
             gen.pending_ms -= dur
+            if not text:
+                continue
             gen.spoken.append(text)
             self._emit("agent_speech", text=text)
             if self.history and self.history[-1]["role"] == "assistant":

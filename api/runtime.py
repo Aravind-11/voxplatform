@@ -17,8 +17,11 @@ from .store import Store
 
 
 class LimitedTTS:
-    """Caps simultaneous syntheses process-wide: TTS front-ends (G2P) are CPU/GIL-bound, so many
-    parallel threads only add contention. The semaphore is shared by every call in the process."""
+    """The semaphore stays (GIL-bound G2P); streaming removes the per-sentence buffer; a separate process is VOX_TTS_URL.
+
+    Caps simultaneous syntheses process-wide: TTS front-ends (G2P) are CPU/GIL-bound, so many
+    parallel threads only add contention. The semaphore is shared by every call in the process and
+    is held while each chunk is yielded, not released after a private buffer of the whole sentence."""
     _sem: Optional[asyncio.Semaphore] = None
 
     def __init__(self, inner, limit: int):
@@ -29,9 +32,8 @@ class LimitedTTS:
         if LimitedTTS._sem is None:
             LimitedTTS._sem = asyncio.Semaphore(self.limit)
         async with LimitedTTS._sem:
-            parts = [p async for p in self.inner.synthesize(text)]
-        for p in parts:
-            yield p
+            async for p in self.inner.synthesize(text):
+                yield p
 
 
 def _count(e: dict) -> None:

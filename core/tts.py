@@ -6,6 +6,8 @@ handed back through an asyncio queue. Output: int16 mono at 24 kHz.
 from __future__ import annotations
 
 import asyncio
+import io
+import wave
 from typing import AsyncIterator
 
 import numpy as np
@@ -137,3 +139,95 @@ class KokoroTTS:
                 yield np.clip(np.rint(item * 32767.0), -32768, 32767).astype(np.int16)
         finally:
             await asyncio.shield(fut)
+
+
+def _pcm_from_tts(raw, default_rate: int) -> tuple[np.ndarray, int]:
+    """WAV bytes -> int16 PCM and the header rate. Anything else is raw s16le at `default_rate`."""
+    if isinstance(raw, np.ndarray):
+        pcm = np.asarray(raw)
+        if pcm.dtype != np.int16:
+            pcm = np.clip(np.rint(pcm.astype(np.float64)), -32768, 32767).astype(np.int16)
+        else:
+            pcm = pcm.copy()
+        return pcm, default_rate
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raw = bytes(raw)
+    else:
+        raw = bytes(raw)
+    if len(raw) >= 12 and raw[:4] == b"RIFF":
+        with wave.open(io.BytesIO(raw), "rb") as w:
+            rate = w.getframerate() or default_rate
+            channels = w.getnchannels()
+            width = w.getsampwidth()
+            frames = w.readframes(w.getnframes())
+        if width != 2:
+            raise ValueError(f"HttpTTS expected 16-bit audio, got {width * 8}-bit")
+        pcm = np.frombuffer(frames, dtype="<i2").copy()
+        if channels > 1:
+            pcm = pcm.reshape(-1, channels)[:, 0].copy()
+        return pcm, rate
+    if len(raw) % 2:
+        raw = raw[: len(raw) - 1]
+    return np.frombuffer(raw, dtype="<i2").copy(), default_rate
+
+
+async def _response_bytes(resp) -> bytes:
+    if isinstance(resp, (bytes, bytearray, memoryview)):
+        return bytes(resp)
+    content = getattr(resp, "content", None)
+    if isinstance(content, (bytes, bytearray, memoryview)):
+        return bytes(content)
+    if hasattr(resp, "aread"):
+        data = resp.aread()
+        if asyncio.iscoroutine(data):
+            data = await data
+        return bytes(data)
+    if hasattr(resp, "aiter_bytes"):
+        buf = bytearray()
+        async for chunk in resp.aiter_bytes():
+            buf.extend(chunk)
+        return bytes(buf)
+    raise TypeError("HttpTTS response has no audio body")
+
+
+class HttpTTS:
+    """OpenAI-compatible `POST {base_url}/audio/speech`.
+
+    `sample_rate` starts at 24000 and is replaced by the rate in a WAV response. If `client.post`
+    returns an async iterator, each yielded piece is one chunk; one WAV body is one chunk.
+    """
+
+    def __init__(self, base_url: str, client, *, model: str = "tts-1", voice: str = "alloy",
+                 api_key: str = "", sample_rate: int = 24000) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.client = client
+        self.model = model
+        self.voice = voice
+        self.api_key = api_key
+        self.sample_rate = sample_rate
+
+    async def synthesize(self, text: str) -> AsyncIterator[np.ndarray]:
+        payload = {"model": self.model, "voice": self.voice, "input": text}
+        kwargs: dict = {"json": payload}
+        if self.api_key:
+            kwargs["headers"] = {"Authorization": f"Bearer {self.api_key}"}
+        posted = self.client.post(f"{self.base_url}/audio/speech", **kwargs)
+        if hasattr(posted, "__aiter__"):
+            async for piece in posted:
+                pcm, rate = _pcm_from_tts(piece, self.sample_rate)
+                self.sample_rate = rate
+                if len(pcm):
+                    yield pcm
+            return
+        resp = await posted
+        if hasattr(resp, "__aiter__") and not isinstance(resp, (bytes, bytearray)):
+            async for piece in resp:
+                pcm, rate = _pcm_from_tts(piece, self.sample_rate)
+                self.sample_rate = rate
+                if len(pcm):
+                    yield pcm
+            return
+        pcm, rate = _pcm_from_tts(await _response_bytes(resp), self.sample_rate)
+        self.sample_rate = rate
+        if len(pcm):
+            yield pcm

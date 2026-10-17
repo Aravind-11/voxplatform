@@ -9,6 +9,8 @@
 # More capacity: add GPU hosts, run the same api service on each, and list every node in VOX_UPSTREAMS (Caddyfile).
 name: voxplatform
 
+# api: Kokoro shares the GPU with vLLM unless VOX_TTS_URL points at a separate TTS process.
+# When they must share a card, CUDA MPS is the isolation knob (CUDA_MPS_PIPE_DIRECTORY). Do not start MPS from inside the app.
 x-api: &api
   build: { context: .., dockerfile: deploy/Dockerfile.api }
   depends_on: { vllm: { condition: service_healthy }, postgres: { condition: service_healthy }, redis: { condition: service_started } }

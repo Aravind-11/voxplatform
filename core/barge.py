@@ -52,11 +52,13 @@ class PlaybackTracker:
         parts: list[str] = []
         cut = False
         for c in self._chunks:
+            # text may be filled in after on_sent (streamed TTS word slices); heard() must see the update
+            text = c.text if isinstance(c.text, str) else str(c.text)
             if now >= c.start_ms + c.dur_ms:
-                parts.append(c.text)
+                parts.append(text)
             elif now > c.start_ms:
                 frac = (now - c.start_ms) / c.dur_ms
-                words = c.text.split()
+                words = text.split()
                 k = int(len(words) * frac)
                 if k > 0:
                     parts.append(" ".join(words[:k]))

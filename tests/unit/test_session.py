@@ -281,6 +281,52 @@ async def test_later_sentences_wait_until_playback_needs_them():
     assert len(r.tts.texts) == 3 and r.s.history[-1]["content"].count("w") == 90
 
 
+async def test_tts_chunks_are_sent_as_they_are_produced():
+    gate = asyncio.Event()
+    order: list[str] = []
+
+    class Chunked(FakeTTS):
+        async def synthesize(self, text):
+            self.texts.append(text)
+            order.append("chunk1")
+            yield np.zeros(2400, dtype=np.int16)
+            order.append("waiting")
+            await gate.wait()
+            order.append("chunk2")
+            yield np.zeros(4800, dtype=np.int16)
+
+    llm = FakeLLM([["Hello there friend."]])
+    tts = Chunked()
+    r = Rig(llm, tts=tts)
+    orig = r.s.send_audio
+
+    async def send(pcm, rate):
+        order.append("send")
+        await orig(pcm, rate)
+        if len(r.sent) == 1:
+            gate.set()
+
+    r.s.send_audio = send
+
+    async def drive():
+        await r.frames("s", 15)
+        await r.frames("q", 23)
+        await r.settle()
+
+    try:
+        await asyncio.wait_for(drive(), timeout=3)
+    finally:
+        gate.set()
+    assert order.index("send") < order.index("chunk2")
+    assert len(r.sent) == 2 and all(n > 0 for _, n, _ in r.sent)
+    assert r.tts.texts == ["Hello there friend."]
+    speeches = [e["text"] for e in r.events if e["type"] == "agent_speech"]
+    assert speeches == ["Hello there friend."]
+    assert r.s.history[-1]["content"] == "Hello there friend."
+    parts = [str(c.text) for c in r.s.tracker._chunks]
+    assert [p.split() for p in parts] == [["Hello"], ["there", "friend."]]
+
+
 class Verdict:
     """Async end-of-turn scorer fake: returns `score` after `delay` asyncio ticks."""
 

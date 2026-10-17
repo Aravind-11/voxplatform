@@ -82,6 +82,7 @@ class SessionConfig:
     tools_schema: list[dict] = field(default_factory=list)
     greeting: str = ""                 # spoken by the agent as soon as the call connects (no model call)
     turn: TurnConfig = field(default_factory=TurnConfig)
+    short_first_sentence: bool = True  # runtime asks for a short opener; Kokoro still cannot hear the caller
 
 
 class _Generation:

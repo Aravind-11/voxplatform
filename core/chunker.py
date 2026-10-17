@@ -23,8 +23,9 @@ def clean(text: str) -> str:
 
 
 class SentenceChunker:
-    def __init__(self, first_min_chars: int = 24):
+    def __init__(self, first_min_chars: int = 24, first_max_words: int = 12):
         self.first_min = first_min_chars
+        self.first_max_words = first_max_words
         self._buf = ""
         self._emitted = 0
 
@@ -58,6 +59,8 @@ class SentenceChunker:
         return []
 
     def _find_boundary(self, s: str) -> int | None:
+        # Cut only once another word has started, so a still-growing token is not split.
+        word_cut = self._first_word_cut(s) if self._emitted == 0 else None
         for i, ch in enumerate(s[:-1]):  # need a following char to confirm the boundary
             nxt = s[i + 1]
             if ch in _END and (nxt.isspace() or ch == "\n"):
@@ -66,6 +69,34 @@ class SentenceChunker:
                 return i
             if (self._emitted == 0 and ch in _CLAUSE and nxt.isspace()
                     and len(clean(s[: i + 1])) >= self.first_min):
+                return i
+            if word_cut is not None and i == word_cut:
+                return i
+        return None
+
+    def _first_word_cut(self, s: str) -> int | None:
+        """Index of the space after the first chunk's word cap, once a further word has started."""
+        if self.first_max_words < 1:
+            return None
+        words = 0
+        i = 0
+        n = len(s)
+        while i < n:
+            while i < n and s[i].isspace():
+                i += 1
+            if i >= n:
+                return None
+            while i < n and not s[i].isspace():
+                i += 1
+            words += 1
+            if words == self.first_max_words:
+                if i >= n or not s[i].isspace():
+                    return None
+                j = i
+                while j < n and s[j].isspace():
+                    j += 1
+                if j >= n:
+                    return None
                 return i
         return None
 

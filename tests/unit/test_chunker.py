@@ -28,6 +28,30 @@ def test_first_chunk_splits_early_at_clause():
     assert out[2] == "Next."
 
 
+def test_first_chunk_cuts_at_twelve_words_without_punctuation():
+    text = "Thanks for calling I will check that for you right away."
+    out = run(split_every(text, 3))
+    assert len(out[0].split()) <= 12
+    assert " ".join(out) == text
+    # Eleven words stays one chunk. A longer unpunctuated reply cuts on the word boundary.
+    longer = text[:-1] + " please hold for just a moment"
+    c = SentenceChunker()
+    early = []
+    for d in split_every(longer, 4):
+        early += c.push(d)
+    rest = c.flush()
+    assert len(early) == 1 and len(early[0].split()) == 12
+    assert rest == [" ".join(longer.split()[12:])]
+    assert early[0] + " " + rest[0] == longer
+    partial = " ".join(longer.split()[:11]) + " " + longer.split()[11][:3]
+    assert SentenceChunker().push(partial) == []
+
+
+def test_word_cap_does_not_apply_after_the_first_chunk():
+    second = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen"
+    assert run(["Hello there. " + second]) == ["Hello there.", second]
+
+
 def test_short_clause_is_not_split_early():
     out = run(["Well, I think so. Okay."])
     assert out == ["Well, I think so.", "Okay."]

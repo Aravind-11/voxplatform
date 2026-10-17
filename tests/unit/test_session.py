@@ -264,21 +264,22 @@ async def test_speculation_synthesizes_only_first_sentence_before_commit():
 
 
 async def test_later_sentences_wait_until_playback_needs_them():
-    words = " ".join(["w"] * 30)      # 30 words x 80 ms = 2.4 s of audio per sentence
+    words = " ".join(["w"] * 30)      # 30 words x 80 ms = 2.4 s; the opener is cut at 12 words (960 ms)
     llm = FakeLLM([[f"{words}. ", f"{words}. ", f"{words}."]])
     r = Rig(llm, cfg=SessionConfig(tts_lookahead_ms=1500, tts_poll_s=0))
     await r.frames("s", 15)
-    await r.frames("q", 23)           # commit; first sentence sent (2.4 s buffered)
+    await r.frames("q", 23)           # commit; 960 ms opener is under the lookahead, so the rest of sentence 1 plays too
     await r.settle()
-    assert len(r.tts.texts) == 1 and len(r.sent) == 1      # 2.4 s queued > 1.5 s lookahead
-    r.clk.t += 1000                    # listener has heard 1 s: 1.4 s left < 1.5 s
+    assert r.tts.texts == [" ".join(["w"] * 12), " ".join(["w"] * 18) + "."]
+    assert len(r.sent) == 2           # 960 + 1440 ms queued > 1.5 s, so sentence 2 waits
+    r.clk.t += 1000                    # 1.4 s left < 1.5 s
     for _ in range(20):
         await asyncio.sleep(0.03)
-    assert len(r.tts.texts) == 2
+    assert len(r.tts.texts) == 3
     r.clk.t += 10_000
     for _ in range(20):
         await asyncio.sleep(0.03)
-    assert len(r.tts.texts) == 3 and r.s.history[-1]["content"].count("w") == 90
+    assert len(r.tts.texts) == 4 and r.s.history[-1]["content"].count("w") == 90
 
 
 class Verdict:

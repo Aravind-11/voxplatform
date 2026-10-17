@@ -55,6 +55,10 @@ def _count(e: dict) -> None:
         METRICS.inc("vox_errors_total", where=str(e.get("where", "")))
 
 
+# Cascaded TTS cannot start until text exists. This does not let Kokoro hear the caller.
+SHORT_FIRST_SENTENCE = "Keep your first sentence under eight words."
+
+
 # Said when a phone call is reconnected after the media stream or its node was lost. Short phrases per language;
 # the non-English ones have not been reviewed by a native speaker.
 RESUME_PHRASE = {"en": "Sorry about that, we got cut off for a moment. I'm back.",
@@ -169,7 +173,11 @@ class Runtime:
             name = LANG_NAME[cfg["language"]]
             prompt += (f"\n\nAlways speak and reply in {name}, whatever language the caller uses; "
                        f"if they speak another language, politely stay in {name}.")
+        short_first_sentence = True
+        if short_first_sentence:
+            prompt += "\n\n" + SHORT_FIRST_SENTENCE
         scfg = SessionConfig(system_prompt=prompt,
+                             short_first_sentence=short_first_sentence,
                              out_rate=transport.out_rate, tools_schema=schemas,
                              greeting=(RESUME_PHRASE.get(cfg.get("language") or "en", RESUME_PHRASE["en"]) if resumed
                                        else varmod.render(str(cfg.get("greeting") or ""), values)),

@@ -603,7 +603,7 @@ def test_outbound_status_and_amd_callbacks_need_a_valid_signature():
 def test_drain_stops_new_calls_but_reports_readiness():
     from test_api import speech, silence
     c, store, lim = make()
-    k, _ = tenant(c)
+    k, tid = tenant(c)
     assert c.get("/healthz").status_code == 200
     assert c.post("/admin/drain").status_code == 403
     r = c.post("/admin/drain", headers={"X-Admin-Key": "adm"})
@@ -620,9 +620,64 @@ def test_drain_stops_new_calls_but_reports_readiness():
     from api import security
     form = {"From": "+15551230000"}
     sig = security.twilio_signature("tok", f"https://vox.example.com/twilio/voice/{a['id']}", form)
-    assert c.post(f"/twilio/voice/{a['id']}", data=form, headers={"X-Twilio-Signature": sig}).status_code == 503
+    before = len(store.list_calls(tid))
+    busy = c.post(f"/twilio/voice/{a['id']}", data=form, headers={"X-Twilio-Signature": sig})
+    assert busy.status_code == 200 and "Sorry, all of our lines are busy. Please call back shortly." in busy.text
+    assert "<Hangup/>" in busy.text and "<Stream" not in busy.text
+    assert len(store.list_calls(tid)) == before                         # draining does not create a call row
     assert c.post("/admin/undrain", headers={"X-Admin-Key": "adm"}).json() == {"draining": False}
     assert c.get("/healthz").status_code == 200
+
+
+def test_node_cap_refuses_the_second_call_and_frees_when_the_first_ends():
+    from test_api import silence
+    from starlette.websockets import WebSocketDisconnect
+    from api import security
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                        node_max_calls=1, overflow_url="https://overflow.example/busy?x=1&y=2")
+    c, store, lim = make(settings)
+    k, tid = tenant(c, limit=10)                 # tenant cap is wider than the node cap
+    h = {"X-API-Key": k}
+    assert c.get("/healthz").status_code == 200 and c.get("/healthz").json()["nodeFull"] is False
+    a = c.post("/v1/agents", json={"name": "a"}, headers=h).json()
+    form = {"From": "+15551230000", "CallSid": "CA1"}
+    url = f"https://vox.example.com/twilio/voice/{a['id']}"
+    open_line = c.post(f"/twilio/voice/{a['id']}", data=form, headers={"X-Twilio-Signature": security.twilio_signature("tok", url, form)})
+    assert open_line.status_code == 200 and "<Stream" in open_line.text and "<Redirect>" not in open_line.text
+    c1 = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=h).json()
+    c2 = c.post("/v1/calls", json={}, headers=h).json()
+    path = lambda call: call["joinUrl"].replace("wss://vox.example.com", "")
+    with c.websocket_connect(path(c1)) as ws1:
+        ws1.send_bytes(silence(1)[0])
+        assert store.get_call_any(c1["id"])["status"] == "active"       # the admitted call keeps running
+        assert lim.local_active() == 1
+        hz = c.get("/healthz")
+        assert hz.status_code == 503 and hz.json()["nodeFull"] is True and hz.json()["ok"] is False
+        with pytest.raises(WebSocketDisconnect) as e:
+            with c.websocket_connect(path(c2)) as ws2:
+                ws2.receive_text()
+        assert e.value.code == 1013
+        assert store.get_call_any(c2["id"])["end_reason"] == "node_full"
+        assert lim.active(tid) == 1                                     # refused before the tenant slot was taken
+        before = len(store.list_calls(tid))
+        form2 = {"From": "+15551230001", "CallSid": "CA2"}
+        busy = c.post(f"/twilio/voice/{a['id']}", data=form2,
+                      headers={"X-Twilio-Signature": security.twilio_signature("tok", url, form2)})
+        assert busy.status_code == 200
+        assert "<Redirect>https://overflow.example/busy?x=1&amp;y=2</Redirect>" in busy.text
+        assert "lines are busy" not in busy.text and len(store.list_calls(tid)) == before
+        ws1.send_bytes(silence(1)[0])                                   # still the first call's socket
+    assert lim.local_active() == 0 and c.get("/healthz").status_code == 200
+    c3 = c.post("/v1/calls", json={}, headers=h).json()
+    with c.websocket_connect(path(c3)) as ws3:
+        ws3.send_bytes(silence(1)[0])
+        assert store.get_call_any(c3["id"])["status"] == "active" and lim.local_active() == 1
+    assert lim.local_active() == 0 and store.get_call_any(c3["id"])["end_reason"] == "hangup"
+
+
+def test_overflow_url_rejects_a_non_http_scheme():
+    with pytest.raises(ValueError, match="http"):
+        make(Settings(admin_key="adm", overflow_url="ftp://files.example/x"))
 
 
 # ------------------------------------------------------------------ billing rate, CSV, call deletion

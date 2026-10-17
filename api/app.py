@@ -8,7 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional, Union
-from xml.sax.saxutils import quoteattr
+from xml.sax.saxutils import escape, quoteattr
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, PlainTextResponse, Response
@@ -44,6 +44,18 @@ class Settings:
     audiosocket_port: int = 0          # >0: listen for Asterisk AudioSocket connections (the SIP path) on this TCP port
     audiosocket_agent: str = ""        # agent id that answers calls arriving on that port
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
+    node_max_calls: int = 32           # this process; 0 = no node cap. Checked before the per-tenant cap.
+    overflow_url: str = ""             # http(s) only; a full or draining node redirects Twilio here instead of speaking
+
+
+def checked_overflow(url: str) -> str:
+    """http(s) overflow target, or '' when unset. Other schemes are rejected (they would be an open redirect)."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError("VOX_OVERFLOW_URL must be an http:// or https:// URL")
+    return url
 
 
 class AgentIn(BaseModel):
@@ -203,6 +215,7 @@ class _Reject(Exception):
 
 def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimiter,
                dispatcher: Optional[security.WebhookDispatcher], settings: Settings) -> FastAPI:
+    overflow_url = checked_overflow(settings.overflow_url)
     app = FastAPI(title="voxplatform")
     if not getattr(runtime, "public_url", ""):
         runtime.public_url = settings.public_base_url
@@ -308,10 +321,22 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     app.state.draining = False
 
+    def at_node_cap() -> bool:
+        """This process is holding VOX_NODE_MAX_CALLS calls. 0 disables the cap."""
+        return settings.node_max_calls > 0 and limiter.local_active() >= settings.node_max_calls
+
+    def busy_twiml() -> str:
+        """HTTP 200 so Twilio plays it. A 503 is a poor signal: Twilio does not retry TwiML well."""
+        if overflow_url:
+            return ('<?xml version="1.0" encoding="UTF-8"?><Response><Redirect>'
+                    f'{escape(overflow_url)}</Redirect></Response>')
+        return ('<?xml version="1.0" encoding="UTF-8"?><Response>'
+                '<Say>Sorry, all of our lines are busy. Please call back shortly.</Say><Hangup/></Response>')
+
     @app.get("/healthz")
     async def healthz():
-        """Readiness: 503 while draining or when the database (or Redis, if used) is unreachable, so the load balancer
-        stops sending new calls to this node."""
+        """Readiness: 503 while draining, at the node cap, or when the database (or Redis, if used) is unreachable,
+        so the load balancer stops sending new calls to this node."""
         checks = {}
         for name, fn in (("db", store.ping), ("redis", getattr(limiter, "ping", None))):
             if fn is None:
@@ -322,8 +347,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             except Exception:  # noqa: BLE001
                 checks[name] = False
                 METRICS.inc("vox_errors_total", where=f"healthz_{name}")
-        ready = not app.state.draining and all(checks.values())
-        body = {"ok": ready, "draining": app.state.draining, "active_calls": limiter.local_active(), "checks": checks}
+        node_full = at_node_cap()
+        ready = not app.state.draining and not node_full and all(checks.values())
+        body = {"ok": ready, "draining": app.state.draining, "nodeFull": node_full,
+                "active_calls": limiter.local_active(), "checks": checks}
         return Response(json.dumps(body), status_code=200 if ready else 503, media_type="application/json")
 
     def admin_only(x_admin_key: str) -> None:
@@ -731,12 +758,16 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     # ------------------------------------------------------ call lifecycle
     def admit(call: dict) -> dict:
-        """Common admission: status check + per-tenant concurrency. Raises _Reject."""
+        """Common admission: status, drain, per-node cap, then per-tenant concurrency. Raises _Reject."""
         if call["status"] != "created":
             raise _Reject(4401, "call not joinable")
         if app.state.draining:
             store.update_call(call["id"], status="ended", ended=time.time(), end_reason="draining")
             raise _Reject(1013, "node is draining")
+        # Before the tenant cap, so a full process does not consume a tenant slot.
+        if at_node_cap():
+            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="node_full")
+            raise _Reject(1013, "node full")
         t = store.get_tenant(call["tenant_id"])
         cap = t["concurrency_limit"] or settings.default_concurrency
         if not limiter.acquire(call["tenant_id"], call["id"], cap):
@@ -810,8 +841,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             if not security.validate_twilio(settings.twilio_auth_token, url, form,
                                             request.headers.get("X-Twilio-Signature", "")):
                 raise HTTPException(403, "bad twilio signature")
-        if app.state.draining:
-            raise HTTPException(503, "node is draining")
+        if app.state.draining or at_node_cap():
+            return Response(busy_twiml(), media_type="text/xml")   # no call row: nothing was admitted
         agent = store.get_agent_any(agent_id)
         if not agent:
             raise HTTPException(404, "agent not found")

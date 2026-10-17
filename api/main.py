@@ -7,6 +7,10 @@
   VOX_VLLM_URL             Ultravox server, default http://127.0.0.1:8000/v1
   VOX_AUDIO_STYLE          input_audio | audio_url
   VOX_DEFAULT_CONCURRENCY  per-tenant active-call cap, default 10
+  VOX_NODE_MAX_CALLS       active calls this process admits (default 32). 0 disables the cap. At the cap, new
+                           calls are refused and /healthz is 503 with nodeFull so the load balancer stops sending more.
+  VOX_OVERFLOW_URL         optional http(s) URL. A full or draining node answers Twilio with <Redirect> to it
+                           instead of the spoken busy line. Any other scheme is rejected.
   TWILIO_AUTH_TOKEN        verifies inbound Twilio webhooks and places outbound calls
   TWILIO_ACCOUNT_SID       outbound calls and the transfer tool
   VOX_TWILIO_NUMBER        default caller id for outbound calls
@@ -53,6 +57,8 @@ def build():
                         allow_unsigned_twilio=env.get("VOX_ALLOW_UNSIGNED_TWILIO") == "1",
                         retention_default_days=int(env.get("VOX_RETENTION_DAYS", "0")),
                         default_concurrency=int(env.get("VOX_DEFAULT_CONCURRENCY", "10")),
+                        node_max_calls=int(env.get("VOX_NODE_MAX_CALLS", "32")),
+                        overflow_url=env.get("VOX_OVERFLOW_URL", ""),
                         audiosocket_port=int(env.get("VOX_AUDIOSOCKET_PORT", "0")),
                         audiosocket_agent=env.get("VOX_AUDIOSOCKET_AGENT", ""),
                         audiosocket_host=env.get("VOX_AUDIOSOCKET_HOST", "127.0.0.1"))

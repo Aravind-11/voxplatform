@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS ledger(
   id {SERIAL}, tenant_id TEXT, t {REAL}, kind TEXT, micros BIGINT, ref TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS ledger_tenant ON ledger(tenant_id, id);
 CREATE UNIQUE INDEX IF NOT EXISTS ledger_ref ON ledger(kind, ref);
+CREATE TABLE IF NOT EXISTS sip_setup(
+  uuid TEXT PRIMARY KEY, caller TEXT, callee TEXT, created {REAL});
 """
 
 # columns added after the first release: (table, column, type)
@@ -397,3 +399,14 @@ class Store:
 
     def messages(self, call_id: str) -> list[dict]:
         return self._all("SELECT role, text, t FROM messages WHERE call_id=? ORDER BY id", (call_id,))
+
+    # ---- SIP setup: dialplan posts caller/callee just before AudioSocket, keyed by the call UUID.
+    def put_sip_setup(self, uuid: str, caller: str, callee: str, created: Optional[float] = None) -> None:
+        created = time.time() if created is None else created
+        self._x("INSERT INTO sip_setup(uuid, caller, callee, created) VALUES(?,?,?,?) "
+                "ON CONFLICT(uuid) DO UPDATE SET caller=excluded.caller, callee=excluded.callee, created=excluded.created",
+                (uuid, caller, callee, created))
+
+    def get_sip_setup(self, uuid: str) -> Optional[dict]:
+        r = self._one("SELECT uuid, caller, callee, created FROM sip_setup WHERE uuid=?", (uuid,))
+        return dict(r) if r else None

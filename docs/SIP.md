@@ -32,7 +32,7 @@ Calls are stored with medium `sip`.
 Without Docker: install Asterisk 18+ (needs the AudioSocket modules), copy the four files from `deploy/sip/` to `/etc/asterisk/`, and run the engine with `VOX_AUDIOSOCKET_PORT=9092 VOX_AUDIOSOCKET_AGENT=<id> VOX_AUDIOSOCKET_HOST=127.0.0.1` (change `api1:9092` in `extensions.conf` to `127.0.0.1:9092`).
 
 ## Known limits
-- **Caller number is not passed:** AudioSocket carries only a call UUID. The agent does not know who is calling until we add it (Asterisk can pass it another way; not built).
+- **Caller number:** AudioSocket still carries only a UUID. The dialplan POSTs `caller` and `callee` to `/internal/sip/setup` (header `X-Vox-Sip-Token`, `VOX_SIP_TOKEN`) before it connects, and the call metadata `from` / `to` fill `{{caller}}` and `{{callee}}`. An empty token leaves that endpoint off.
 - **One engine node per Asterisk:** the dialplan points at `api1`. A TCP load balancer in front of several nodes is not built, and a call is lost if its node dies (the Twilio path can reconnect a call; the SIP path cannot).
 - **Security:** the AudioSocket port has no authentication. Keep it on a private network and never publish it.
 - **Outbound calls over SIP** (through VoxSun's `calls/initiate`) are not built.

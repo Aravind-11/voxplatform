@@ -168,3 +168,63 @@ def test_full_sip_call_through_the_app_creates_a_call_speaks_back_and_hangs_up()
                 break
             time.sleep(0.05)
         assert calls[0]["medium"] == "sip" and calls[0]["status"] == "ended"
+
+
+def test_sip_setup_puts_the_caller_on_the_call_and_into_the_prompt():
+    """After /internal/sip/setup, the AudioSocket call metadata `from` is the caller and {{caller}} is rendered."""
+    import socket
+    from fastapi.testclient import TestClient
+    from api import security
+    from api.app import Settings, create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    tid = store.create_tenant("a")
+    caller, callee = "+15551212000", "+15551110000"
+    ag = store.create_agent(tid, "n", {"systemPrompt": "Caller is {{caller}}", "voice": "af_heart",
+                                       "greeting": "", "tools": []})
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    settings = Settings(admin_key="adm", audiosocket_port=port, audiosocket_agent=ag["id"], sip_token="sip-secret")
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), None, settings)
+    u = uuid.uuid4()
+    with TestClient(app) as c:
+        assert c.post("/internal/sip/setup", data={"uuid": str(u), "caller": caller, "callee": callee}).status_code == 403
+        ok = c.post("/internal/sip/setup", data={"uuid": str(u), "caller": caller, "callee": callee},
+                    headers={"X-Vox-Sip-Token": "sip-secret"})
+        assert ok.status_code == 200 and app.state.sip_setups[str(u)]["caller"] == caller
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.settimeout(5)
+        sock.sendall(A.pack(A.KIND_UUID, u.bytes))
+        call = None
+        for _ in range(100):
+            calls = store.list_calls(tid)
+            if calls and calls[0]["metadata"].get("from") == caller and calls[0]["id"] in rt.live:
+                call = calls[0]
+                break
+            time.sleep(0.05)
+        assert call is not None, store.list_calls(tid)
+        assert call["metadata"]["to"] == callee and call["metadata"]["callSid"] == str(u)
+        assert call["metadata"]["channel"] == "sip" and call["medium"] == "sip"
+        sess = rt.live[call["id"]][0]
+        assert sess.history[0]["content"] == f"Caller is {caller}"          # {{caller}} rendered; ctx is not on the session
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        for _ in range(100):
+            if store.get_call_any(call["id"])["status"] == "ended":
+                break
+            time.sleep(0.05)
+        assert store.get_call_any(call["id"])["status"] == "ended"
+        assert store.get_call_any(call["id"])["metadata"]["from"] == caller
+
+    store2 = Store()
+    app2 = create_app(store2, Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store2),
+                      security.ConcurrencyLimiter(2), None, Settings(sip_token=""))
+    with TestClient(app2) as c2:
+        assert c2.post("/internal/sip/setup", data={"uuid": "z", "caller": caller, "callee": callee},
+                       headers={"X-Vox-Sip-Token": "z"}).status_code == 404

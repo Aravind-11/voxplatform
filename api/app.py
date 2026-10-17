@@ -44,6 +44,7 @@ class Settings:
     audiosocket_port: int = 0          # >0: listen for Asterisk AudioSocket connections (the SIP path) on this TCP port
     audiosocket_agent: str = ""        # agent id that answers calls arriving on that port
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
+    sip_token: str = ""                # VOX_SIP_TOKEN; empty disables POST /internal/sip/setup (404)
 
 
 class AgentIn(BaseModel):
@@ -307,6 +308,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                              {"type": type_, "t": time.time(), "call": public_call(call), **extra})
 
     app.state.draining = False
+    app.state.sip_setups = {}          # uuid -> {caller, callee, created}; mirrors sip_setup for this process
 
     @app.get("/healthz")
     async def healthz():
@@ -845,6 +847,33 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             if "t" in state:
                 finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
 
+    def require_sip_token(header: str) -> None:
+        """Empty VOX_SIP_TOKEN turns SIP setup off (404). A wrong token is 403, not a silent accept."""
+        if not settings.sip_token:
+            raise HTTPException(404, "not found")
+        if not hmac.compare_digest(header or "", settings.sip_token):
+            raise HTTPException(403, "bad sip token")
+
+    def sip_setup_for(uid: str) -> Optional[dict]:
+        mem = app.state.sip_setups.get(uid)
+        if mem:
+            return mem
+        return store.get_sip_setup(uid)
+
+    @app.post("/internal/sip/setup")
+    async def sip_setup(request: Request, x_vox_sip_token: str = Header(default="")):
+        """Asterisk posts the AudioSocket UUID plus caller and dialed number before it connects the audio."""
+        require_sip_token(x_vox_sip_token)
+        form = {k: str(v) for k, v in (await request.form()).items()}
+        uid = form.get("uuid", "").strip()
+        if not uid:
+            raise HTTPException(422, "uuid is required")
+        caller, callee = form.get("caller", ""), form.get("callee", "")
+        created = time.time()
+        store.put_sip_setup(uid, caller, callee, created)
+        app.state.sip_setups[uid] = {"uuid": uid, "caller": caller, "callee": callee, "created": created}
+        return {"ok": True}
+
     async def audiosocket_call(reader, writer) -> None:
         """One SIP call arriving from Asterisk over AudioSocket: create the call, admit it, run the agent."""
         from transports.audiosocket import AudioSocketTransport
@@ -856,7 +885,14 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         state: dict = {}
 
         async def factory(tr, custom):
-            store.update_call(call["id"], metadata={"callSid": custom.get("uuid", ""), "channel": "sip"})
+            uid = str(custom.get("uuid", ""))
+            setup = sip_setup_for(uid) if uid else {}
+            # build_session reads this dict, not a fresh store row, so the caller id has to be on it
+            # before the session is built ({{caller}} / CallContext.caller).
+            meta = {"callSid": uid, "channel": "sip",
+                    "from": (setup or {}).get("caller", ""), "to": (setup or {}).get("callee", "")}
+            store.update_call(call["id"], metadata=meta)
+            call["metadata"] = meta
             state["t"] = admit(call)
             return runtime.build_session(call, tr)
 

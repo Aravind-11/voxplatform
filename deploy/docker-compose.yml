@@ -32,6 +32,7 @@ x-api: &api
     VOX_AUDIOSOCKET_PORT: ${VOX_AUDIOSOCKET_PORT:-0}          # SIP path (docs/SIP.md): 0 = off
     VOX_AUDIOSOCKET_AGENT: ${VOX_SIP_AGENT:-}
     VOX_AUDIOSOCKET_HOST: 0.0.0.0                              # private compose network only; never publish this port
+    VOX_SIP_TOKEN: ${VOX_SIP_TOKEN:-}                          # POST /internal/sip/setup (caller id); empty = endpoint off (404)
   volumes: [ "models:/models", "recordings:/data/recordings" ]
   deploy: { resources: { reservations: { devices: [ { driver: nvidia, count: 1, capabilities: [ gpu ] } ] } } }
   stop_grace_period: 1h          # live calls finish after the drain (see deploy/drain.py)
@@ -63,6 +64,8 @@ services:
     build: { context: ., dockerfile: Dockerfile.asterisk }
     hostname: asterisk
     depends_on: [ api1 ]
+    environment:
+      SIP_SETUP_TOKEN: ${VOX_SIP_TOKEN:-}                      # dialplan reads this; must match the api VOX_SIP_TOKEN. Not a secret in the image.
     ports: [ "5060:5060/udp", "10000-10100:10000-10100/udp" ]
     restart: unless-stopped
 

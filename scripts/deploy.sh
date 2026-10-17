@@ -4,6 +4,11 @@
 # Prompts for the Twilio Auth Token with hidden input; it is never printed or written to disk.
 # Optional env: TWILIO_ACCOUNT_SID, VOX_TWILIO_NUMBER (+E.164)  -> also sets the number's webhook for you.
 #               VOX_DB (default $FS/vox.db; a postgresql:// URL works), VOX_REDIS_URL, VOX_RECORD_DIR.
+#               VOX_PROCS (default 1). 1 or unset: one uvicorn with --workers 1. Above 1: that many
+#               separate processes on ports 8080..8080+N-1 (not uvicorn's shared worker model).
+#               Caddy or the tunnel must list every port. WebSockets stick to the process that
+#               accepted them; in-process state (live calls, VAD) is per process. Split
+#               VOX_NODE_MAX_CALLS with scripts/deploy_procs.py (integer floor, at least 1).
 set -euo pipefail
 FS="${FS:-/lambda/nfs/arvi}"
 cd "$(dirname "$0")/.."
@@ -39,18 +44,68 @@ done
 [ -n "$URL" ] || { echo "no tunnel URL after 40 s; see /tmp/tunnel.log"; exit 1; }
 
 # 3. API
+# WebSockets stick to the process that accepted them. In-process state (live calls, VAD) is per
+# process, so VOX_PROCS>1 is N uvicorn processes on consecutive ports — not `uvicorn --workers N`,
+# which shares one listener. Each process gets max(1, VOX_NODE_MAX_CALLS / VOX_PROCS).
+VOX_PROCS="${VOX_PROCS:-1}"
+if ! [[ "$VOX_PROCS" =~ ^[0-9]+$ ]] || [ "$VOX_PROCS" -lt 1 ]; then
+  echo "VOX_PROCS must be an integer >= 1 (got ${VOX_PROCS})"; exit 1
+fi
 ADMIN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
 METRICS="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
 REC="${VOX_RECORD_DIR:-$FS/recordings}"; mkdir -p "$REC"
-tmux kill-session -t api 2>/dev/null || true
-tmux new -d -s api "cd $ROOT && source $HOME/venv/bin/activate && \
-  export HF_HOME=$FS/hf HF_HUB_OFFLINE=1 VOX_DB='${VOX_DB:-$FS/vox.db}' VOX_PUBLIC_URL=$URL VOX_ADMIN_KEY=$ADMIN \
-         TWILIO_AUTH_TOKEN='$TWILIO_AUTH_TOKEN' TWILIO_ACCOUNT_SID='${TWILIO_ACCOUNT_SID:-}' \
-         VOX_TWILIO_NUMBER='${VOX_TWILIO_NUMBER:-}' VOX_METRICS_TOKEN=$METRICS VOX_RECORD_DIR=$REC \
-         VOX_REDIS_URL='${VOX_REDIS_URL:-}' VOX_DEFAULT_CONCURRENCY=64 VOX_LOG_EVENTS=1 VOX_EOT=model VOX_EOT_THRESHOLD=0.9 && \
-  uvicorn api.main:app --host 127.0.0.1 --port 8080"
-for _ in $(seq 1 120); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break; sleep 1; done
-curl -fsS http://127.0.0.1:8080/healthz >/dev/null || { echo "API did not start: tmux attach -t api"; exit 1; }
+if tmux ls >/dev/null 2>&1; then
+  # Process substitution, not a pipe: `read` returning EOF must not trip `set -o pipefail`.
+  while read -r _s; do
+    case "$_s" in api|api-[0-9]*) tmux kill-session -t "$_s" || true ;; esac
+  done < <(tmux ls -F '#{session_name}')
+fi
+# Split the node cap before the processes start. Unset means the app default (one cap per process).
+PER_CAP=""
+if [ -n "${VOX_NODE_MAX_CALLS:-}" ]; then
+  PER_CAP="$(VOX_NODE_MAX_CALLS="$VOX_NODE_MAX_CALLS" VOX_PROCS="$VOX_PROCS" python3 -c 'import os; from scripts.deploy_procs import per_process_cap; print(per_process_cap(int(os.environ["VOX_NODE_MAX_CALLS"]), int(os.environ["VOX_PROCS"])))')"
+fi
+start_api() {   # port, tmux session, uvicorn --workers
+  local port="$1" session="$2" workers="$3"
+  local cap_env=""
+  [ -n "$PER_CAP" ] && cap_env="VOX_NODE_MAX_CALLS=$PER_CAP"
+  tmux new -d -s "$session" "cd $ROOT && source $HOME/venv/bin/activate && \
+    export HF_HOME=$FS/hf HF_HUB_OFFLINE=1 VOX_DB='${VOX_DB:-$FS/vox.db}' VOX_PUBLIC_URL=$URL VOX_ADMIN_KEY=$ADMIN \
+           TWILIO_AUTH_TOKEN='$TWILIO_AUTH_TOKEN' TWILIO_ACCOUNT_SID='${TWILIO_ACCOUNT_SID:-}' \
+           VOX_TWILIO_NUMBER='${VOX_TWILIO_NUMBER:-}' VOX_METRICS_TOKEN=$METRICS VOX_RECORD_DIR=$REC \
+           VOX_REDIS_URL='${VOX_REDIS_URL:-}' VOX_DEFAULT_CONCURRENCY=64 VOX_LOG_EVENTS=1 VOX_EOT=model VOX_EOT_THRESHOLD=0.9 \
+           VOX_PROCS=$VOX_PROCS $cap_env && \
+    uvicorn api.main:app --host 127.0.0.1 --port $port --workers $workers"
+}
+if [ "$VOX_PROCS" -eq 1 ]; then
+  start_api 8080 api "$VOX_PROCS"          # --workers 1 (or the unset default, which we set to 1 above)
+  PORTS="8080"
+else
+  PORTS=""
+  for _i in $(seq 0 $((VOX_PROCS - 1))); do
+    _port=$((8080 + _i))
+    start_api "$_port" "api-$_port" 1      # one process each, not a shared worker pool
+    PORTS="$PORTS $_port"
+  done
+  echo "VOX_PROCS=$VOX_PROCS: one uvicorn process per port:$PORTS (not uvicorn --workers $VOX_PROCS)."
+  echo "Caddy (or the tunnel) must list every port. The quick tunnel above only reaches :8080."
+  echo "WebSockets stick to the process that accepted them; live calls and VAD are not shared."
+  if [ -n "$PER_CAP" ]; then
+    echo "VOX_NODE_MAX_CALLS=$VOX_NODE_MAX_CALLS split to $PER_CAP per process (floor, at least 1)."
+  else
+    echo "Set VOX_NODE_MAX_CALLS so each process takes max(1, VOX_NODE_MAX_CALLS / VOX_PROCS)."
+  fi
+fi
+_ok=0
+for _ in $(seq 1 120); do
+  _ok=1
+  for _port in $PORTS; do
+    curl -fsS "http://127.0.0.1:${_port}/healthz" >/dev/null 2>&1 || _ok=0
+  done
+  [ "$_ok" -eq 1 ] && break
+  sleep 1
+done
+[ "$_ok" -eq 1 ] || { echo "API did not start on ports:$PORTS — tmux attach -t api (or api-<port>)"; exit 1; }
 
 # 4. tenant + agent (auth header is X-API-Key)
 J='content-type: application/json'
@@ -89,4 +144,9 @@ else
   echo "Phone:       Twilio console -> your number -> Voice -> 'A call comes in' -> Webhook, HTTP POST, URL:"
   echo "             $HOOK"
 fi
-echo "Logs:        tmux capture-pane -p -S -300 -t api | grep -E 'EV|ERROR|Traceback|twilio' | tail -60"
+if [ "$VOX_PROCS" -eq 1 ]; then
+  echo "Logs:        tmux capture-pane -p -S -300 -t api | grep -E 'EV|ERROR|Traceback|twilio' | tail -60"
+else
+  echo "Logs:        tmux capture-pane -p -S -300 -t api-8080 | grep -E 'EV|ERROR|Traceback|twilio' | tail -60"
+  echo "             (also api-<port> for each port listed above)"
+fi

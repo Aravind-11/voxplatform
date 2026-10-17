@@ -77,6 +77,7 @@ class SessionConfig:
     pre_roll_frames: int = 10
     max_tool_rounds: int = 3
     output_latency_ms: float = 0.0
+    mark_timeout_ms: float = 1500.0    # give up waiting for a playback mark this long after the clock estimate
     tts_lookahead_ms: float = 1500.0   # synthesize sentence k+1 only when < this much audio is queued
     tts_poll_s: float = 0.02           # how often a waiting sentence re-checks the playback buffer
     tools_schema: list[dict] = field(default_factory=list)
@@ -415,12 +416,25 @@ class Session:
             self._emit("error", where="call_action", error=repr(e))
 
     async def _finish_action(self, gen: _Generation) -> None:
-        deadline = self.clock() + 30000.0
-        while self.tracker.buffered_ms() > 0 and self.clock() < deadline:   # the reply must finish playing first
+        hard = self.clock() + 30000.0
+        # Marks lag the local clock (Twilio jitter). Wait until every armed mark is acked, but not
+        # forever: a lost mark must not keep the goodbye from hanging up.
+        mark_deadline = self.tracker.ends_at() + self.cfg.mark_timeout_ms
+        while self.clock() < hard:
+            if self.tracker.pending_marks:
+                if self.clock() >= mark_deadline:
+                    break
+            elif self.tracker.buffered_ms() <= 0:
+                break
             await asyncio.sleep(0.05)
         a, gen.after = gen.after, None      # taken only now: a barge-in during the wait still sees it
         if a is not None:
             self._spawn_action(a)
+
+    def attach_transport_marks(self, transport) -> None:
+        """If the transport echoes playback marks, feed them to the tracker."""
+        if hasattr(transport, "set_mark_handler"):
+            transport.set_mark_handler(self.tracker.note_mark)
 
     async def _speak(self, gen: _Generation, text: str) -> None:
         t_tts = self.clock()
@@ -444,11 +458,13 @@ class Session:
                 gen.first_audio_sent = True
                 self._emit("agent_first_audio",
                            latency_ms=self.clock() - gen.speech_end_clock)
-            await self.send_audio(pcm, self.cfg.out_rate)
+            mark = await self.send_audio(pcm, self.cfg.out_rate)
             if self.recorder is not None:
                 self.recorder.agent(pcm, self.cfg.out_rate)
             dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
             self.tracker.on_sent(text, dur)
+            if isinstance(mark, str) and mark:
+                self.tracker.arm_mark(mark)
             gen.pending_ms -= dur
             gen.spoken.append(text)
             self._emit("agent_speech", text=text)

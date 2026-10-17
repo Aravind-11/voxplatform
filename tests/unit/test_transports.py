@@ -96,6 +96,23 @@ async def test_twilio_outbound_media_mark_clear_and_chunking():
     assert ws.sent == [{"event": "clear", "streamSid": "MZ9"}]
 
 
+async def test_twilio_inbound_mark_reaches_the_handler():
+    seen = []
+    msgs = [{"event": "start", "streamSid": "MZ1",
+             "start": {"streamSid": "MZ1", "callSid": "CA1", "customParameters": {}}},
+            {"event": "mark", "streamSid": "MZ1", "mark": {"name": "m1"}},
+            {"event": "stop", "streamSid": "MZ1"}]
+    sess = StubSession()
+
+    async def factory(tr, custom):
+        tr.set_mark_handler(seen.append)
+        return sess
+
+    tr = TwilioTransport(FakeTwilioWS(msgs), factory)
+    await tr.run()
+    assert seen == ["m1"] and tr.marks_acked == 1 and sess.closed
+
+
 async def test_twilio_rejects_non_8k_output():
     tr = TwilioTransport(FakeTwilioWS([]), None)
     with pytest.raises(AssertionError):

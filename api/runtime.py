@@ -169,8 +169,12 @@ class Runtime:
             name = LANG_NAME[cfg["language"]]
             prompt += (f"\n\nAlways speak and reply in {name}, whatever language the caller uses; "
                        f"if they speak another language, politely stay in {name}.")
+        # Twilio jitter: trust mark acks, and don't assume playback is instant. Other transports
+        # keep output_latency_ms at 0 so clock-driven unit tests stay put.
+        use_marks = getattr(transport, "out_rate", 0) == 8000 and hasattr(transport, "set_mark_handler")
         scfg = SessionConfig(system_prompt=prompt,
                              out_rate=transport.out_rate, tools_schema=schemas,
+                             output_latency_ms=200.0 if use_marks else 0.0,
                              greeting=(RESUME_PHRASE.get(cfg.get("language") or "en", RESUME_PHRASE["en"]) if resumed
                                        else varmod.render(str(cfg.get("greeting") or ""), values)),
                              turn=TurnConfig(end_ms=float(os.environ.get("VOX_END_MS", "640")),
@@ -200,6 +204,7 @@ class Runtime:
                        send_audio=transport.send_audio, clear_audio=transport.clear, clock=self.clock,
                        cfg=scfg, tools=fns, on_event=on_event, eot_fn=self._eot_sync(),
                        eot_async=self._eot_async(), recorder=recorder, on_utterance=on_utt)
+        sess.attach_transport_marks(transport)
 
         async def voicemail(message: str) -> None:
             await sess.say_and_wait(message)

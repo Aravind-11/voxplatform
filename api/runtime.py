@@ -12,6 +12,7 @@ from core.metrics import METRICS
 from core.recorder import CallRecorder, write_wav16
 from core.session import Session, SessionConfig
 from core.turn import TurnConfig
+from core.vad_exec import VADScheduler
 from . import tools as toolmod
 from .store import Store
 
@@ -81,6 +82,7 @@ class Runtime:
     record_dir: str = ""                   # where recordings / the utterance dataset go; "" -> VOX_RECORD_DIR env
     live: dict = field(default_factory=dict)       # call_id -> (Session, transport): lets webhooks reach a live call
     recorders: dict = field(default_factory=dict)  # call_id -> CallRecorder
+    vad_scheduler: VADScheduler = field(default_factory=VADScheduler)  # one scheduler per process (one Runtime)
 
     def finalize(self, call_id: str) -> Optional[str]:
         """Called when a call ends: forgets the live session and writes the recording. Returns the WAV path."""
@@ -199,7 +201,8 @@ class Runtime:
         sess = Session(llm=self.llm, tts=tts, vad=self.make_vad(),
                        send_audio=transport.send_audio, clear_audio=transport.clear, clock=self.clock,
                        cfg=scfg, tools=fns, on_event=on_event, eot_fn=self._eot_sync(),
-                       eot_async=self._eot_async(), recorder=recorder, on_utterance=on_utt)
+                       eot_async=self._eot_async(), recorder=recorder, on_utterance=on_utt,
+                       vad_scheduler=self.vad_scheduler)
 
         async def voicemail(message: str) -> None:
             await sess.say_and_wait(message)

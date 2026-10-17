@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
 
 from core.metrics import METRICS
+from core.vad_exec import watch_loop_lag
 from core import tts as ttsmod
 from core.tts import DEFAULT_VOICE, LANG_NAME, VOICES
 from transports.browser import BrowserTransport
@@ -225,6 +226,9 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                     METRICS.inc("vox_errors_total", where="retention")
                 await asyncio.sleep(3600)
         app.state.retention = asyncio.create_task(sweep())
+        # One lag watcher per app. Startup can run again (reload, a second enter); don't stack tasks.
+        if getattr(app.state, "loop_lag_task", None) is None:
+            app.state.loop_lag_task = asyncio.create_task(watch_loop_lag(METRICS))
 
     def tenant(x_api_key: str = Header(default="")) -> dict:
         t = store.tenant_by_key(security.hash_key(x_api_key)) if x_api_key else None

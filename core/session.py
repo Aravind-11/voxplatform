@@ -110,8 +110,10 @@ class Session:
                  eot_fn: Optional[Callable[[np.ndarray, list[dict]], float]] = None,
                  eot_async: Optional[Callable[[np.ndarray, list[dict]], Awaitable[float]]] = None,
                  recorder: Any = None,
-                 on_utterance: Optional[Callable[[np.ndarray, str, Optional[float]], None]] = None):
+                 on_utterance: Optional[Callable[[np.ndarray, str, Optional[float]], None]] = None,
+                 vad_scheduler: Any = None):
         self.llm, self.tts, self.vad = llm, tts, vad
+        self.vad_scheduler = vad_scheduler    # None: score inline so unit rigs stay deterministic
         self.send_audio, self.clear_audio = send_audio, clear_audio
         self.clock = clock
         self.cfg = cfg or SessionConfig()
@@ -139,7 +141,10 @@ class Session:
         """Feed one 512-sample 16 kHz int16 frame (32 ms)."""
         if self.recorder is not None:
             self.recorder.mic(frame)
-        prob = self.vad.prob(frame)
+        if self.vad_scheduler is not None:
+            prob = await self.vad_scheduler.prob(self.vad, frame)
+        else:
+            prob = self.vad.prob(frame)   # no scheduler: stay on this task (Rig tests depend on it)
         if prob >= self.cfg.turn.threshold:
             self._last_speech_clock = self.clock()
         self.turn.set_agent_speaking(self._agent_active())

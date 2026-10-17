@@ -65,6 +65,50 @@ class CallContext:
     client_call: Optional[Callable[..., Awaitable[Any]]] = None     # run a tool in the caller's browser
     embedder: Any = None                                            # optional core.embed.OpenAIEmbedder (hybrid KB search)
     base_url: str = ""                                              # public URL of this API (warm-transfer callbacks)
+    tool_budget: int = 8                                            # side-effect calls allowed on this call; the next one is refused
+    tool_calls: int = 0
+    last_user_text: Callable[[], str] = lambda: ""                  # empty when the caller has not been transcribed yet
+
+
+# Phrase list only. A caller who avoids these words is not stopped, and a quoted phrase can still false-positive.
+_INJECTION = re.compile(
+    r"ignore (?:all |your |previous )?instructions|system prompt|you are now|jailbreak|developer message",
+    re.IGNORECASE)
+_BUDGET_ERROR = "tool call budget for this call is used up"
+_INJECTION_ERROR = "refused: the caller's words look like an instruction to the model, not a request to the business"
+
+
+def injection_risk(text) -> bool:
+    return bool(text) and _INJECTION.search(str(text)) is not None
+
+
+def _caller_text(ctx) -> str:
+    provider = getattr(ctx, "last_user_text", None)
+    if provider is None:
+        return ""
+    try:
+        text = provider() if callable(provider) else provider
+    except Exception:  # noqa: BLE001
+        return ""
+    return text if isinstance(text, str) else ""
+
+
+def _injection_refusal() -> dict:
+    return {"executed": False, "error": _INJECTION_ERROR}
+
+
+def _with_budget(fn, ctx):
+    """Shared per-call cap. The refused call does not run `fn` and does not increment the counter."""
+    async def run(args: dict):
+        if injection_risk(_caller_text(ctx)):
+            return _injection_refusal()
+        used = int(getattr(ctx, "tool_calls", 0) or 0)
+        budget = int(getattr(ctx, "tool_budget", 8))
+        if used >= budget:
+            return {"error": _BUDGET_ERROR}
+        ctx.tool_calls = used + 1
+        return await fn(args)
+    return run
 
 
 def _canon(args: dict) -> str:
@@ -88,6 +132,8 @@ def with_confirmation(fn, schema: dict, ctx):
     pending: dict[str, int] = {}
 
     async def run(args: dict):
+        if injection_risk(_caller_text(ctx)):
+            return _injection_refusal()
         args = dict(args or {})
         confirmed = args.pop("confirmed", False) is True
         key, turn = _canon(args), ctx.turn_fn()
@@ -176,13 +222,19 @@ def build(specs: list, ctx: Optional[CallContext] = None, client: Any = None):
             sch, fn = DEMO_SCHEMAS[d["demo"]], demo[d["demo"]]
             if d.get("confirm"):
                 sch, fn = with_confirmation(fn, sch, ctx)
+            if d["demo"] == "book_slot":          # changes state; check_availability is a read and is not counted
+                fn = _with_budget(fn, ctx)
             schemas[d["demo"]], fns[d["demo"]] = sch, fn
         elif "builtin" in d:
             key = d.get("name") or d["builtin"]
-            schemas[key], fns[key] = builtin_tools.schema(d), builtin_tools.make(d, ctx, client)
+            fn = builtin_tools.make(d, ctx, client)
+            if d["builtin"] in ("hangUp", "transfer"):
+                fn = _with_budget(fn, ctx)
+            schemas[key], fns[key] = builtin_tools.schema(d), fn
         else:
             sch, fn = http_tools.schema(d), http_tools.make_http_tool(d, ctx, client)
             if d.get("confirm"):
                 sch, fn = with_confirmation(fn, sch, ctx)
+            fn = _with_budget(fn, ctx)
             schemas[d["name"]], fns[d["name"]] = sch, fn
     return list(schemas.values()), fns

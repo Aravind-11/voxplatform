@@ -46,6 +46,14 @@ class Settings:
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
 
 
+class TurnIn(BaseModel):
+    """Per-agent end-of-turn timing. Operators tune these on VOX_DATASET=1 recordings; they do not
+    make the acoustic "um" decision correct."""
+    endMs: Optional[float] = Field(None, ge=200, le=2000)
+    eotThreshold: Optional[float] = Field(None, ge=0.05, le=0.99)
+    patientMs: Optional[float] = Field(None, ge=400, le=3000)
+
+
 class AgentIn(BaseModel):
     name: str
     systemPrompt: str = ""
@@ -56,6 +64,7 @@ class AgentIn(BaseModel):
     tools: list[Union[str, dict[str, Any]]] = Field(default_factory=list)
     speed: float = Field(1.0, ge=0.7, le=1.3)
     record: bool = False                            # stereo recording of calls; you need the caller's consent
+    turn: Optional[TurnIn] = None                   # optional endMs / eotThreshold / patientMs over the env defaults
 
 
 class AgentPatch(BaseModel):
@@ -68,6 +77,7 @@ class AgentPatch(BaseModel):
     tools: Optional[list[Union[str, dict[str, Any]]]] = None
     speed: Optional[float] = Field(None, ge=0.7, le=1.3)
     record: Optional[bool] = None
+    turn: Optional[TurnIn] = None
 
 
 class CallIn(BaseModel):
@@ -384,6 +394,9 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     async def create_agent(body: AgentIn, t: dict = Depends(tenant_write)):
         check_tools(body.tools, t["id"])
         cfg0 = body.model_dump(exclude={"name"})
+        turn = cfg0.pop("turn", None)
+        if turn:
+            cfg0["turn"] = {k: v for k, v in turn.items() if v is not None}
         cfg0["voice"], cfg0["language"] = pick_voice("af_heart", None, body.voice, body.language, "voice" in body.model_fields_set)
         check_voice(cfg0["voice"], cfg0["language"])
         call_variables(cfg0, None, strict=False)
@@ -404,9 +417,13 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                                          "voice" in body.model_fields_set)
         check_voice(eff_voice, eff_lang)
         changed = []
-        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record"):
+        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record", "turn"):
             v = getattr(body, k)
             if v is not None:
+                if k == "turn":
+                    merged = dict(cfg.get("turn") or {})
+                    merged.update(v.model_dump(exclude_none=True))
+                    v = merged
                 cfg[k] = v
                 changed.append(k)
         call_variables(cfg, None, strict=False)

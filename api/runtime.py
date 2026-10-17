@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from core.asr import AsrLLM, HttpASR
 from core.metrics import METRICS
 from core.recorder import CallRecorder, write_wav16
 from core.session import Session, SessionConfig
@@ -53,6 +54,12 @@ def _count(e: dict) -> None:
         METRICS.inc("vox_turns_total")
     elif t == "error":
         METRICS.inc("vox_errors_total", where=str(e.get("where", "")))
+
+
+# History is text because the speech model accepts one audio clip. Ask the agent to repeat slots
+# before acting when the operator turned that reminder on.
+RESTATE_SLOTS = ("Earlier caller turns are transcripts and may not match the audio. "
+                 "Restate any name, date, or number before you act on it.")
 
 
 # Said when a phone call is reconnected after the media stream or its node was lost. Short phrases per language;
@@ -124,6 +131,20 @@ class Runtime:
             return eot_prosody
         return self.eot_fn
 
+    def _session_llm(self):
+        """LLM handed to the Session. Transcripts use `VOX_ASR_URL` when that client is configured.
+
+        The wrapper is not stored on `self.llm`: `_eot_async` checks `eot_score` on the Ultravox
+        client, and with no URL (or no shared HTTP client) `VllmClient.transcribe` stays in place.
+        Earlier audio still cannot be replayed into Ultravox (`--limit-mm-per-prompt audio:1`);
+        the separate transcript can diverge from what the model heard.
+        """
+        url = os.environ.get("VOX_ASR_URL", "").strip().rstrip("/")
+        if not url or self.http is None:
+            return self.llm
+        model = os.environ.get("VOX_ASR_MODEL", "whisper-1").strip() or "whisper-1"
+        return AsrLLM(self.llm, HttpASR(url, self.http, model=model))
+
     def build_session(self, call: dict, transport, forward_events: bool = False) -> Session:
         cfg = call["config"]
         meta = call.get("metadata") or {}
@@ -169,6 +190,8 @@ class Runtime:
             name = LANG_NAME[cfg["language"]]
             prompt += (f"\n\nAlways speak and reply in {name}, whatever language the caller uses; "
                        f"if they speak another language, politely stay in {name}.")
+        if cfg.get("restateSlots"):
+            prompt += "\n\n" + RESTATE_SLOTS
         scfg = SessionConfig(system_prompt=prompt,
                              out_rate=transport.out_rate, tools_schema=schemas,
                              greeting=(RESUME_PHRASE.get(cfg.get("language") or "en", RESUME_PHRASE["en"]) if resumed
@@ -196,7 +219,7 @@ class Runtime:
         lim = int(os.environ.get("VOX_TTS_CONCURRENCY", "4"))
         if lim > 0:
             tts = LimitedTTS(tts, lim)
-        sess = Session(llm=self.llm, tts=tts, vad=self.make_vad(),
+        sess = Session(llm=self._session_llm(), tts=tts, vad=self.make_vad(),
                        send_audio=transport.send_audio, clear_audio=transport.clear, clock=self.clock,
                        cfg=scfg, tools=fns, on_event=on_event, eot_fn=self._eot_sync(),
                        eot_async=self._eot_async(), recorder=recorder, on_utterance=on_utt)

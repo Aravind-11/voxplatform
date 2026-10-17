@@ -5,6 +5,8 @@
   VOX_DB                   SQLite path (default vox.db) or postgresql://user:pass@host/db
   VOX_REDIS_URL            redis://host:6379/0 -> concurrency cap shared by all API nodes (default: in-process)
   VOX_VLLM_URL             Ultravox server, default http://127.0.0.1:8000/v1
+  VOX_ASR_URL              optional OpenAI-compatible transcriber (include /v1). Caller transcripts come from it; Ultravox still hears only the current turn
+  VOX_ASR_MODEL            transcription model for VOX_ASR_URL, default whisper-1
   VOX_AUDIO_STYLE          input_audio | audio_url
   VOX_DEFAULT_CONCURRENCY  per-tenant active-call cap, default 10
   TWILIO_AUTH_TOKEN        verifies inbound Twilio webhooks and places outbound calls

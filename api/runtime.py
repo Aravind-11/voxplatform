@@ -66,6 +66,17 @@ RESUME_PHRASE = {"en": "Sorry about that, we got cut off for a moment. I'm back.
                  "pt": "Desculpe, a ligação caiu por um instante. Já voltei.",
                  "zh": "不好意思，刚才断线了一下。我回来了。"}
 
+# Spoken once when a committed reply fails in the model or in TTS. Short phrases per language;
+# the non-English ones have not been reviewed by a native speaker.
+ERROR_PHRASE = {"en": "Sorry, could you say that again?",
+                "es": "Perdón, ¿puede repetirlo?",
+                "fr": "Désolé, pouvez-vous répéter ?",
+                "hi": "माफ़ कीजिए, क्या आप फिर से बोलेंगे?",
+                "it": "Scusi, può ripetere?",
+                "ja": "すみません、もう一度言っていただけますか？",
+                "pt": "Desculpe, pode repetir?",
+                "zh": "不好意思，请再说一遍。"}
+
 
 @dataclass
 class Runtime:
@@ -169,10 +180,12 @@ class Runtime:
             name = LANG_NAME[cfg["language"]]
             prompt += (f"\n\nAlways speak and reply in {name}, whatever language the caller uses; "
                        f"if they speak another language, politely stay in {name}.")
+        lang = cfg.get("language") or "en"
         scfg = SessionConfig(system_prompt=prompt,
                              out_rate=transport.out_rate, tools_schema=schemas,
-                             greeting=(RESUME_PHRASE.get(cfg.get("language") or "en", RESUME_PHRASE["en"]) if resumed
+                             greeting=(RESUME_PHRASE.get(lang, RESUME_PHRASE["en"]) if resumed
                                        else varmod.render(str(cfg.get("greeting") or ""), values)),
+                             error_phrase=ERROR_PHRASE.get(lang, ERROR_PHRASE["en"]),
                              turn=TurnConfig(end_ms=float(os.environ.get("VOX_END_MS", "640")),
                                              eot_threshold=float(os.environ.get("VOX_EOT_THRESHOLD", "0.8")),
                                              patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000"))))

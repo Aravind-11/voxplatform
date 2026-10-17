@@ -81,6 +81,7 @@ class SessionConfig:
     tts_poll_s: float = 0.02           # how often a waiting sentence re-checks the playback buffer
     tools_schema: list[dict] = field(default_factory=list)
     greeting: str = ""                 # spoken by the agent as soon as the call connects (no model call)
+    error_phrase: str = "Sorry, could you say that again?"  # spoken once if a committed reply fails
     turn: TurnConfig = field(default_factory=TurnConfig)
 
 
@@ -99,6 +100,7 @@ class _Generation:
         self.produce_done = False
         self.first_audio_sent = False
         self.cancelled = False
+        self.fallback_used = False     # the spoken apology is attempted at most once per reply
         self.after: Optional[ToolResult] = None   # deferred call action requested by a tool this reply
 
 
@@ -359,6 +361,11 @@ class Session:
             raise
         except Exception as e:  # noqa: BLE001
             self._emit("error", where="produce", error=repr(e))
+            # Only a committed reply owes the caller an apology. A speculative reply that is
+            # cancelled, or that fails before the turn commits, must stay silent.
+            if gen.committed and not gen.cancelled and not gen.fallback_used:
+                gen.fallback_used = True
+                gen.textq.put_nowait(self.cfg.error_phrase)
         finally:
             gen.textq.put_nowait(None)
 
@@ -384,9 +391,21 @@ class Session:
             raise
         except Exception as e:  # noqa: BLE001
             self._emit("error", where="tts", error=repr(e))
+            if gen.committed and not gen.cancelled and not gen.fallback_used:
+                await self._speak_fallback(gen)
         finally:
             gen.produce_done = True
             gen.outbox.put_nowait(None)
+
+    async def _speak_fallback(self, gen: _Generation) -> None:
+        """Synthesize the apology directly. A second failure is reported and not retried."""
+        gen.fallback_used = True
+        try:
+            await self._speak(gen, self.cfg.error_phrase)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._emit("error", where="tts_fallback", error=repr(e))
 
     async def _run_tool(self, call: ToolCall, gen: Optional[_Generation] = None) -> str:
         fn = self.tools.get(call.name)

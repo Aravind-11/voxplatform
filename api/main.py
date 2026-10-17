@@ -19,6 +19,10 @@
   VOX_EMBED_MODEL          default BAAI/bge-small-en-v1.5;  VOX_EMBED_MIN_SIM  cosine floor for dense matches (default 0)
   VOX_RETENTION_DAYS       erase ended calls older than this for tenants without their own limit (default: keep)
   VOX_NO_ESPEAK=1          run Kokoro without the GPL espeak-ng fallback (English only; Spanish/French/Italian/Portuguese/Hindi need espeak)
+  VOX_TTS_URL              OpenAI-compatible speech base (include /v1). When set, every voice uses POST {url}/audio/speech instead of Kokoro
+  VOX_TTS_MODEL            model for VOX_TTS_URL, default tts-1
+  VOX_TTS_API_KEY          bearer token for that endpoint, if it requires one
+  VOX_TTS_RATE             sample rate for a raw s16le speech response (WAV carries its own rate), default 24000
   VOX_PRELOAD_LANGS        Kokoro language codes to load at start-up, default a (a,b English; e,f,h,i,p,j,z others; see docs/LANGUAGES.md)
   VOX_AUDIOSOCKET_PORT / VOX_AUDIOSOCKET_AGENT / VOX_AUDIOSOCKET_HOST   SIP path: TCP port Asterisk streams call audio to, and the agent id that answers (docs/SIP.md)
   VOX_ALLOW_UNSIGNED_TWILIO=1   development only
@@ -35,7 +39,7 @@ from api.app import Settings, create_app
 from api.runtime import Runtime
 from api.store import Store
 from core.llm import VllmClient
-from core.tts import KokoroTTS
+from core.tts import make_tts_factory
 from core.vad import SileroVAD
 
 
@@ -57,8 +61,6 @@ def build():
                         audiosocket_agent=env.get("VOX_AUDIOSOCKET_AGENT", ""),
                         audiosocket_host=env.get("VOX_AUDIOSOCKET_HOST", "127.0.0.1"))
     store = Store(env.get("VOX_DB", "vox.db"))
-    from core.tts import PipelineSet
-    pipelines = PipelineSet(preload=env.get("VOX_PRELOAD_LANGS", "a"))   # one front end per language, shared by all calls
     llm = VllmClient(base_url=env.get("VOX_VLLM_URL", "http://127.0.0.1:8000/v1"),
                      audio_style=env.get("VOX_AUDIO_STYLE", "input_audio"))
     http = httpx.AsyncClient()
@@ -67,7 +69,7 @@ def build():
         from core.embed import OpenAIEmbedder
         embedder = OpenAIEmbedder(env["VOX_EMBED_URL"], env.get("VOX_EMBED_MODEL", "BAAI/bge-small-en-v1.5"), http,
                                   min_sim=float(env.get("VOX_EMBED_MIN_SIM", "0")))
-    rt = Runtime(llm, lambda voice: KokoroTTS(voice=voice, pipeline=pipelines.for_voice(voice)), SileroVAD, store,
+    rt = Runtime(llm, make_tts_factory(env, http), SileroVAD, store,
                  http=http, record_dir=settings.record_dir, embedder=embedder)   # one pooled client for tools and Twilio
     redis_url = env.get("VOX_REDIS_URL", "")
     limiter = (security.RedisLimiter(redis_url, settings.default_concurrency) if redis_url

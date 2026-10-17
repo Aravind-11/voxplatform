@@ -2,10 +2,15 @@
 
 KPipeline is a blocking generator, so synthesis runs in a worker thread and PCM pieces are
 handed back through an asyncio queue. Output: int16 mono at 24 kHz.
+
+`HttpTTS` is the swap for a commercially licensed engine (`VOX_TTS_URL`). Kokoro's voice list
+does not grow when that is set.
 """
 from __future__ import annotations
 
 import asyncio
+import io
+import wave
 from typing import AsyncIterator
 
 import numpy as np
@@ -137,3 +142,66 @@ class KokoroTTS:
                 yield np.clip(np.rint(item * 32767.0), -32768, 32767).astype(np.int16)
         finally:
             await asyncio.shield(fut)
+
+
+class HttpTTS:
+    """OpenAI-compatible `POST {url}/audio/speech` with JSON `{model, voice, input}`.
+
+    A WAV response sets `sample_rate` from the header. Anything else is raw s16le at `rate`
+    (`VOX_TTS_RATE`, default 24000). One response is one chunk.
+    """
+
+    def __init__(self, voice: str, url: str, client, model: str = "tts-1", api_key: str = "",
+                 rate: int = 24000):
+        self.voice = voice
+        self.url = url.rstrip("/")
+        self.client = client
+        self.model = model or "tts-1"
+        self.api_key = api_key
+        self._default_rate = rate
+        self.sample_rate = rate
+
+    async def synthesize(self, text: str) -> AsyncIterator[np.ndarray]:
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
+        response = await self.client.post(
+            f"{self.url}/audio/speech",
+            json={"model": self.model, "voice": self.voice, "input": text},
+            headers=headers)
+        if hasattr(response, "raise_for_status"):
+            response.raise_for_status()
+        data = response.content
+        pcm, rate = _pcm_from_speech(data, self._default_rate)
+        self.sample_rate = rate
+        if len(pcm):
+            yield pcm
+
+
+def make_tts_factory(env, http):
+    """Kokoro unless `VOX_TTS_URL` is set, in which case every voice uses that HTTP engine.
+
+    The HTTP branch does not construct a Kokoro pipeline. The fixed voice list is unchanged either way.
+    """
+    url = env.get("VOX_TTS_URL", "").strip().rstrip("/")
+    if url:
+        model = env.get("VOX_TTS_MODEL", "tts-1").strip() or "tts-1"
+        key = env.get("VOX_TTS_API_KEY", "")
+        rate = int(env.get("VOX_TTS_RATE", "24000") or "24000")
+        return lambda voice, url=url, model=model, key=key, rate=rate: HttpTTS(
+            voice, url, http, model=model, api_key=key, rate=rate)
+    pipelines = PipelineSet(preload=env.get("VOX_PRELOAD_LANGS", "a"))   # one front end per language, shared by all calls
+    return lambda voice: KokoroTTS(voice=voice, pipeline=pipelines.for_voice(voice))
+
+
+def _pcm_from_speech(data: bytes, default_rate: int) -> tuple[np.ndarray, int]:
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        with wave.open(io.BytesIO(data), "rb") as w:
+            channels, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+            raw = w.readframes(w.getnframes())
+        if width != 2:
+            raise ValueError(f"TTS WAV must be 16-bit, got {width * 8}-bit")
+        pcm = np.frombuffer(raw, dtype=np.int16).copy()
+        if channels > 1:
+            pcm = pcm.reshape(-1, channels)[:, 0].copy()
+        return pcm, rate
+    even = data[: len(data) - (len(data) % 2)]
+    return np.frombuffer(even, dtype=np.int16).copy(), default_rate

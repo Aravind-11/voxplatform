@@ -30,6 +30,8 @@ Two ways to avoid the question:
 The provided Dockerfile does not install espeak-ng unless you build with `--build-arg WITH_ESPEAK=1`.
 Status: the switch is written; it has not been run on the GPU box, and pronunciation impact is unmeasured.
 
+Kokoro has a fixed voice list and cannot clone a voice. Non-English front ends that need espeak-ng are GPL-3.0, and this tree does not enable espeak. `VOX_TTS_URL` sends synthesis to an OpenAI-compatible `/audio/speech` endpoint so a commercially licensed engine can be swapped in after its license is reviewed. That swap does not add voices to Kokoro.
+
 ## Not verified
 - The Hugging Face model cards can change; the MIT label on Ultravox v0.6 was read from its card, not from a license file.
 - The "CC BY-NC" badge image text on the silero-vad PyPI page contradicts its MIT license field; the repo LICENSE file

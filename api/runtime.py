@@ -8,12 +8,36 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from core.asr import HttpASR
 from core.metrics import METRICS
 from core.recorder import CallRecorder, write_wav16
 from core.session import Session, SessionConfig
 from core.turn import TurnConfig
 from . import tools as toolmod
 from .store import Store
+
+
+class _LlmWithASR:
+    """Use HttpASR for transcripts. `stream` and `eot_score` still go to the speech model.
+
+    Built only when VOX_ASR_URL is set, so VllmClient.transcribe is unchanged otherwise.
+    """
+
+    def __init__(self, inner, asr: HttpASR) -> None:
+        self._inner = inner
+        self._asr = asr
+
+    def stream(self, history, audio, followups, tools):
+        return self._inner.stream(history, audio, followups, tools)
+
+    def eot_score(self, history, audio):
+        return self._inner.eot_score(history, audio)
+
+    async def transcribe(self, audio) -> str:
+        return await self._asr.transcribe(audio)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 class LimitedTTS:
@@ -196,7 +220,11 @@ class Runtime:
         lim = int(os.environ.get("VOX_TTS_CONCURRENCY", "4"))
         if lim > 0:
             tts = LimitedTTS(tts, lim)
-        sess = Session(llm=self.llm, tts=tts, vad=self.make_vad(),
+        llm = self.llm
+        asr_url = os.environ.get("VOX_ASR_URL", "").strip()
+        if asr_url:
+            llm = _LlmWithASR(self.llm, HttpASR(asr_url, self.http))
+        sess = Session(llm=llm, tts=tts, vad=self.make_vad(),
                        send_audio=transport.send_audio, clear_audio=transport.clear, clock=self.clock,
                        cfg=scfg, tools=fns, on_event=on_event, eot_fn=self._eot_sync(),
                        eot_async=self._eot_async(), recorder=recorder, on_utterance=on_utt)

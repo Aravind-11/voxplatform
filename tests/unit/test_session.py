@@ -205,6 +205,26 @@ async def test_tool_call_does_not_run_until_turn_is_committed():
     assert r.tts.texts == ["Let me check.", "Booked for ten."]
 
 
+async def test_tool_round_sends_transcript_instead_of_reprefilling_audio():
+    async def lookup(args):
+        return {"slot": "10:00"}
+
+    llm = FakeLLM([["Let ", "me ", "check. ", ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["Booked ", "for ", "ten."]])
+    r = Rig(llm, tools={"lookup": lookup})
+    await r.frames("s", 15)
+    await r.frames("q", 8)
+    await r.settle()
+    await r.frames("q", 15)
+    await r.settle()
+    assert llm.calls[0]["n_audio"] > 0
+    assert llm.calls[1]["n_audio"] == 0
+    assert {"role": "user", "content": "caller said 1"} in llm.calls[1]["history"]
+    # the transcript is history, not a fake user turn shoved in front of the tool call
+    assert llm.calls[1]["followups"][0]["tool_calls"][0]["function"]["name"] == "lookup"
+    assert all(m.get("role") != "user" for m in llm.calls[1]["followups"])
+
+
 async def test_tool_call_cancelled_speculation_never_runs_tool():
     calls = []
 

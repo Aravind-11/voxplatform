@@ -301,6 +301,8 @@ class Session:
         self.history.append({"role": "assistant", "content": ""})
         user_idx = len(self.history) - 2
         self._transcript_task = asyncio.create_task(self._transcribe(gen.audio, user_idx))
+        gen.transcript_task = self._transcript_task   # so a later turn's task is not the one we await
+        gen.user_idx = user_idx
         gen.commit.set()
 
     async def _transcribe(self, audio: np.ndarray, idx: int) -> None:
@@ -317,19 +319,37 @@ class Session:
             except Exception as e:  # noqa: BLE001  (a dataset write must never break a call)
                 self._emit("error", where="utterance_sink", error=repr(e))
 
+    def _tool_round_history(self, gen: _Generation) -> list[dict]:
+        """This turn's caller audio, as text, prepended to the history the tool round sees.
+
+        `user_idx` is only set for an audio commit. Text turns (keypad) already have the user
+        message in `base_history`, so they are left as they are.
+        """
+        idx = getattr(gen, "user_idx", None)
+        if not isinstance(idx, int) or not (0 <= idx < len(self.history)):
+            return list(gen.base_history)
+        content = self.history[idx].get("content")
+        transcript = "[inaudible]" if content == "[caller audio]" else content
+        return [*gen.base_history, {"role": "user", "content": transcript}]
+
     async def _produce(self, gen: _Generation) -> None:
         followups: list[dict] = []
         try:
             if self._transcript_task and not self._transcript_task.done():
                 await self._transcript_task  # previous turn's transcript must be in history
                 gen.base_history = list(self.history[: len(gen.base_history)])
-            for _round in range(self.cfg.max_tool_rounds + 1):
+            for round_i in range(self.cfg.max_tool_rounds + 1):
                 chunker = SentenceChunker()
                 text_parts: list[str] = []
                 calls: list[ToolCall] = []
                 t_req, first_tok = self.clock(), True
-                async for item in self.llm.stream(gen.base_history, gen.audio, followups,
-                                                  self.cfg.tools_schema):
+                # One audio clip per request. Round 0 keeps this turn's audio; later rounds send the
+                # transcript (text) and must not re-prefill that clip. The user text stays out of followups.
+                if round_i == 0:
+                    hist, audio = gen.base_history, gen.audio
+                else:
+                    hist, audio = self._tool_round_history(gen), np.zeros(0, np.int16)
+                async for item in self.llm.stream(hist, audio, followups, self.cfg.tools_schema):
                     if isinstance(item, ToolCall):
                         calls.append(item)
                         continue
@@ -344,6 +364,9 @@ class Session:
                 if not calls:
                     break
                 await gen.commit.wait()  # never run side effects for an uncommitted reply
+                task = getattr(gen, "transcript_task", None)
+                if task is not None and task is self._transcript_task:
+                    await task
                 followups.append({"role": "assistant", "content": "".join(text_parts) or None,
                                   "tool_calls": [{"id": c.id, "type": "function",
                                                   "function": {"name": c.name,

@@ -23,6 +23,7 @@ import numpy as np
 from .audio import resample, pcm_duration_ms
 from .barge import PlaybackTracker, trim_history
 from .chunker import SentenceChunker
+from .history import fit_history
 from .turn import Ev, TurnConfig, TurnEvent, TurnManager
 
 FRAME_SAMPLES = 512   # 32 ms at 16 kHz (Silero VAD frame)
@@ -82,6 +83,8 @@ class SessionConfig:
     tools_schema: list[dict] = field(default_factory=list)
     greeting: str = ""                 # spoken by the agent as soon as the call connects (no model call)
     turn: TurnConfig = field(default_factory=TurnConfig)
+    max_context_tokens: int = 6000     # model context budget; the stored transcript is not trimmed to this
+    history_tail: int = 6              # recent messages kept verbatim when the budget replaces older turns
 
 
 class _Generation:
@@ -328,7 +331,9 @@ class Session:
                 text_parts: list[str] = []
                 calls: list[ToolCall] = []
                 t_req, first_tok = self.clock(), True
-                async for item in self.llm.stream(gen.base_history, gen.audio, followups,
+                # Fitted view for the model only. self.history (and the store transcript) stay complete.
+                model_history = fit_history(gen.base_history, self.cfg.max_context_tokens, self.cfg.history_tail)
+                async for item in self.llm.stream(model_history, gen.audio, followups,
                                                   self.cfg.tools_schema):
                     if isinstance(item, ToolCall):
                         calls.append(item)

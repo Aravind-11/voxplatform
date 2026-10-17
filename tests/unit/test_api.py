@@ -340,6 +340,24 @@ def test_hangUp_tool_ends_the_websocket_call_after_the_agent_has_spoken():
     assert [m["text"] for m in store.messages(call["id"]) if m["role"] == "agent"] == ["Goodbye now.", "Take care."]
 
 
+def test_agent_save_warns_when_tool_schemas_exceed_the_token_budget():
+    c, store, _ = make()
+    k, _ = tenant(c)
+    h = {"X-API-Key": k}
+    tools = [{"name": f"lookup_{i}", "description": "d" * 1000,
+              "parameters": {"type": "object", "properties": {"q": {"type": "string", "description": "x" * 200}}},
+              "http": {"url": f"https://api.example.com/t{i}"}} for i in range(8)]
+    r = c.post("/v1/agents", json={"name": "big", "tools": tools}, headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["warnings"] and "2000" in body["warnings"][0]
+    assert len(store.get_agent_any(body["id"])["config"]["tools"]) == 8
+    small = c.post("/v1/agents", json={"name": "small", "tools": ["hangUp"]}, headers=h)
+    assert small.status_code == 200 and "warnings" not in small.json()
+    patched = c.patch(f"/v1/agents/{small.json()['id']}", json={"tools": tools}, headers=h)
+    assert patched.status_code == 200 and patched.json()["warnings"]
+
+
 def test_agent_can_be_updated_in_place_and_new_calls_use_it():
     c, store, _ = make()
     k, _ = tenant(c)

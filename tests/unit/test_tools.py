@@ -58,6 +58,20 @@ def test_api_never_returns_header_values():
     assert "s3cret" not in out and "***" in out
 
 
+def test_large_tool_schemas_warn_but_are_not_rejected():
+    fat = []
+    for i in range(8):
+        fat.append({"name": f"lookup_{i}", "description": "d" * 1000,
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string", "description": "x" * 200}}},
+                    "http": {"url": f"https://api.example.com/t{i}"}})
+    specs = toolmod.validate_specs(fat)          # over the soft cap, still valid
+    schemas, _ = toolmod.build(specs)
+    assert toolmod.schema_tokens(schemas) > 2000
+    warning = toolmod.warn_schema_tokens(schemas)
+    assert warning and "2000" in warning
+    assert toolmod.warn_schema_tokens(toolmod.build(["hangUp"])[0]) is None
+
+
 def test_spec_list_rules():
     with pytest.raises(ToolConfigError):
         toolmod.validate_specs(["nope"])

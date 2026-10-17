@@ -237,6 +237,30 @@ async def test_noise_burst_triggers_nothing():
     assert llm.calls == [] and r.sent == []
 
 
+async def test_long_history_is_fitted_for_the_model_but_stored_in_full():
+    llm = FakeLLM([["Okay."]])
+    cfg = SessionConfig(max_context_tokens=200, tts_poll_s=0,
+                        system_prompt="You are a helpful receptionist.")
+    r = Rig(llm, cfg=cfg)
+    seeded = []
+    for i in range(60):
+        seeded.append({"role": "user", "text": f"user-{i:02d}-" + ("abcd" * 8)})
+        seeded.append({"role": "agent", "text": f"agent-{i:02d}-" + ("efgh" * 8)})
+    r.s.seed_history(seeded)
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    shown = llm.calls[0]["history"]
+    from core.history import estimate_messages
+    assert estimate_messages(shown) <= 200
+    assert shown[0]["content"].startswith("You are a helpful")
+    assert any(m["role"] == "user" and "user-59-" in m["content"] for m in shown)
+    stored_users = [m for m in r.s.history if m["role"] == "user" and str(m["content"]).startswith("user-")]
+    assert len(stored_users) == 60
+    assert not any(str(m.get("content", "")).startswith("Earlier in this call:") for m in r.s.history)
+    assert estimate_messages(r.s.history) > 200
+
+
 async def test_second_turn_history_contains_first_transcript():
     llm = FakeLLM([["First ", "reply."], ["Second ", "reply."]])
     r = Rig(llm)

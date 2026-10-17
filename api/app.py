@@ -44,6 +44,7 @@ class Settings:
     audiosocket_port: int = 0          # >0: listen for Asterisk AudioSocket connections (the SIP path) on this TCP port
     audiosocket_agent: str = ""        # agent id that answers calls arriving on that port
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
+    audiosocket_rate: int = 8000       # VOX_AUDIOSOCKET_RATE. 8000 keeps 320-byte frames; 16000 matches g722/slin16.
 
 
 class AgentIn(BaseModel):
@@ -860,7 +861,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             state["t"] = admit(call)
             return runtime.build_session(call, tr)
 
-        tr = AudioSocketTransport(reader, writer, factory)
+        tr = AudioSocketTransport(reader, writer, factory, sample_rate=settings.audiosocket_rate)
         tr.before_end = lambda: store.update_call(call["id"], end_reason="agent_hangup")
         try:
             await tr.run()

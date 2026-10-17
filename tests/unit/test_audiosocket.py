@@ -40,7 +40,7 @@ async def test_inbound_audio_uuid_dtmf_and_hangup():
     done = asyncio.Event()
 
     async def handler(r, w):
-        tr = A.AudioSocketTransport(r, w, factory)
+        tr = A.AudioSocketTransport(r, w, factory, sample_rate=8000)
         seen["tr"] = tr
         await tr.run()
         done.set()
@@ -70,7 +70,7 @@ async def test_outbound_audio_is_paced_at_real_time_and_clear_drops_the_queue():
     box = {}
 
     async def handler(r, w):
-        tr = A.AudioSocketTransport(r, w, factory)
+        tr = A.AudioSocketTransport(r, w, factory, sample_rate=8000)
         box["tr"] = tr
         await tr.run()
 
@@ -116,7 +116,7 @@ async def test_rejects_connection_that_does_not_start_with_uuid():
     done = asyncio.Event()
 
     async def handler(r, w):
-        await A.AudioSocketTransport(r, w, factory).run()
+        await A.AudioSocketTransport(r, w, factory, sample_rate=8000).run()
         done.set()
 
     srv, port = await serve(handler)
@@ -125,6 +125,45 @@ async def test_rejects_connection_that_does_not_start_with_uuid():
     await w.drain()
     await asyncio.wait_for(done.wait(), 2)
     assert not sess.started
+    srv.close()
+
+
+async def test_wideband_audiosocket_uses_640_byte_frames_and_does_not_resample():
+    """16 kHz AudioSocket frames are 640 bytes, and 16 kHz input is not resampled on the way to the session."""
+    from core.audio import StreamResampler
+    block = np.arange(320, dtype=np.int16)
+    assert len(StreamResampler(16000, 16000).push(block)) == len(block)
+
+    sess = StubSession()
+
+    async def factory(tr, custom):
+        return sess
+
+    box = {}
+
+    async def handler(r, w):
+        tr = A.AudioSocketTransport(r, w, factory, sample_rate=16000)
+        box["tr"] = tr
+        await tr.run()
+
+    srv, port = await serve(handler)
+    r, w = await asyncio.open_connection("127.0.0.1", port)
+    w.write(A.pack(A.KIND_UUID, uuid.uuid4().bytes))
+    payload = np.full(320, 1000, dtype="<i2").tobytes()
+    assert len(payload) == 640
+    w.write(A.pack(A.KIND_AUDIO, payload) + A.pack(A.KIND_AUDIO, payload))
+    await w.drain()
+    for _ in range(100):
+        if sess.frames:
+            break
+        await asyncio.sleep(0.01)
+    assert sess.frames and all(len(f) == 512 for f in sess.frames)
+    tr = box["tr"]
+    assert tr.out_rate == 16000
+    await tr.send_audio(np.full(16000, 700, dtype=np.int16), 16000)       # 1 s = 50 frames of 640 bytes
+    kind, got = await asyncio.wait_for(A.read_message(r), 1)
+    assert kind == A.KIND_AUDIO and len(got) == 640
+    await tr.end()
     srv.close()
 
 
@@ -147,7 +186,7 @@ def test_full_sip_call_through_the_app_creates_a_call_speaks_back_and_hangs_up()
     tid = store.create_tenant("a")
     ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "Hello from SIP", "tools": []})
     rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
-    settings = Settings(admin_key="adm", audiosocket_port=port, audiosocket_agent=ag["id"])
+    settings = Settings(admin_key="adm", audiosocket_port=port, audiosocket_agent=ag["id"], audiosocket_rate=8000)
     app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), None, settings)
     with TestClient(app):
         sock = socket.create_connection(("127.0.0.1", port), timeout=5)

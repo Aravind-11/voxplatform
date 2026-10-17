@@ -8,7 +8,7 @@
 
 ## How it works here
 ```
-caller -> VoxSun -- SIP/RTP --> Asterisk -- AudioSocket (TCP, 8 kHz audio) --> voice engine (this repo)
+caller -> VoxSun -- SIP/RTP --> Asterisk -- AudioSocket (TCP, 8 kHz or 16 kHz PCM) --> voice engine (this repo)
 ```
 Asterisk (open source) does the SIP and audio-over-IP work. The engine receives each call's audio over a plain TCP connection
 (`transports/audiosocket.py`) and runs the same agent, tools, interruption handling and storage as the Twilio path.
@@ -17,7 +17,7 @@ Calls are stored with medium `sip`.
 ## What is verified and what is not
 | Part | State |
 |---|---|
-| AudioSocket transport: message format, 8 kHz audio in, paced real-time audio out, interruption (queue cleared), DTMF in, hangup both ways | **tested** (4 unit tests incl. a simulated Asterisk talking to the real app; no real Asterisk) |
+| AudioSocket transport: message format, 8 kHz or 16 kHz (`VOX_AUDIOSOCKET_RATE`, g722/slin16) audio in, paced real-time audio out, interruption (queue cleared), DTMF in, hangup both ways | **tested** (unit tests incl. a simulated Asterisk talking to the real app; no real Asterisk) |
 | `VOX_AUDIOSOCKET_*` settings and the call lifecycle (create, admit, session, finish, webhook) | **tested** with the simulated Asterisk |
 | Asterisk config (`deploy/sip/`), `deploy/Dockerfile.asterisk`, compose `asterisk` service (profile `sip`) | **written from Asterisk's documentation, never run**: compose file parses; no Asterisk was available here |
 | Real call from VoxSun | **not done**: needs VoxSun credentials and a test number |

@@ -21,6 +21,7 @@
   VOX_NO_ESPEAK=1          run Kokoro without the GPL espeak-ng fallback (English only; Spanish/French/Italian/Portuguese/Hindi need espeak)
   VOX_PRELOAD_LANGS        Kokoro language codes to load at start-up, default a (a,b English; e,f,h,i,p,j,z others; see docs/LANGUAGES.md)
   VOX_AUDIOSOCKET_PORT / VOX_AUDIOSOCKET_AGENT / VOX_AUDIOSOCKET_HOST   SIP path: TCP port Asterisk streams call audio to, and the agent id that answers (docs/SIP.md)
+  VOX_AUDIOSOCKET_RATE     AudioSocket PCM rate (8000 ulaw, or 16000 with g722/slin16). Default 8000.
   VOX_ALLOW_UNSIGNED_TWILIO=1   development only
   VOX_EOT, VOX_EOT_THRESHOLD, VOX_END_MS, VOX_PATIENT_MS, VOX_TTS_CONCURRENCY, VOX_LOG_EVENTS: see docs/TUNING.md
 Run: uvicorn api.main:app --host 0.0.0.0 --port 8080   (put TLS in front; Twilio needs wss)."""
@@ -55,7 +56,8 @@ def build():
                         default_concurrency=int(env.get("VOX_DEFAULT_CONCURRENCY", "10")),
                         audiosocket_port=int(env.get("VOX_AUDIOSOCKET_PORT", "0")),
                         audiosocket_agent=env.get("VOX_AUDIOSOCKET_AGENT", ""),
-                        audiosocket_host=env.get("VOX_AUDIOSOCKET_HOST", "127.0.0.1"))
+                        audiosocket_host=env.get("VOX_AUDIOSOCKET_HOST", "127.0.0.1"),
+                        audiosocket_rate=int(env.get("VOX_AUDIOSOCKET_RATE", "8000")))
     store = Store(env.get("VOX_DB", "vox.db"))
     from core.tts import PipelineSet
     pipelines = PipelineSet(preload=env.get("VOX_PRELOAD_LANGS", "a"))   # one front end per language, shared by all calls

@@ -64,6 +64,40 @@ def test_inbound_phone_calls_get_caller_number_and_empty_unknowns():
     assert rt.build_session(call, T()).history[0]["content"] == "Caller +15551230000 dialled +15559990000. "
 
 
+def test_narrowband_prompt_asks_for_a_readback_and_wideband_does_not():
+    from transports.audiosocket import AudioSocketTransport
+    from transports.browser import BrowserTransport
+    from transports.twilio import TwilioTransport
+    sentence = "This call is narrowband telephone audio. Spell back any name and read back any number before you use it."
+    assert TwilioTransport.narrowband is True and BrowserTransport.narrowband is False
+    phone = AudioSocketTransport(None, None, None)
+    assert phone.narrowband is True
+    phone.out_rate = 16000
+    assert phone.narrowband is False
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    tid = store.create_tenant("t")
+    call = store.create_call(tid, None, "twilio", {"systemPrompt": "Be brief."}, {})
+
+    class Narrow:
+        out_rate = 8000
+        narrowband = True
+        async def send_audio(self, b): ...
+        async def clear(self): ...
+        async def end(self): ...
+
+    class Wide:
+        out_rate = 16000
+        narrowband = False
+        async def send_audio(self, b): ...
+        async def clear(self): ...
+        async def end(self): ...
+
+    got = rt.build_session(call, Narrow()).history[0]["content"]
+    assert got.startswith("Be brief.") and sentence in got
+    assert rt.build_session(call, Wide()).history[0]["content"] == "Be brief."
+
+
 # ------------------------------------------------------- HTTP tool: path + query
 @pytest.fixture
 def allow_private(monkeypatch):

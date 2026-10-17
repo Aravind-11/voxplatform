@@ -45,6 +45,11 @@ async def read_message(reader: asyncio.StreamReader) -> tuple[int, bytes]:
 class AudioSocketTransport:
     out_rate = 8000
 
+    @property
+    def narrowband(self) -> bool:
+        """True at 8 kHz. A 16 kHz stream is wideband; this does not invent the frequencies a codec removed."""
+        return self.out_rate < 16000
+
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, session_factory: SessionFactory):
         self.reader, self.writer = reader, writer
         self.session_factory = session_factory

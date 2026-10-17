@@ -29,6 +29,7 @@ DTMF_IDLE_S = 2.0           # keypad digits are handed to the agent as one turn 
 
 class TwilioTransport:
     out_rate = 8000
+    narrowband = True          # mulaw is 8 kHz; nothing above 4 kHz is on the wire
 
     def __init__(self, ws, session_factory: SessionFactory):
         self.ws = ws                      # needs: async receive_text() / async send_text(str)

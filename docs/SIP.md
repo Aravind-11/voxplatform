@@ -37,4 +37,5 @@ Without Docker: install Asterisk 18+ (needs the AudioSocket modules), copy the f
 - **Security:** the AudioSocket port has no authentication. Keep it on a private network and never publish it.
 - **Outbound calls over SIP** (through VoxSun's `calls/initiate`) are not built.
 - **Open ports for Asterisk:** UDP 5060 and the RTP range 10000-10100. Behind NAT, set the public address in `pjsip.conf`.
+- **8 kHz band:** when the carrier offers wideband (G.722), use it; a narrowband codec has already dropped everything above 4 kHz and the engine cannot restore those frequencies.
 - Asterisk is GPL-2.0 software run as a separate program; this repo does not include or link it. Get the same licence check you would for any GPL component.

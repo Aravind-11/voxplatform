@@ -169,6 +169,9 @@ class Runtime:
             name = LANG_NAME[cfg["language"]]
             prompt += (f"\n\nAlways speak and reply in {name}, whatever language the caller uses; "
                        f"if they speak another language, politely stay in {name}.")
+        if getattr(transport, "narrowband", False):
+            prompt += ("\n\nThis call is narrowband telephone audio. Spell back any name and read back any number "
+                       "before you use it.")
         scfg = SessionConfig(system_prompt=prompt,
                              out_rate=transport.out_rate, tools_schema=schemas,
                              greeting=(RESUME_PHRASE.get(cfg.get("language") or "en", RESUME_PHRASE["en"]) if resumed

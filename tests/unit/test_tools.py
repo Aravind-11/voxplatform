@@ -47,6 +47,19 @@ def test_invalid_definitions_are_rejected_at_creation(bad):
         http_tools.validate(bad)
 
 
+def test_filler_text_is_stored_and_hidden_from_the_model():
+    d = http_tools.validate(good(fillerText="Checking that order."))
+    assert d["fillerText"] == "Checking that order."
+    shown = json.dumps(http_tools.schema(d))
+    assert "fillerText" not in shown and "Checking that order." not in shown
+    assert "fillerText" not in http_tools.validate(good())
+    assert toolmod.filler_texts([good(fillerText="Checking that order.")]) == {"lookup_order": "Checking that order."}
+    with pytest.raises(ToolConfigError):
+        http_tools.validate(good(fillerText="x" * 201))
+    with pytest.raises(ToolConfigError):
+        http_tools.validate(good(fillerText=12))
+
+
 def test_model_sees_only_name_description_and_parameters():
     s = json.dumps(http_tools.schema(http_tools.validate(good())))
     for secret in ("s3cret", "api.example.com", "acme", "Authorization"):

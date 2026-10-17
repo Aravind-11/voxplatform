@@ -8,7 +8,8 @@ An agent's `tools` list holds names (demo tools, built-ins such as "hangUp") or 
             "headers": {"Authorization": "Bearer sk-..."}, "timeoutS": 8},
    "static": {"tenant": "acme"},            # always sent, never shown to the model, cannot be overridden by it
    "automatic": ["callId", "from"],         # filled in by the platform: callId, from, to, callSid
-   "confirm": true}                         # side-effect tool: agent must read details back and get a yes first
+   "confirm": true,                         # side-effect tool: agent must read details back and get a yes first
+   "fillerText": "Let me look that up."}    # optional; spoken if the call runs long. Not shown to the model.
 
 Parameter kinds mirror the paid product: dynamic (the model fills them: `parameters`), static, automatic.
 A tool's HTTP response goes back to the model. A response header `X-Vox-Response-Type: hang-up`
@@ -92,14 +93,22 @@ def validate(defn: dict) -> dict:
     auto = defn.get("automatic", []) or []
     if not isinstance(auto, list) or not set(auto) <= AUTOMATIC:
         raise ToolConfigError(f"tool {name}: automatic must be a subset of {sorted(AUTOMATIC)}")
-    return {"name": name, "description": desc.strip(), "parameters": params,
-            "http": {"url": http["url"], "method": method, "headers": headers, "timeoutS": timeout,
-                     "query": list(query_names)},
-            "static": static, "automatic": list(auto), "confirm": bool(defn.get("confirm", False))}
+    filler = defn.get("fillerText", "")
+    if filler is None:
+        filler = ""
+    if not isinstance(filler, str) or len(filler) > 200:
+        raise ToolConfigError(f"tool {name}: fillerText must be a string of at most 200 characters")
+    out = {"name": name, "description": desc.strip(), "parameters": params,
+           "http": {"url": http["url"], "method": method, "headers": headers, "timeoutS": timeout,
+                    "query": list(query_names)},
+           "static": static, "automatic": list(auto), "confirm": bool(defn.get("confirm", False))}
+    if filler.strip():
+        out["fillerText"] = filler
+    return out
 
 
 def schema(defn: dict) -> dict:
-    """What the model sees: name, description and the model-filled parameters only. Never URL, headers or static."""
+    """What the model sees: name, description and the model-filled parameters only. Never URL, headers, static or fillerText."""
     return {"type": "function", "function": {"name": defn["name"], "description": defn["description"],
                                               "parameters": defn["parameters"]}}
 

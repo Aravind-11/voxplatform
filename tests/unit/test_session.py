@@ -205,6 +205,52 @@ async def test_tool_call_does_not_run_until_turn_is_committed():
     assert r.tts.texts == ["Let me check.", "Booked for ten."]
 
 
+async def test_slow_tool_speaks_its_filler_before_returning():
+    release = asyncio.Event()
+    seen = {}
+
+    async def lookup(args):
+        await release.wait()
+        seen["texts"] = list(r.tts.texts)
+        return {"slot": "10:00"}
+
+    llm = FakeLLM([["Let me check. ", ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["Booked for ten."]])
+    phrase = "Checking that order."
+    r = Rig(llm, tools={"lookup": lookup},
+            cfg=SessionConfig(tts_poll_s=0, filler_delay_s=0.01, tool_fillers={"lookup": phrase}))
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    try:
+        for _ in range(100):
+            if phrase in r.tts.texts:
+                break
+            await asyncio.sleep(0.01)
+        await r.settle()
+        assert phrase in r.tts.texts
+        assert "One moment, let me check that." not in r.tts.texts
+    finally:
+        release.set()
+    await r.settle()
+    assert phrase in seen["texts"]          # synthesized while the tool was still blocked
+    assert "Booked for ten." in r.tts.texts
+
+
+async def test_fast_tool_does_not_speak_a_filler():
+    async def lookup(args):
+        return {"slot": "10:00"}
+
+    llm = FakeLLM([["Let me check. ", ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["Booked for ten."]])
+    r = Rig(llm, tools={"lookup": lookup}, cfg=SessionConfig(tts_poll_s=0, filler_delay_s=0.01))
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    await asyncio.sleep(0.05)               # longer than filler_delay_s; the sleeper was cancelled
+    assert "One moment, let me check that." not in r.tts.texts
+    assert r.tts.texts == ["Let me check.", "Booked for ten."]
+
+
 async def test_tool_call_cancelled_speculation_never_runs_tool():
     calls = []
 

@@ -49,6 +49,27 @@ def test_call_needs_every_variable_and_values_reach_the_prompt():
     assert sess.cfg.greeting == "Hi Dana!"
 
 
+def test_filler_text_on_a_tool_spec_is_passed_to_the_session():
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    tid = store.create_tenant("t")
+    tool = {"name": "lookup_order", "description": "Find an order.",
+            "parameters": {"type": "object", "properties": {}},
+            "http": {"url": "https://api.example.com/orders"},
+            "fillerText": "Checking that order."}
+    call = store.create_call(tid, None, "webSocket", {"systemPrompt": "Be brief.", "tools": [tool]}, {})
+
+    class T:
+        out_rate = 8000
+        async def send_audio(self, b): ...
+        async def clear(self): ...
+        async def end(self): ...
+
+    sess = rt.build_session(call, T())
+    assert sess.cfg.tool_fillers == {"lookup_order": "Checking that order."}
+    assert sess.cfg.filler_text == "One moment, let me check that."
+
+
 def test_inbound_phone_calls_get_caller_number_and_empty_unknowns():
     store = Store()
     rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)

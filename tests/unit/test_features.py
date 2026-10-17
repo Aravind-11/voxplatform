@@ -438,6 +438,38 @@ def test_recorder_queues_back_to_back_agent_audio():
     assert st[0, 1] == 7 and st[1599, 1] == 7 and st[1600, 1] == 9 and len(st) == 3200
 
 
+def test_streaming_recorder_writes_wav_before_save_and_bounds_memory(tmp_path):
+    t = [0.0]
+    part = tmp_path / "c.part.wav"
+    rec = CallRecorder(clock=lambda: t[0], path=str(part))
+    assert part.stat().st_size == 44                                # file exists before any audio
+    frame = np.full(512, 1000, np.int16)
+    for _ in range(200):
+        rec.mic(frame)
+        t[0] += 512 / 16000
+    assert len(rec.left) <= 2
+    rec.agent(np.full(16000, 2000, np.int16), 16000)               # extends past the caller track
+    data_bytes = int.from_bytes(part.read_bytes()[40:44], "little")
+    with wave.open(str(part)) as w:
+        assert w.getnchannels() == 2 and w.getframerate() == 16000
+        assert w.getnframes() * 4 == data_bytes and part.stat().st_size == 44 + data_bytes
+        assert w.getnframes() == 200 * 512 + 16000
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").reshape(-1, 2)
+    assert pcm[0, 0] == 1000 and pcm[200 * 512, 1] == 2000 and pcm[200 * 512 - 1, 1] == 0
+    t[0] += 0.25
+    rec.clear()
+    with wave.open(str(part)) as w:
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").reshape(-1, 2)
+    now = int(t[0] * 16000)
+    assert len(pcm) == now and pcm[:, 1].nonzero()[0].max() < now
+    final = tmp_path / "c.wav"
+    secs = rec.save(str(final))
+    assert final.is_file() and not part.exists()
+    assert secs == pytest.approx(now / 16000)
+    with wave.open(str(final)) as w:
+        assert w.getnframes() == now and w.getnchannels() == 2
+
+
 def test_recording_end_to_end_and_download(tmp_path, monkeypatch):
     monkeypatch.setenv("VOX_RECORD_DIR", str(tmp_path))
     from test_api import speech, silence

@@ -127,9 +127,14 @@ def with_confirmation(fn, schema: dict, ctx):
         key, turn = _canon(args), ctx.turn_fn()
         transcript = ctx.last_user_text()
         if confirmed and key in pending and pending[key] < turn and _is_affirmative(transcript):
-            pending.pop(key)
-            ctx.audit("tool.confirmed", {"name": name, "args": dict(args), "transcript": transcript})
-            return await fn(args)
+            detail = {"name": name, "args": dict(args), "transcript": transcript}
+            result = await fn(args)
+            pending.pop(key)  # a raise leaves the proposal; a failed audit must not undo this
+            try:
+                ctx.audit("tool.confirmed", detail)
+            except Exception:  # noqa: BLE001 (a logging failure is not the tool result)
+                pass
+            return result
         pending[key] = turn
         return {"executed": False,
                 "next_step": ("NOT DONE YET. Read these details back to the caller in one short sentence and ask them "

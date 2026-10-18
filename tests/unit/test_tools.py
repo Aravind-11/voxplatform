@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import httpx
 import pytest
@@ -248,6 +249,72 @@ async def test_confirmation_in_a_later_turn_with_same_details_runs_it_once():
     assert again["executed"] is False and len(ctx.audit_log) == 1            # one confirmation = one action
 
 
+async def test_failed_audit_returns_the_tool_result_and_does_not_repeat_it():
+    ctx = Ctx()
+    ctx.turn = 0
+    ctx.turn_fn = lambda: ctx.turn
+    ctx.last_user_text = lambda: "yes, that's right"
+    ctx.audit_log = []
+    ctx.audit = lambda action, detail: ctx.audit_log.append((action, detail))
+    calls = []
+
+    async def book(args):
+        calls.append(dict(args))
+        return {"booked": True, "day": args["day"], "time": args["time"]}
+
+    schema = {"type": "function", "function": {
+        "name": "book_slot", "description": "Book an appointment slot.",
+        "parameters": {"type": "object", "properties": {
+            "day": {"type": "string"}, "time": {"type": "string"}}, "required": ["day", "time"]}}}
+    _, run = toolmod.with_confirmation(book, schema, ctx)
+    assert (await run({"day": "tuesday", "time": "11:00"}))["executed"] is False
+    assert calls == []
+    ctx.turn = 1
+
+    def boom(action, detail):
+        raise sqlite3.ProgrammingError("Cannot operate on a closed database")
+
+    ctx.audit = boom
+    out = await run({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert out == {"booked": True, "day": "tuesday", "time": "11:00"}
+    assert calls == [{"day": "tuesday", "time": "11:00"}]                     # ran even though the audit insert failed
+    assert ctx.audit_log == []
+    again = await run({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert again["executed"] is False and calls == [{"day": "tuesday", "time": "11:00"}]
+
+
+async def test_raising_tool_writes_no_audit_and_same_turn_retry_runs():
+    ctx = Ctx()
+    ctx.turn = 0
+    ctx.turn_fn = lambda: ctx.turn
+    ctx.last_user_text = lambda: "yes, that's right"
+    ctx.audit_log = []
+    ctx.audit = lambda action, detail: ctx.audit_log.append((action, detail))
+    calls = {"n": 0}
+
+    async def flaky(args):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("upstream down")
+        return {"ok": True, "day": args["day"]}
+
+    schema = {"type": "function", "function": {
+        "name": "book_slot", "description": "Book an appointment slot.",
+        "parameters": {"type": "object", "properties": {
+            "day": {"type": "string"}, "time": {"type": "string"}}, "required": ["day", "time"]}}}
+    _, run = toolmod.with_confirmation(flaky, schema, ctx)
+    await run({"day": "tuesday", "time": "11:00"})
+    ctx.turn = 1
+    with pytest.raises(RuntimeError, match="upstream down"):
+        await run({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert calls["n"] == 1 and ctx.audit_log == []                            # the failed attempt is not tool.confirmed
+    out = await run({"day": "tuesday", "time": "11:00", "confirmed": True})   # same caller turn can still run it
+    assert out == {"ok": True, "day": "tuesday"} and calls["n"] == 2
+    assert len(ctx.audit_log) == 1 and ctx.audit_log[0][0] == "tool.confirmed"
+    assert (await run({"day": "tuesday", "time": "11:00", "confirmed": True}))["executed"] is False
+    assert len(ctx.audit_log) == 1
+
+
 async def test_changed_details_after_confirmation_must_be_confirmed_again():
     ctx, _, run = _confirmed_booker()
     await run({"day": "tuesday", "time": "11:00"})
@@ -351,6 +418,41 @@ async def test_runtime_confirms_from_the_latest_user_line_and_writes_audit():
     assert rows[0]["actor"] == "tool" and rows[0]["action"] == "tool.confirmed" and rows[0]["target"] == call["id"]
     assert rows[0]["detail"] == {"name": "book_slot", "args": {"day": "tuesday", "time": "11:00"},
                                  "transcript": "yes, that's right"}
+
+
+async def test_closed_store_audit_still_returns_the_booking_once():
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    tid = store.create_tenant("t")
+    call = store.create_call(tid, None, "web",
+                             {"systemPrompt": "p", "tools": [{"tool": "book_slot", "confirm": True}]}, {})
+
+    class T:
+        out_rate = 24000
+
+        async def send_audio(self, pcm, rate):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            return None
+
+    sess = rt.build_session(call, T())
+    fn = sess.tools["book_slot"]
+    assert (await fn({"day": "tuesday", "time": "11:00"}))["executed"] is False
+    sess.stats["turns"] = 1
+    sess.history.append({"role": "user", "content": "yes, that's right"})
+    store.close()
+    out = await fn({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert out == {"booked": True, "day": "tuesday", "time": "11:00"}
+    again = await fn({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert again["executed"] is False and "booked" not in again
 
 
 def test_tool_options_validate():

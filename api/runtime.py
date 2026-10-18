@@ -201,11 +201,14 @@ class Runtime:
             if e["type"] in ("llm_first_token", "tts_done", "agent_first_audio", "tool_result"):
                 ms = e["ms"] if "ms" in e else e.get("latency_ms")
                 if ms is not None:
-                    turn = int(sess.stats["turns"])
-                    gen = sess._gen
-                    if gen is not None and not gen.committed:
-                        turn += 1
-                    store.add_timing(cid, turn, e["type"], ms, time.time())
+                    try:
+                        turn = int(sess.stats["turns"])
+                        gen = sess._gen
+                        if gen is not None and not gen.committed:
+                            turn += 1
+                        store.add_timing(cid, turn, e["type"], ms, time.time())
+                    except Exception:  # noqa: BLE001  (a timings write must never break the call)
+                        METRICS.inc("vox_errors_total", where="timings")
             if forward_events and hasattr(transport, "send_event"):
                 import asyncio
                 asyncio.get_running_loop().create_task(transport.send_event(e))

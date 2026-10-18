@@ -1,7 +1,59 @@
-# Asterisk as the SIP front end (docs/SIP.md). Written, not built here (container registries are blocked in the build environment).
+# Asterisk as the SIP front end (docs/SIP.md).
+# Bookworm and trixie ship no asterisk package. Asterisk 20.6, which is what
+# "install Asterisk 18+" gets on Ubuntu, reads AudioSocket kinds 0x00 and 0x10
+# only, so this dialplan's slin16 frames (kind 0x12, 640 bytes) are discarded
+# and the agent is silent. Kinds 0x11-0x18 landed in 20.17, 21.12, and 22.7.
+# 22.11 plays them. Written, not built here (registries are blocked).
 FROM debian:12-slim
-RUN apt-get update && apt-get install -y --no-install-recommends asterisk asterisk-modules ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+
+ARG ASTERISK_VERSION=22.11.0
+ARG ASTERISK_SHA256=3bd5ee040509a3d3cd9b1ba9520c18e6ec0a7e7981ca68c457dcd36ba3c54d94
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential pkg-config \
+        libedit-dev libjansson-dev libsqlite3-dev uuid-dev libxml2-dev \
+        libssl-dev libncurses-dev \
+        curl ca-certificates bzip2 patch \
+        libedit2 libjansson4 libsqlite3-0 libxml2 libssl3 libuuid1 libncurses6; \
+    f=/tmp/asterisk.tar.gz; \
+    curl -fsSL -o "$f" "https://downloads.asterisk.org/pub/telephony/asterisk/releases/asterisk-${ASTERISK_VERSION}.tar.gz" \
+        || curl -fsSL -o "$f" "https://downloads.asterisk.org/pub/telephony/asterisk/asterisk-${ASTERISK_VERSION}.tar.gz" \
+        || curl -fsSL -o "$f" "https://downloads.asterisk.org/pub/telephony/asterisk/old-releases/asterisk-${ASTERISK_VERSION}.tar.gz"; \
+    echo "${ASTERISK_SHA256}  $f" | sha256sum -c -; \
+    mkdir -p /tmp/asterisk-src; \
+    tar -xzf "$f" -C /tmp/asterisk-src --strip-components=1; \
+    cd /tmp/asterisk-src; \
+    ./configure --with-pjproject-bundled --with-ssl=ssl --with-crypto; \
+    make menuselect; \
+    menuselect/menuselect --disable BUILD_NATIVE menuselect.makeopts; \
+    menuselect/menuselect --disable-category MENUSELECT_CORE_SOUNDS menuselect.makeopts; \
+    menuselect/menuselect --disable-category MENUSELECT_MOH menuselect.makeopts; \
+    menuselect/menuselect --disable-category MENUSELECT_EXTRA_SOUNDS menuselect.makeopts; \
+    menuselect/menuselect --enable chan_audiosocket menuselect.makeopts; \
+    menuselect/menuselect --enable res_audiosocket menuselect.makeopts; \
+    menuselect/menuselect --enable chan_pjsip menuselect.makeopts; \
+    menuselect/menuselect --enable res_pjsip menuselect.makeopts; \
+    menuselect/menuselect --enable codec_g722 menuselect.makeopts; \
+    make -j"$(nproc)"; \
+    make install; \
+    make samples; \
+    test -f /usr/lib/asterisk/modules/chan_audiosocket.so; \
+    test -f /usr/lib/asterisk/modules/res_audiosocket.so; \
+    test -f /usr/lib/asterisk/modules/codec_g722.so; \
+    apt-get purge -y --auto-remove \
+        build-essential pkg-config \
+        libedit-dev libjansson-dev libsqlite3-dev uuid-dev libxml2-dev \
+        libssl-dev libncurses-dev \
+        curl bzip2 patch; \
+    if ldd /usr/sbin/asterisk | grep 'not found'; then exit 1; fi; \
+    if find /usr/lib/asterisk/modules -name '*.so' -exec ldd {} + | grep 'not found'; then exit 1; fi; \
+    useradd --system --user-group --home-dir /var/lib/asterisk --no-create-home asterisk; \
+    mkdir -p /var/run/asterisk /var/log/asterisk /var/spool/asterisk /var/lib/asterisk; \
+    chown -R asterisk:asterisk /var/run/asterisk /var/log/asterisk /var/spool/asterisk /var/lib/asterisk /etc/asterisk; \
+    rm -rf /tmp/asterisk-src /tmp/asterisk.tar.gz /var/lib/apt/lists/*
+
 COPY sip/pjsip.conf sip/extensions.conf sip/modules.conf sip/rtp.conf /etc/asterisk/
 EXPOSE 5060/udp 10000-10100/udp
-CMD ["asterisk", "-f", "-U", "asterisk", "-G", "asterisk"]
+CMD ["/usr/sbin/asterisk", "-f", "-U", "asterisk", "-G", "asterisk"]

@@ -1,4 +1,5 @@
 import asyncio
+import re
 import struct
 import time
 import uuid
@@ -132,7 +133,7 @@ async def test_wideband_audiosocket_uses_640_byte_frames_and_does_not_resample()
     """16 kHz AudioSocket frames are 640 bytes, and 16 kHz input is not resampled on the way to the session."""
     from core.audio import StreamResampler
     block = np.arange(320, dtype=np.int16)
-    assert len(StreamResampler(16000, 16000).push(block)) == len(block)
+    assert np.array_equal(StreamResampler(16000, 16000).push(block), block)
 
     sess = StubSession()
 
@@ -157,7 +158,9 @@ async def test_wideband_audiosocket_uses_640_byte_frames_and_does_not_resample()
         if sess.frames:
             break
         await asyncio.sleep(0.01)
-    assert sess.frames and all(len(f) == 512 for f in sess.frames)
+    # 640 samples at 16 kHz fill one 512-sample frame. Upsampling them as 8 kHz yields two.
+    assert len(sess.frames) == 1, f"expected one unresampled frame, got {len(sess.frames)}"
+    assert np.array_equal(sess.frames[0], np.full(512, 1000, dtype=np.int16))
     tr = box["tr"]
     assert tr.out_rate == 16000
     await tr.send_audio(np.full(16000, 700, dtype=np.int16), 16000)       # 1 s = 50 frames of 640 bytes
@@ -247,6 +250,105 @@ def test_full_sip_call_through_the_app_creates_a_call_speaks_back_and_hangs_up()
             buf += sock.recv(4096)
             got_audio = len(buf) >= 3 + 320 and buf[0] == A.KIND_AUDIO
         assert got_audio, "the greeting should arrive as AudioSocket audio frames"
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        for _ in range(100):
+            calls = store.list_calls(tid)
+            if calls and calls[0]["status"] == "ended":
+                break
+            time.sleep(0.05)
+        assert calls[0]["medium"] == "sip" and calls[0]["status"] == "ended"
+
+
+def _asterisk_plays_slin16(major: int, minor: int) -> bool:
+    """Kinds 0x11-0x18 (0x12 is 16 kHz slin) shipped in 20.17, 21.12, and 22.7."""
+    if major > 22:
+        return True
+    if major == 22:
+        return minor >= 7
+    if major == 21:
+        return minor >= 12
+    if major == 20:
+        return minor >= 17
+    return False
+
+
+def test_asterisk_image_plays_slin16_and_bare_metal_sets_the_rate():
+    """Debian 12 has no asterisk package, and 20.6 drops kind 0x12. The image must build a release that plays it,
+    and the non-docker command must ask the engine for 16 kHz or TTS stays 8 kHz against a slin16 dialplan."""
+    docker = open("deploy/Dockerfile.asterisk", encoding="utf-8").read()
+    m = re.search(r"(?m)^ARG\s+ASTERISK_VERSION=(\d+)\.(\d+)\.(\d+)\s*$", docker)
+    assert m, "Dockerfile.asterisk must pin ASTERISK_VERSION"
+    major, minor = int(m.group(1)), int(m.group(2))
+    assert _asterisk_plays_slin16(major, minor), (major, minor)
+    assert "downloads.asterisk.org" in docker
+    assert "asterisk-${ASTERISK_VERSION}.tar.gz" in docker
+    assert "chan_audiosocket" in docker and "res_audiosocket" in docker
+    flat = docker.replace("\\\n", " ")
+    installs = re.findall(r"apt-get\s+install\b([^;&|]*)", flat)
+    assert installs, "Dockerfile.asterisk lost its package install"
+    for blob in installs:
+        pkgs = {tok.split("=")[0] for tok in blob.split() if not tok.startswith("-")}
+        assert "asterisk" not in pkgs and "asterisk-modules" not in pkgs
+    sip = open("docs/SIP.md", encoding="utf-8").read()
+    bare = next(ln for ln in sip.splitlines() if ln.startswith("Without Docker:"))
+    assert "18+" not in bare
+    assert "20.17" in bare and "21.12" in bare and "22.7" in bare
+    assert "VOX_AUDIOSOCKET_PORT=9092" in bare
+    assert "VOX_AUDIOSOCKET_AGENT=" in bare
+    assert "VOX_AUDIOSOCKET_HOST=127.0.0.1" in bare
+    assert "VOX_AUDIOSOCKET_RATE=16000" in bare
+
+
+def test_wideband_sip_call_through_the_app_speaks_kind_0x12_at_the_session_rate():
+    """create_app must pass audiosocket_rate into the transport and build_session must copy out_rate.
+    The greeting is then kind 0x12, 640 bytes, not an 8 kHz frame Asterisk would play at half speed."""
+    import socket
+    from fastapi.testclient import TestClient
+    from api import security
+    from api.app import Settings, create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    tid = store.create_tenant("a")
+    ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "Hello from SIP", "tools": []})
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    settings = Settings(admin_key="adm", audiosocket_port=port, audiosocket_agent=ag["id"], audiosocket_rate=16000)
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), None, settings)
+    with TestClient(app):
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.sendall(A.pack(A.KIND_UUID, uuid.uuid4().bytes))
+        sock.settimeout(5)
+        buf, audio = b"", None
+        end = time.time() + 5
+        while time.time() < end and audio is None:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while len(buf) >= 3 and audio is None:
+                kind, n = struct.unpack_from(">BH", buf)
+                if len(buf) < 3 + n:
+                    break
+                payload, buf = buf[3:3 + n], buf[3 + n:]
+                if kind in (A.KIND_AUDIO, A.KIND_SLIN16):
+                    audio = (kind, payload)
+        assert audio is not None, "the greeting should arrive as an AudioSocket audio frame"
+        kind, payload = audio
+        assert kind == A.KIND_SLIN16 == 0x12 and len(payload) == 640
+        assert abs(int(np.median(np.frombuffer(payload, dtype="<i2"))) - 500) < 50
+        assert rt.live, "build_session did not keep the live session"
+        for sess, tr in rt.live.values():
+            assert sess.cfg.out_rate == 16000 and tr.out_rate == 16000
         sock.sendall(A.pack(A.KIND_HANGUP))
         sock.close()
         for _ in range(100):

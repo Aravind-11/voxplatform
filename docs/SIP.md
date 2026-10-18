@@ -29,7 +29,7 @@ Calls are stored with medium `sip`.
 4. Check: `docker compose exec asterisk asterisk -rx "pjsip show registrations"` and `... "module show like audiosocket"`.
 5. Call the VoxSun number. In the engine logs you should see a new `sip` call.
 
-Without Docker: install Asterisk 18+ (needs the AudioSocket modules), copy the four files from `deploy/sip/` to `/etc/asterisk/`, and run the engine with `VOX_AUDIOSOCKET_PORT=9092 VOX_AUDIOSOCKET_AGENT=<id> VOX_AUDIOSOCKET_HOST=127.0.0.1` (change `api1:9092` in `extensions.conf` to `127.0.0.1:9092`).
+Without Docker: install Asterisk 20.17+, 21.12+, or 22.7+ (needs the AudioSocket channel modules; older releases drop kind 0x12 and the agent is silent), copy the four files from `deploy/sip/` to `/etc/asterisk/`, and run the engine with `VOX_AUDIOSOCKET_PORT=9092 VOX_AUDIOSOCKET_AGENT=<id> VOX_AUDIOSOCKET_HOST=127.0.0.1 VOX_AUDIOSOCKET_RATE=16000` (change `api1:9092` in `extensions.conf` to `127.0.0.1:9092`).
 
 ## Known limits
 - **Caller number is not passed:** AudioSocket carries only a call UUID. The agent does not know who is calling until we add it (Asterisk can pass it another way; not built).

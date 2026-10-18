@@ -129,7 +129,6 @@ class Runtime:
         cfg = call["config"]
         meta = call.get("metadata") or {}
         if isinstance(meta, str):
-            import json
             meta = json.loads(meta or "{}")
         sid, token = os.environ.get("TWILIO_ACCOUNT_SID", ""), os.environ.get("TWILIO_AUTH_TOKEN", "")
         ctx = toolmod.CallContext(call_id=call["id"], caller=str(meta.get("from", "")), callee=str(meta.get("to", "")),
@@ -146,6 +145,7 @@ class Runtime:
         rec_dir = self.record_dir or os.environ.get("VOX_RECORD_DIR", "")
         recorder = None
         on_utt = None
+        redact = bool(cfg.get("redact"))
         if cfg.get("record") and rec_dir:
             recorder = CallRecorder()
             self.recorders[call["id"]] = recorder
@@ -154,6 +154,8 @@ class Runtime:
 
                 def on_utt(audio, text, eot):          # noqa: F811
                     counter["n"] += 1
+                    if redact:
+                        text = redact_text(text)
                     base = os.path.join(rec_dir, "utterances", f"{call['id']}-{counter['n']:03d}")
                     write_wav16(base + ".wav", audio)
                     with open(os.path.join(rec_dir, "utterances", "index.jsonl"), "a") as f:
@@ -178,7 +180,6 @@ class Runtime:
                                              eot_threshold=float(os.environ.get("VOX_EOT_THRESHOLD", "0.8")),
                                              patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000"))))
         store, cid = self.store, call["id"]
-        redact = bool(cfg.get("redact"))
 
         def on_event(e: dict) -> None:
             if os.environ.get('VOX_LOG_EVENTS'):

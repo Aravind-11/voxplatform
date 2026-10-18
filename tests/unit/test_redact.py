@@ -1,6 +1,8 @@
 """PII redaction: the helper, stored transcripts, and the call.ended webhook."""
 import json
 
+import numpy as np
+
 from core.redact import redact_text
 from tests.unit.test_api import make, tenant
 
@@ -93,3 +95,83 @@ def test_years_and_clock_times_stay_while_cards_and_streets_are_redacted():
     assert redact_text("ship to 10 King St. in 1999 at 11:00") == "ship to [REDACTED:address] in 1999 at 11:00"
     assert redact_text("1999 Oak Dr") == "[REDACTED:address]"
     assert redact_text("10 St") == "[REDACTED:address]"
+    # A year plus only function words is a title or a sentence, not a house number.
+    assert redact_text("Meet in 1999 and Dr. Adams arrived") == "Meet in 1999 and Dr. Adams arrived"
+    assert redact_text("since 1999 the street has changed") == "since 1999 the street has changed"
+    assert redact_text("In 2019 the St. Patrick parade started at 11:00.") == (
+        "In 2019 the St. Patrick parade started at 11:00.")
+    # A card is one number. Clocks, years, zips, and order ids are not glued onto it,
+    # and a 16-digit number written as two groups is still a card.
+    glued = [
+        ("at 11:00 4111 1111 1111 1111", "at 11:00 [REDACTED:card]"),
+        ("11:00 1999 123456789012", "11:00 1999 123456789012"),
+        ("order 123456789012 4111 1111 1111 1111", "order 123456789012 [REDACTED:card]"),
+        ("in 1999 4111 1111 1111 1111", "in 1999 [REDACTED:card]"),
+        ("zip 94107 4111 1111 1111 1111", "zip 94107 [REDACTED:card]"),
+        ("in 1999, 4111 1111 1111 1111", "in 1999, [REDACTED:card]"),
+        ("41111111 11111111", "[REDACTED:card]"),
+    ]
+    for raw, expected in glued:
+        assert redact_text(raw) == expected
+        assert redact_text(expected) == expected
+
+
+def test_glued_card_tail_is_not_stored_or_sent_on_call_ended():
+    samples = [
+        ("at 11:00 4111 1111 1111 1111", "at 11:00 [REDACTED:card]"),
+        ("11:00 1999 123456789012", "11:00 1999 123456789012"),
+        ("order 123456789012 4111 1111 1111 1111", "order 123456789012 [REDACTED:card]"),
+    ]
+    events = []
+
+    class D:
+        def spawn(self, url, secret, event):
+            events.append(event)
+
+    c, store, _ = make(dispatcher=D())
+    k, _ = tenant(c)
+    h = H(k)
+    c.put("/v1/webhook", headers=h, json={"url": "https://hook.example/x"})
+    agent = c.post("/v1/agents", headers=h, json={"name": "pii", "systemPrompt": "s", "redact": True}).json()
+    call = c.post("/v1/calls", headers=h, json={"agentId": agent["id"]}).json()
+    sess = c.app.state.runtime.build_session(store.get_call_any(call["id"]), _transport())
+    for raw, _expected in samples:
+        sess.on_event({"type": "user_transcript", "text": raw})
+    stored = [m["text"] for m in store.messages(call["id"])]
+    assert stored == [expected for _raw, expected in samples]
+    with c.websocket_connect(call["joinUrl"].replace("wss://vox.example.com", "")):
+        pass
+    ended = [e for e in events if e["type"] == "call.ended"]
+    assert len(ended) == 1
+    assert [m["text"] for m in ended[0]["transcript"]] == stored
+    blob = json.dumps(ended[0]["transcript"])
+    assert "4111 1111 1111 1111" not in blob and "1111 1111 1111" not in blob
+
+
+def test_dataset_utterance_is_redacted_only_when_the_flag_is_on(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOX_DATASET", "1")
+    c, store, _ = make()
+    k, _ = tenant(c)
+    h = H(k)
+    audio = np.zeros(160, dtype=np.int16)
+    sentence = "card 4111 1111 1111 1111 mailed ada@example.com"
+    runtime = c.app.state.runtime
+
+    def index_text(redact: bool):
+        record_dir = tmp_path / ("on" if redact else "off")
+        runtime.record_dir = str(record_dir)
+        body = {"name": "ds", "systemPrompt": "s", "record": True}
+        if redact:
+            body["redact"] = True
+        agent = c.post("/v1/agents", headers=h, json=body).json()
+        call = c.post("/v1/calls", headers=h, json={"agentId": agent["id"]}).json()
+        cfg = store.get_call_any(call["id"])["config"]
+        assert cfg["record"] is True and bool(cfg.get("redact")) is redact
+        sess = runtime.build_session(store.get_call_any(call["id"]), _transport())
+        sess.on_utterance(audio, sentence, 0.4)
+        return json.loads((record_dir / "utterances" / "index.jsonl").read_text())
+
+    redacted = index_text(True)
+    assert redacted["text"] == "card [REDACTED:card] mailed [REDACTED:email]"
+    assert "4111" not in redacted["text"] and "ada@example.com" not in redacted["text"]
+    assert index_text(False)["text"] == sentence

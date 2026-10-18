@@ -273,6 +273,10 @@ def _pcm_from_tts(raw, default_rate: int) -> tuple[np.ndarray, int]:
     # An error document (JSON or HTML) is even-length often enough to decode as loud PCM.
     if _is_error_document(raw):
         raise ValueError("HttpTTS response was not audio")
+    # A finished body of only whitespace is not s16le. Space is 0x20, so b"    " would play as audio.
+    # An empty body is silence (yield nothing), matching the streaming decoder.
+    if raw and raw.strip(_WS) == b"" and raw[:1] not in (b"R", b"r"):
+        raise ValueError("HttpTTS response was not audio")
     if len(raw) % 2:
         raw = raw[: len(raw) - 1]
     return np.frombuffer(raw, dtype="<i2").copy(), default_rate

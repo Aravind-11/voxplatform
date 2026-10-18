@@ -189,6 +189,21 @@ async def test_http_tts_does_not_play_an_error_document_as_pcm():
                 "http://tts.example/v1", _byte_stream(b"Internal Server Error", 4)).synthesize("hi"):
             played.append(c)
     assert played == []
+    # A finished body of only spaces or newlines is not s16le (0x20 would play as a sample).
+    for body in (b"    ", b"\n", b"\r\n", b"\n\n", b" \t\r\n"):
+        played = []
+        with pytest.raises(ValueError):
+            async for c in HttpTTS("http://tts.example/v1", _ClientErr(200, body)).synthesize("hi"):
+                played.append(c)
+        assert played == []
+        played = []
+        with pytest.raises(ValueError):
+            async for c in HttpTTS("http://tts.example/v1", _byte_stream(body, 1)).synthesize("hi"):
+                played.append(c)
+        assert played == []
+    # An empty body is silence, not an error document.
+    assert [c async for c in HttpTTS("http://tts.example/v1", _ClientErr(200, b"")).synthesize("hi")] == []
+    assert [c async for c in HttpTTS("http://tts.example/v1", _byte_stream(b"", 1)).synthesize("hi")] == []
     # audio/wav that is not a WAV must not be decoded as s16le.
     pcm_body = np.asarray([1, 2, 3, 4], dtype="<i2").tobytes()
     with pytest.raises(ValueError):

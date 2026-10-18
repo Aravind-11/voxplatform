@@ -72,10 +72,16 @@ OnEvent = Callable[[dict], None]
 
 class _WordSlice:
     """Tracker text for one audio chunk. `heard()` calls `split` and stringifies, so filling `.text`
-    after `on_sent` still fixes barge-in without holding the first chunk until synthesis finishes."""
+    after `on_sent` still fixes barge-in without holding the first chunk until synthesis finishes.
 
-    def __init__(self, text: str = "") -> None:
+    `sentence` is the utterance this chunk belongs to. `covered` is set once a transcript marker
+    or a prefix commit has already counted the chunk, so cancel does not record it twice.
+    """
+
+    def __init__(self, text: str = "", sentence: str = "") -> None:
         self.text = text
+        self.sentence = sentence
+        self.covered = False
 
     def split(self, sep=None, maxsplit=-1):
         return self.text.split() if sep is None else self.text.split(sep, maxsplit)
@@ -154,6 +160,7 @@ class _Generation:
         self.outbox_audio = 0          # audio items still in outbox (not transcript markers)
         self.tasks: list[asyncio.Task] = []
         self.spoken: list[str] = []
+        self.sent_slices: list[_WordSlice] = []  # slices whose send_audio has returned
         self.produce_done = False
         self.first_audio_sent = False
         self.cancelled = False
@@ -481,7 +488,7 @@ class Session:
             self._spawn_action(a)
 
     def _commit_transcript(self, gen: _Generation, text: str) -> None:
-        """Record a sentence only after its audio is queued, never the part synthesis did not produce."""
+        """Record assistant text whose audio was sent, and emit one agent_speech."""
         if not text:
             return
         gen.spoken.append(text)
@@ -489,8 +496,39 @@ class Session:
         if self.history and self.history[-1]["role"] == "assistant":
             self.history[-1]["content"] = " ".join(gen.spoken)
 
+    def _cover_slices(self, track: Any) -> None:
+        if isinstance(track, list):
+            for sl in track:
+                if isinstance(sl, _WordSlice):
+                    sl.covered = True
+
+    def _commit_sent_prefix(self, gen: _Generation) -> None:
+        """One transcript for slices send_audio already accepted and not yet recorded.
+
+        Chunks still in the outbox are not included. Barge-in trims history after this, so the
+        heard prefix plus `[interrupted]` still replaces the assistant turn.
+        """
+        groups: list[list[_WordSlice]] = []
+        for sl in gen.sent_slices:
+            if sl.covered:
+                continue
+            if groups and groups[-1][0].sentence == sl.sentence:
+                groups[-1].append(sl)
+            else:
+                groups.append([sl])
+        parts: list[str] = []
+        for group in groups:
+            joined = " ".join(sl.text for sl in group if sl.text).strip()
+            for sl in group:
+                sl.covered = True
+            if joined:
+                parts.append(joined)
+        if parts:
+            self._commit_transcript(gen, " ".join(parts))
+
     async def _speak(self, gen: _Generation, text: str) -> None:
-        """Enqueue each TTS chunk as it arrives. History gets the sentence only if every chunk was queued."""
+        """Enqueue each TTS chunk as it arrives. The sentence is recorded once every chunk is sent,
+        or only the words on chunks already sent if synthesis or send_audio stops early."""
         t_tts = self.clock()
         slices: list[_WordSlice] = []
         lengths: list[int] = []
@@ -500,7 +538,7 @@ class Session:
                 if len(pcm) == 0:
                     continue
                 # The slice is what barge-in reads. It stays a conservative prefix until synthesis finishes.
-                sl = _WordSlice("")
+                sl = _WordSlice("", text)
                 slices.append(sl)
                 lengths.append(len(pcm))
                 _claim_words_so_far(slices, lengths, text, self.cfg.out_rate)
@@ -511,41 +549,56 @@ class Session:
             # A later chunk failed: keep only the words attached to audio already queued.
             queued = " ".join(sl.text for sl in slices if sl.text).strip()
             if queued:
-                await gen.outbox.put((queued, None, None))
+                await gen.outbox.put((queued, slices, None))
             raise
         self._emit("tts_done", ms=self.clock() - t_tts, chars=len(text))
         if slices:
             _fill_word_slices(slices, lengths, text)
-            await gen.outbox.put((text, None, None))
+            await gen.outbox.put((text, slices, None))
         else:
             await gen.outbox.put((text, text, np.zeros(0, np.int16)))
 
     async def _drain(self, gen: _Generation) -> None:
-        await gen.commit.wait()
-        while True:
-            item = await gen.outbox.get()
-            if item is None:
-                if gen.after is not None and not gen.cancelled:
-                    await self._finish_action(gen)
-                return
-            text, track, pcm = item
-            if pcm is None:
-                self._commit_transcript(gen, text)
-                continue
-            if len(pcm):
-                gen.outbox_audio -= 1
-            if not gen.first_audio_sent:
-                gen.first_audio_sent = True
-                self._emit("agent_first_audio",
-                           latency_ms=self.clock() - gen.speech_end_clock)
-            await self.send_audio(pcm, self.cfg.out_rate)
-            if self.recorder is not None:
-                self.recorder.agent(pcm, self.cfg.out_rate)
-            dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
-            self.tracker.on_sent(track, dur)
-            gen.pending_ms -= dur
-            if text:
-                self._commit_transcript(gen, text)
+        try:
+            await gen.commit.wait()
+            while True:
+                item = await gen.outbox.get()
+                if item is None:
+                    if gen.after is not None and not gen.cancelled:
+                        await self._finish_action(gen)
+                    return
+                text, track, pcm = item
+                if pcm is None:
+                    # Cover first so a commit that re-enters cancel cannot record the slices twice.
+                    self._cover_slices(track)
+                    self._commit_transcript(gen, text)
+                    continue
+                if len(pcm):
+                    gen.outbox_audio -= 1
+                if not gen.first_audio_sent:
+                    gen.first_audio_sent = True
+                    self._emit("agent_first_audio",
+                               latency_ms=self.clock() - gen.speech_end_clock)
+                try:
+                    await self.send_audio(pcm, self.cfg.out_rate)
+                except Exception as e:
+                    # This chunk never left. Do not apply the full-sentence marker queued behind it.
+                    self._commit_sent_prefix(gen)
+                    self._emit("error", where="send_audio", error=repr(e))
+                    return
+                if isinstance(track, _WordSlice):
+                    gen.sent_slices.append(track)
+                if self.recorder is not None:
+                    self.recorder.agent(pcm, self.cfg.out_rate)
+                dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
+                self.tracker.on_sent(track, dur)
+                gen.pending_ms -= dur
+                if text:
+                    self._commit_transcript(gen, text)
+        except asyncio.CancelledError:
+            # Barge-in, hang-up, and shutdown cancel drain before it reads the sentence marker.
+            self._commit_sent_prefix(gen)
+            raise
 
     # ----------------------------------------------------------- barge-in
     async def _interrupt(self, gen: _Generation) -> None:
@@ -571,3 +624,6 @@ class Session:
         for t in gen.tasks:
             t.cancel()
         await asyncio.gather(*gen.tasks, return_exceptions=True)
+        # Drain's cancel handler records slices it had already sent. Repeat is a no-op once covered,
+        # and covers a drain task that finished without seeing the marker.
+        self._commit_sent_prefix(gen)

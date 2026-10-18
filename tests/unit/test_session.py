@@ -351,6 +351,10 @@ async def test_failed_later_chunk_records_only_audio_that_was_queued():
     assert sentence not in speeches and sentence not in r.s._gen.spoken
     assert "six" not in r.s.history[-1]["content"]
     assert len(r.sent) == 1
+    await r.s.close()
+    speeches = [e["text"] for e in r.events if e["type"] == "agent_speech"]
+    assert speeches == ["one two three four five"]
+    assert r.s.history[-1]["content"] == "one two three four five"
 
 
 async def test_barge_in_after_first_chunk_marks_the_prefix_interrupted():
@@ -382,11 +386,77 @@ async def test_barge_in_after_first_chunk_marks_the_prefix_interrupted():
         assert ev["heard"] == "one two three four five"
         assert r.s.history[-1]["content"] == "one two three four five [interrupted]"
         speeches = [e["text"] for e in r.events if e["type"] == "agent_speech"]
+        assert speeches == ["one two three four five"]
+        assert r.s._gen.spoken == ["one two three four five"]
         assert sentence not in speeches
         assert all("six" not in s for s in speeches)
         assert len(r.sent) == 1
     finally:
         gate.set()
+
+
+async def test_close_records_the_sent_prefix_not_the_unheard_tail():
+    """Hang-up cancels drain before the sentence marker; the caller still heard the first chunk."""
+    gate = asyncio.Event()
+    sentence = "one two three four five six seven eight nine ten."
+
+    class Hold(FakeTTS):
+        sample_rate = 8000
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            yield np.zeros(8000, dtype=np.int16)
+            await gate.wait()
+            yield np.zeros(8000, dtype=np.int16)
+
+    r = Rig(FakeLLM([[sentence]]), tts=Hold())
+    try:
+        await r.frames("s", 15)
+        await r.frames("q", 23)
+        await r.settle()
+        assert len(r.sent) == 1
+        await r.s.close()
+        speeches = [e["text"] for e in r.events if e["type"] == "agent_speech"]
+        assert speeches == ["one two three four five"]
+        assert r.s._gen.spoken == ["one two three four five"]
+        assert r.s.history[-1]["content"] == "one two three four five"
+        assert sentence not in speeches and "six" not in r.s.history[-1]["content"]
+        assert not any(e["type"] == "error" for e in r.events)
+        assert len(r.sent) == 1
+    finally:
+        gate.set()
+
+
+async def test_send_audio_error_records_only_the_chunk_that_was_sent():
+    """The full-sentence marker is already queued; a failed second send must not apply it."""
+    sentence = "one two three four five six seven eight nine ten."
+
+    class Two(FakeTTS):
+        sample_rate = 8000
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            yield np.zeros(8000, dtype=np.int16)
+            yield np.zeros(8000, dtype=np.int16)
+
+    r = Rig(FakeLLM([[sentence]]), tts=Two())
+
+    async def send(pcm, rate):
+        if r.sent:
+            raise ConnectionError("dropped")
+        r.sent.append((r.clk.t, len(pcm), rate))
+
+    r.s.send_audio = send
+    await r.frames("s", 15)
+    await r.frames("q", 23)
+    await asyncio.wait_for(asyncio.gather(*r.s._gen.tasks, return_exceptions=True), timeout=2)
+    speeches = [e["text"] for e in r.events if e["type"] == "agent_speech"]
+    assert speeches == ["one two three four five"]
+    assert r.s._gen.spoken == ["one two three four five"]
+    assert r.s.history[-1]["content"] == "one two three four five"
+    assert sentence not in speeches and "six" not in r.s.history[-1]["content"]
+    assert any(e["type"] == "error" and e.get("where") == "send_audio" for e in r.events)
+    assert len(r.sent) == 1
 
 
 async def test_barge_in_does_not_wait_for_a_blocked_kokoro_worker():

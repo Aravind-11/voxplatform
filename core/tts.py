@@ -10,7 +10,11 @@ import io
 import wave
 from typing import AsyncIterator
 
+import httpx
 import numpy as np
+
+# One utterance can outlive the shared client's 5s tool budget. Connect stays at 5s; only the read is long.
+TTS_HTTP_TIMEOUT = httpx.Timeout(5.0, read=60.0)
 
 
 # Kokoro-82M voices by language code (Kokoro's published voice list). The first letter of a voice name is its
@@ -112,6 +116,23 @@ class KokoroTTS:
         self.pipeline = pipeline
         self.voice = voice
         self.speed = speed
+        self._detached: list[asyncio.Future] = []
+
+    def detached_workers(self) -> list[asyncio.Future]:
+        """Executor jobs barge-in stopped waiting for. Still running, so a concurrency slot must count them."""
+        return [f for f in self._detached if not f.done()]
+
+    def _detach_worker(self, fut: asyncio.Future) -> None:
+        self._detached.append(fut)
+
+        def _done(f: asyncio.Future) -> None:
+            try:
+                self._detached.remove(f)
+            except ValueError:
+                pass
+            _retrieve_future(f)
+
+        fut.add_done_callback(_done)
 
     async def synthesize(self, text: str) -> AsyncIterator[np.ndarray]:
         loop = asyncio.get_running_loop()
@@ -138,31 +159,90 @@ class KokoroTTS:
                     raise item
                 yield np.clip(np.rint(item * 32767.0), -32768, 32767).astype(np.int16)
         finally:
-            await asyncio.shield(fut)
+            # shield() still blocks the cancelled session task until the worker returns.
+            # Detach instead, and let LimitedTTS hold the slot until the thread exits.
+            if not fut.done() and _task_cancelling():
+                self._detach_worker(fut)
+            elif not fut.done():
+                try:
+                    await asyncio.shield(fut)
+                except asyncio.CancelledError:
+                    if not fut.done():
+                        self._detach_worker(fut)
+                    raise
+            else:
+                _retrieve_future(fut)
+
+
+def _task_cancelling() -> bool:
+    task = asyncio.current_task()
+    if task is None:
+        return False
+    cancelling = getattr(task, "cancelling", None)
+    return bool(cancelling and cancelling())
+
+
+def _retrieve_future(fut: asyncio.Future) -> None:
+    if not fut.done() or fut.cancelled():
+        return
+    try:
+        fut.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        pass
 
 
 _WS = b" \t\r\n"
-_ERR_OPEN = b"{[<"
+_TOKENS = (b'{"', b"[{", b"<!", b"<?", b"<html")
+_PRINTABLE = bytes(b for b in range(256) if b in (9, 10, 13) or 32 <= b <= 126)
+
+
+def _content_type(resp) -> str:
+    headers = getattr(resp, "headers", None)
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return ""
+    return str(getter("content-type") or "").split(";", 1)[0].strip().lower()
 
 
 def _text_media(resp) -> bool:
     """A JSON or text Content-Type is an error document, not a raw PCM body."""
-    headers = getattr(resp, "headers", None)
-    getter = getattr(headers, "get", None)
-    if getter is None:
-        return False
-    ctype = str(getter("content-type") or "").split(";", 1)[0].strip().lower()
+    ctype = _content_type(resp)
     return ctype.startswith("text/") or ctype == "application/json" or ctype.endswith("+json")
 
 
-def _is_error_document(raw: bytes) -> bool:
-    """JSON or HTML, including a leading BOM or whitespace. Those bytes are not s16le audio."""
+def _wav_media(resp) -> bool:
+    """audio/wav that is not a WAV must fail closed, not fall through to s16le."""
+    return _content_type(resp) in {"audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave"}
+
+
+def _body_text(raw: bytes) -> bytes:
+    """Drop a leading BOM and whitespace. The rest is what an error document would start with."""
     if raw.startswith(b"\xef\xbb\xbf"):
         raw = raw[3:]
     i = 0
     while i < len(raw) and raw[i] in _WS:
         i += 1
-    return i < len(raw) and raw[i:i + 1] in _ERR_OPEN
+    return raw[i:]
+
+
+def _all_printable(body: bytes) -> bool:
+    return not body.translate(None, _PRINTABLE)
+
+
+def _is_error_document(raw: bytes, *, final: bool = True) -> bool:
+    """True for a JSON/HTML token or, once the body is complete, a run of plain text.
+
+    A single '<', '[' or '{' is a legal s16le sample (60, 91, 123). Those bytes are audio
+    unless the body is actually text: a real token, or printable ASCII with no NUL/high bytes.
+    """
+    body = _body_text(raw)
+    if not body:
+        return False
+    low = body[:16].lower()
+    if any(low.startswith(tok) for tok in _TOKENS):
+        return True
+    # A short printable prefix can still be the start of PCM; decide only when the body is finished.
+    return bool(final and len(body) >= 4 and _all_printable(body))
 
 
 def _pcm_from_tts(raw, default_rate: int) -> tuple[np.ndarray, int]:
@@ -205,9 +285,10 @@ class _BytePCM:
     each read on its own plays the header at the default rate or drops the odd trailing byte.
     """
 
-    def __init__(self, default_rate: int) -> None:
+    def __init__(self, default_rate: int, *, require_wav: bool = False) -> None:
         self.default_rate = default_rate
         self.rate = default_rate
+        self.require_wav = require_wav
         self._buf = bytearray()
         self._i = 0
         self._mode = "unk"  # unk until the leading bytes say wav or raw; done once a sized data chunk ends
@@ -257,11 +338,7 @@ class _BytePCM:
         view = bytes(self._buf[self._i:])
         if not view:
             return False
-        if _is_error_document(view):
-            raise ValueError("HttpTTS response was not audio")
-        if _pending_error_prefix(view) and not final:
-            return False
-        if final and view.strip(b" \t\r\n") == b"" and view[:1] not in (b"R", b"r"):
+        if _is_error_document(view, final=final):
             raise ValueError("HttpTTS response was not audio")
         if view.startswith(b"RIFF"):
             if len(view) < 12 and not final:
@@ -272,6 +349,15 @@ class _BytePCM:
             return True
         if not final and len(view) < 4 and view.startswith(b"R"):
             return False
+        # audio/wav that is not a WAV must not be played as raw s16le.
+        if self.require_wav:
+            if not final and len(view) < 12 and b"RIFF".startswith(view):
+                return False
+            raise ValueError("HttpTTS response was not audio")
+        if _pending_error_prefix(view) and not final:
+            return False
+        if final and view.strip(b" \t\r\n") == b"" and view[:1] not in (b"R", b"r"):
+            raise ValueError("HttpTTS response was not audio")
         self._mode = "raw"
         return True
 
@@ -352,15 +438,24 @@ class _BytePCM:
 
 
 def _pending_error_prefix(view: bytes) -> bool:
-    """True while the leading bytes could still become a JSON/HTML error and not audio."""
+    """True while the leading bytes could still become text and not audio.
+
+    Holds a printable prefix so a plain-text error is not played before the body ends, but a
+    NUL or high byte (a real s16le sample) is audio immediately.
+    """
+    if not view:
+        return False
     if view.startswith(b"\xef") and not view.startswith(b"\xef\xbb\xbf"):
         return len(view) < 3
-    if view.startswith(b"\xef\xbb\xbf"):
-        view = view[3:]
-    i = 0
-    while i < len(view) and view[i] in _WS:
-        i += 1
-    return i == len(view)
+    body = _body_text(view)
+    if not body:
+        return True
+    if not _all_printable(body):
+        return False
+    low = body[:16].lower()
+    if any(low.startswith(tok) for tok in _TOKENS):
+        return False
+    return True
 
 
 async def _response_bytes(resp) -> bytes:
@@ -398,8 +493,8 @@ class HttpTTS:
         self.api_key = api_key
         self.sample_rate = sample_rate
 
-    async def _iter_pieces(self, pieces) -> AsyncIterator[np.ndarray]:
-        dec = _BytePCM(self.sample_rate)
+    async def _iter_pieces(self, pieces, *, require_wav: bool = False) -> AsyncIterator[np.ndarray]:
+        dec = _BytePCM(self.sample_rate, require_wav=require_wav)
         async for piece in pieces:
             for pcm in dec.feed(piece):
                 self.sample_rate = dec.rate
@@ -413,7 +508,7 @@ class HttpTTS:
 
     async def synthesize(self, text: str) -> AsyncIterator[np.ndarray]:
         payload = {"model": self.model, "voice": self.voice, "input": text}
-        kwargs: dict = {"json": payload}
+        kwargs: dict = {"json": payload, "timeout": TTS_HTTP_TIMEOUT}
         if self.api_key:
             kwargs["headers"] = {"Authorization": f"Bearer {self.api_key}"}
         posted = self.client.post(f"{self.base_url}/audio/speech", **kwargs)
@@ -427,11 +522,15 @@ class HttpTTS:
             raise RuntimeError(f"HttpTTS HTTP {status}")
         if _text_media(resp):
             raise ValueError("HttpTTS response was not audio")
+        require_wav = _wav_media(resp)
         if hasattr(resp, "__aiter__") and not isinstance(resp, (bytes, bytearray)):
-            async for pcm in self._iter_pieces(resp):
+            async for pcm in self._iter_pieces(resp, require_wav=require_wav):
                 yield pcm
             return
-        pcm, rate = _pcm_from_tts(await _response_bytes(resp), self.sample_rate)
+        raw = await _response_bytes(resp)
+        if require_wav and not (len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE"):
+            raise ValueError("HttpTTS response was not audio")
+        pcm, rate = _pcm_from_tts(raw, self.sample_rate)
         self.sample_rate = rate
         if len(pcm):
             yield pcm

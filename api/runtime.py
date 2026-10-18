@@ -21,8 +21,11 @@ class LimitedTTS:
 
     Caps simultaneous syntheses process-wide: TTS front-ends (G2P) are CPU/GIL-bound, so many
     parallel threads only add contention. The semaphore is shared by every call in the process and
-    is held while each chunk is yielded, not released after a private buffer of the whole sentence."""
+    is held while each chunk is yielded, not released after a private buffer of the whole sentence.
+    Barge-in detaches the session task from an in-process worker, but the slot stays held until
+    that thread actually exits."""
     _sem: Optional[asyncio.Semaphore] = None
+    _bg: set[asyncio.Task] = set()
 
     def __init__(self, inner, limit: int):
         self.inner, self.limit = inner, limit
@@ -36,9 +39,33 @@ class LimitedTTS:
     async def synthesize(self, text: str):
         if LimitedTTS._sem is None:
             LimitedTTS._sem = asyncio.Semaphore(self.limit)
-        async with LimitedTTS._sem:
+        sem = LimitedTTS._sem
+        await sem.acquire()
+        try:
             async for p in self.inner.synthesize(text):
                 yield p
+        finally:
+            pending = _detached_workers(self.inner)
+            if not pending:
+                sem.release()
+            else:
+                task = asyncio.create_task(_release_tts_slot(sem, pending))
+                LimitedTTS._bg.add(task)
+                task.add_done_callback(LimitedTTS._bg.discard)
+
+
+def _detached_workers(inner) -> list:
+    take = getattr(inner, "detached_workers", None)
+    if take is None:
+        return []
+    return [f for f in take() if f is not None and not f.done()]
+
+
+async def _release_tts_slot(sem: asyncio.Semaphore, workers: list) -> None:
+    try:
+        await asyncio.gather(*workers, return_exceptions=True)
+    finally:
+        sem.release()
 
 
 def _count(e: dict) -> None:

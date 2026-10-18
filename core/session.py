@@ -151,6 +151,7 @@ class _Generation:
         self.outbox: asyncio.Queue = asyncio.Queue()
         self.textq: asyncio.Queue = asyncio.Queue()
         self.pending_ms = 0.0          # synthesized audio waiting in outbox (not yet sent)
+        self.outbox_audio = 0          # audio items still in outbox (not transcript markers)
         self.tasks: list[asyncio.Task] = []
         self.spoken: list[str] = []
         self.produce_done = False
@@ -479,29 +480,43 @@ class Session:
         if a is not None:
             self._spawn_action(a)
 
+    def _commit_transcript(self, gen: _Generation, text: str) -> None:
+        """Record a sentence only after its audio is queued, never the part synthesis did not produce."""
+        if not text:
+            return
+        gen.spoken.append(text)
+        self._emit("agent_speech", text=text)
+        if self.history and self.history[-1]["role"] == "assistant":
+            self.history[-1]["content"] = " ".join(gen.spoken)
+
     async def _speak(self, gen: _Generation, text: str) -> None:
-        """Enqueue each TTS chunk as it arrives. The transcript keeps the sentence once; the tracker gets a word slice."""
+        """Enqueue each TTS chunk as it arrives. History gets the sentence only if every chunk was queued."""
         t_tts = self.clock()
         slices: list[_WordSlice] = []
         lengths: list[int] = []
-        first = True
-        async for part in self.tts.synthesize(text):
-            pcm = resample(np.asarray(part), self.tts.sample_rate, self.cfg.out_rate)
-            if len(pcm) == 0:
-                continue
-            # The transcript line is the whole sentence once. The slice is what barge-in reads, and it
-            # stays a conservative prefix until every chunk's length is known.
-            sl = _WordSlice("")
-            slices.append(sl)
-            lengths.append(len(pcm))
-            _claim_words_so_far(slices, lengths, text, self.cfg.out_rate)
-            spoken = text if first else ""
-            first = False
-            gen.pending_ms += pcm_duration_ms(len(pcm), self.cfg.out_rate)
-            await gen.outbox.put((spoken, sl, pcm))
+        try:
+            async for part in self.tts.synthesize(text):
+                pcm = resample(np.asarray(part), self.tts.sample_rate, self.cfg.out_rate)
+                if len(pcm) == 0:
+                    continue
+                # The slice is what barge-in reads. It stays a conservative prefix until synthesis finishes.
+                sl = _WordSlice("")
+                slices.append(sl)
+                lengths.append(len(pcm))
+                _claim_words_so_far(slices, lengths, text, self.cfg.out_rate)
+                gen.pending_ms += pcm_duration_ms(len(pcm), self.cfg.out_rate)
+                gen.outbox_audio += 1
+                await gen.outbox.put(("", sl, pcm))
+        except Exception:
+            # A later chunk failed: keep only the words attached to audio already queued.
+            queued = " ".join(sl.text for sl in slices if sl.text).strip()
+            if queued:
+                await gen.outbox.put((queued, None, None))
+            raise
         self._emit("tts_done", ms=self.clock() - t_tts, chars=len(text))
         if slices:
             _fill_word_slices(slices, lengths, text)
+            await gen.outbox.put((text, None, None))
         else:
             await gen.outbox.put((text, text, np.zeros(0, np.int16)))
 
@@ -514,6 +529,11 @@ class Session:
                     await self._finish_action(gen)
                 return
             text, track, pcm = item
+            if pcm is None:
+                self._commit_transcript(gen, text)
+                continue
+            if len(pcm):
+                gen.outbox_audio -= 1
             if not gen.first_audio_sent:
                 gen.first_audio_sent = True
                 self._emit("agent_first_audio",
@@ -524,16 +544,16 @@ class Session:
             dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
             self.tracker.on_sent(track, dur)
             gen.pending_ms -= dur
-            if not text:
-                continue
-            gen.spoken.append(text)
-            self._emit("agent_speech", text=text)
-            if self.history and self.history[-1]["role"] == "assistant":
-                self.history[-1]["content"] = " ".join(gen.spoken)
+            if text:
+                self._commit_transcript(gen, text)
 
     # ----------------------------------------------------------- barge-in
     async def _interrupt(self, gen: _Generation) -> None:
         heard, cut = self.tracker.heard()
+        # Audio still in synthesize or in the outbox is not in the tracker, so a finished chunk
+        # looks like a clean end unless we force the cut.
+        if not gen.produce_done or gen.outbox_audio > 0:
+            cut = True
         await self.clear_audio()          # stop the far end first: that is what the caller hears
         if self.recorder is not None:
             self.recorder.clear()

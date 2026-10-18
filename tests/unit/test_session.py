@@ -327,6 +327,124 @@ async def test_tts_chunks_are_sent_as_they_are_produced():
     assert [p.split() for p in parts] == [["Hello"], ["there", "friend."]]
 
 
+async def test_failed_later_chunk_records_only_audio_that_was_queued():
+    """A chunk after the first must not make history claim the sentence was spoken."""
+    sentence = "one two three four five six seven eight nine ten."
+
+    class Boom(FakeTTS):
+        sample_rate = 8000
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            yield np.zeros(8000, dtype=np.int16)  # 1 s -> five words at the 180 ms claim cap
+            raise RuntimeError("second chunk failed")
+
+    r = Rig(FakeLLM([[sentence]]), tts=Boom())
+    await r.frames("s", 15)
+    await r.frames("q", 23)
+    await asyncio.wait_for(asyncio.gather(*r.s._gen.tasks, return_exceptions=True), timeout=2)
+    assert any(e["type"] == "error" and e["where"] == "tts" for e in r.events)
+    speeches = [e["text"] for e in r.events if e["type"] == "agent_speech"]
+    assert speeches == ["one two three four five"]
+    assert r.s._gen.spoken == ["one two three four five"]
+    assert r.s.history[-1] == {"role": "assistant", "content": "one two three four five"}
+    assert sentence not in speeches and sentence not in r.s._gen.spoken
+    assert "six" not in r.s.history[-1]["content"]
+    assert len(r.sent) == 1
+
+
+async def test_barge_in_after_first_chunk_marks_the_prefix_interrupted():
+    """A dry buffer while the next chunk is still synthesizing is not a finished turn."""
+    gate = asyncio.Event()
+    sentence = "one two three four five six seven eight nine ten."
+
+    class Hold(FakeTTS):
+        sample_rate = 8000
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            yield np.zeros(8000, dtype=np.int16)
+            await gate.wait()
+            yield np.zeros(8000, dtype=np.int16)
+
+    r = Rig(FakeLLM([[sentence]]), tts=Hold())
+    try:
+        await r.frames("s", 15)
+        await r.frames("q", 23)
+        await r.settle()
+        assert len(r.sent) == 1
+        sent_t, n, rate = r.sent[0]
+        r.clk.t = max(r.clk.t, sent_t + (1000.0 * n / rate) + 1)
+        await r.frames("s", 6)
+        await r.settle()
+        ev = r.last("user_interrupted")
+        assert ev["cut"] is True
+        assert ev["heard"] == "one two three four five"
+        assert r.s.history[-1]["content"] == "one two three four five [interrupted]"
+        speeches = [e["text"] for e in r.events if e["type"] == "agent_speech"]
+        assert sentence not in speeches
+        assert all("six" not in s for s in speeches)
+        assert len(r.sent) == 1
+    finally:
+        gate.set()
+
+
+async def test_barge_in_does_not_wait_for_a_blocked_kokoro_worker():
+    """Cancel must return while the G2P thread is still inside the rest of the sentence."""
+    import threading
+    import time
+
+    from api.runtime import LimitedTTS
+    from core.tts import KokoroTTS
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    class Pipe:
+        def __call__(self, text, voice="af_heart", speed=1.0):
+            yield None, None, np.zeros(24000, dtype=np.float32)
+            entered.set()
+            release.wait(3.0)
+            yield None, None, np.zeros(24000, dtype=np.float32)
+
+    old = LimitedTTS._sem
+    LimitedTTS._sem = None
+    try:
+        tts = LimitedTTS(KokoroTTS(pipeline=Pipe()), 1)
+        r = Rig(FakeLLM([["one two three four five six seven eight nine ten."]]), tts=tts)
+        await r.frames("s", 15)
+        await r.frames("q", 23)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not (r.sent and entered.is_set()):
+            await asyncio.sleep(0.01)
+        assert r.sent and entered.is_set()
+        sent_before = len(r.sent)
+        t0 = time.monotonic()
+        await r.frames("s", 6)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0
+        assert "user_interrupted" in r.types()
+        assert len(r.sent) == sent_before
+        assert LimitedTTS._sem.locked()
+        release.set()
+        for _ in range(100):
+            if not LimitedTTS._sem.locked():
+                break
+            await asyncio.sleep(0.02)
+        assert not LimitedTTS._sem.locked()
+        await asyncio.sleep(0.05)
+        assert len(r.sent) == sent_before
+    finally:
+        release.set()
+        sem = LimitedTTS._sem
+        if sem is not None:
+            for _ in range(100):
+                if not sem.locked():
+                    break
+                await asyncio.sleep(0.02)
+        LimitedTTS._sem = old
+
+
 class Verdict:
     """Async end-of-turn scorer fake: returns `score` after `delay` asyncio ticks."""
 

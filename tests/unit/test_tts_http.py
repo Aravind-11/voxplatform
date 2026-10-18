@@ -30,8 +30,8 @@ class _Client:
         self.body = body
         self.calls = []
 
-    async def post(self, url, json=None, headers=None):
-        self.calls.append({"url": url, "json": json, "headers": headers})
+    async def post(self, url, json=None, headers=None, timeout=None):
+        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
         return _Body(self.body)
 
 
@@ -45,10 +45,13 @@ async def test_http_tts_decodes_wav_and_takes_its_sample_rate():
     assert client.calls[0]["url"] == "http://tts.example/v1/audio/speech"
     assert client.calls[0]["json"] == {"model": "tts-1", "voice": "af_heart", "input": "hi"}
     assert client.calls[0]["headers"]["Authorization"] == "Bearer k"
+    # The shared client stays at 5s for tools; a full utterance needs a longer read.
+    timeout = client.calls[0]["timeout"]
+    assert timeout.connect == 5.0 and timeout.read == 60.0
 
 
 class _StreamClient:
-    def post(self, url, json=None, headers=None):
+    def post(self, url, json=None, headers=None, timeout=None):
         async def chunks():
             yield np.array([5, 6], dtype=np.int16)
             yield np.array([7], dtype=np.int16)
@@ -150,7 +153,7 @@ async def test_http_tts_does_not_play_an_error_document_as_pcm():
         def __init__(self, status, content, content_type=None):
             self.status, self.content, self.content_type = status, content, content_type
 
-        async def post(self, url, json=None, headers=None):
+        async def post(self, url, json=None, headers=None, timeout=None):
             return _Err(self.status, self.content, self.content_type)
 
     with pytest.raises(RuntimeError):
@@ -167,11 +170,45 @@ async def test_http_tts_does_not_play_an_error_document_as_pcm():
     with pytest.raises(ValueError):
         _ = [c async for c in HttpTTS(
             "http://tts.example/v1", _ClientErr(200, b"Internal Server Error", "text/plain")).synthesize("hi")]
+    # A 200 plain-text body is not audio, with or without a PCM/WAV content type.
+    for ctype in (None, "application/octet-stream", "audio/wav"):
+        played = []
+        with pytest.raises(ValueError):
+            async for c in HttpTTS(
+                    "http://tts.example/v1",
+                    _ClientErr(200, b"Internal Server Error", ctype)).synthesize("hi"):
+                played.append(c)
+        assert played == []
+    for body in (b"null", b"true", b'"error"'):
+        with pytest.raises(ValueError):
+            _ = [c async for c in HttpTTS(
+                "http://tts.example/v1", _ClientErr(200, body)).synthesize("hi")]
+    played = []
+    with pytest.raises(ValueError):
+        async for c in HttpTTS(
+                "http://tts.example/v1", _byte_stream(b"Internal Server Error", 4)).synthesize("hi"):
+            played.append(c)
+    assert played == []
+    # audio/wav that is not a WAV must not be decoded as s16le.
+    pcm_body = np.asarray([1, 2, 3, 4], dtype="<i2").tobytes()
+    with pytest.raises(ValueError):
+        _ = [c async for c in HttpTTS(
+            "http://tts.example/v1", _ClientErr(200, pcm_body, "audio/wav")).synthesize("hi")]
+    # A raw sample whose low byte is '<' / '[' / '{' is audio, not an error document.
+    for lead, sample in ((b"<", 60), (b"[", 91), (b"{", 123)):
+        raw = lead + b"\x00" + np.asarray([1000, -1000], dtype="<i2").tobytes()
+        for ctype in (None, "audio/L16", "application/octet-stream"):
+            got = [c async for c in HttpTTS(
+                "http://tts.example/v1", _ClientErr(200, raw, ctype), sample_rate=24000).synthesize("hi")]
+            assert np.concatenate(got).tolist() == [sample, 1000, -1000]
+        streamed = [c async for c in HttpTTS(
+            "http://tts.example/v1", _byte_stream(raw, 1), sample_rate=24000).synthesize("hi")]
+        assert np.concatenate(streamed).tolist() == [sample, 1000, -1000]
 
 
 def _byte_stream(body: bytes, step: int):
     class Client:
-        def post(self, url, json=None, headers=None):
+        def post(self, url, json=None, headers=None, timeout=None):
             async def chunks():
                 for i in range(0, len(body), step):
                     yield body[i:i + step]

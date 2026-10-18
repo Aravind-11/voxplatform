@@ -300,6 +300,151 @@ async def test_barge_in_while_tool_round_waits_keeps_the_transcript():
     assert "[caller audio]" not in _contents(later)
 
 
+async def test_user_transcript_handler_error_still_runs_the_tool_round():
+    """A store write on user_transcript must not fail the task the tool round is waiting on."""
+    release = asyncio.Event()
+    ran = []
+
+    async def lookup(args):
+        ran.append(args)
+        return {"slot": "10:00"}
+
+    llm = FakeLLM([["Let ", "me ", "check. ", ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["Booked ", "for ", "ten."]])
+
+    async def slow(audio):
+        await release.wait()
+        return "tuesday at eleven"
+
+    llm.transcribe = slow
+    r = Rig(llm, tools={"lookup": lookup})
+
+    def on_event(event):
+        r.events.append(event)
+        if event["type"] == "user_transcript":
+            raise RuntimeError("store down")
+
+    r.s.on_event = on_event
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    assert len(llm.calls) == 1 and llm.calls[0]["n_audio"] > 0 and ran == []
+    release.set()
+    await r.settle()
+    assert ran == [{"day": "mon"}]
+    assert llm.calls[1]["n_audio"] == 0
+    assert {"role": "user", "content": "tuesday at eleven"} in llm.calls[1]["history"]
+    assert "tuesday at eleven" in _contents(r.s.history)
+
+
+async def test_close_joins_an_older_transcript_after_a_newer_turn_finished():
+    """Hang-up must save an earlier ASR that is still running after a later turn committed."""
+    releases = []
+
+    async def slow(audio):
+        gate = asyncio.Event()
+        releases.append(gate)
+        n = len(releases)
+        await gate.wait()
+        return f"turn {n}"
+
+    llm = FakeLLM([["Let ", "me ", "check. ", ToolCall("t1", "lookup", {})],
+                   ["Second ", "reply."]])
+    llm.transcribe = slow
+    r = Rig(llm)
+    close_task = None
+    try:
+        await r.frames("s", 15)
+        await r.frames("q", 25)
+        await r.settle()
+        assert r.s.history[1]["content"] == "[caller audio]"
+        await r.frames("s", 8)             # barge-in: cancels the reply, not this turn's ASR
+        await r.frames("q", 30)            # a newer turn commits and replaces the session pointer
+        await r.settle()
+        assert len(releases) == 2
+        releases[1].set()
+        await r.settle()
+        texts = [e.get("text") for e in r.events if e["type"] == "user_transcript"]
+        assert texts == ["turn 2"]
+        assert "[caller audio]" in _contents(r.s.history)
+        started = {t for t in asyncio.all_tasks() if t is not asyncio.current_task()}
+        close_task = asyncio.create_task(r.s.close())
+        await r.settle()
+        assert not close_task.done()
+        releases[0].set()
+        await close_task
+        close_task = None
+        assert "turn 1" in _contents(r.s.history)
+        assert "[caller audio]" not in _contents(r.s.history)
+        texts = [e.get("text") for e in r.events if e["type"] == "user_transcript"]
+        assert "turn 1" in texts and "turn 2" in texts
+        for t in started:
+            if not t.done():
+                t.cancel()
+        await r.settle()
+        assert "turn 1" in _contents(r.s.history)
+        assert any(e["type"] == "user_transcript" and e["text"] == "turn 1" for e in r.events)
+    finally:
+        for gate in releases:
+            gate.set()
+        if close_task is not None:
+            if not close_task.done():
+                close_task.cancel()
+            try:
+                await close_task
+            except asyncio.CancelledError:
+                pass
+
+
+async def test_close_cancelled_while_blocked_on_asr_still_saves_the_transcript():
+    """A cancel of close() during ASR must not cancel that transcript."""
+    release = asyncio.Event()
+
+    async def slow(audio):
+        await release.wait()
+        return "saved on hangup"
+
+    llm = FakeLLM([["Hello ", "there."]])
+    llm.transcribe = slow
+    r = Rig(llm)
+    close_task = None
+    try:
+        await r.frames("s", 15)
+        await r.frames("q", 25)
+        await r.settle()
+        assert r.s.history[1]["content"] == "[caller audio]"
+        started = {t for t in asyncio.all_tasks() if t is not asyncio.current_task()}
+        close_task = asyncio.create_task(r.s.close())
+        await r.settle()
+        assert not close_task.done()
+        close_task.cancel()
+        await r.settle()
+        assert not close_task.done()
+        assert r.s.history[1]["content"] == "[caller audio]"
+        assert not any(e["type"] == "user_transcript" for e in r.events)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+        close_task = None
+        assert r.s.history[1]["content"] == "saved on hangup"
+        assert any(e["type"] == "user_transcript" and e["text"] == "saved on hangup" for e in r.events)
+        for t in started:
+            if not t.done():
+                t.cancel()
+        await r.settle()
+        assert r.s.history[1]["content"] == "saved on hangup"
+        assert any(e["type"] == "user_transcript" and e["text"] == "saved on hangup" for e in r.events)
+    finally:
+        release.set()
+        if close_task is not None:
+            if not close_task.done():
+                close_task.cancel()
+            try:
+                await close_task
+            except asyncio.CancelledError:
+                pass
+
+
 async def test_speech_resume_does_not_cancel_the_previous_transcript():
     """A resumed pause cancels the speculative reply, not the previous turn's ASR."""
     release = asyncio.Event()

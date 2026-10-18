@@ -134,6 +134,7 @@ class Session:
         self._gen: Optional[_Generation] = None
         self._last_speech_clock = 0.0
         self._transcript_task: Optional[asyncio.Task] = None
+        self._transcript_tasks: set[asyncio.Task] = set()
         self._bg: set[asyncio.Task] = set()
         self.stats = {"turns": 0, "speculations": 0, "speculations_cancelled": 0, "interruptions": 0}
 
@@ -213,11 +214,28 @@ class Session:
         self._emit("user_transcript", text=text, source="text")
 
     async def close(self) -> None:
-        self._cancel_eot()
-        if self._gen:
-            await self._cancel(self._gen)
-        if self._transcript_task:
-            await asyncio.gather(self._transcript_task, return_exceptions=True)
+        try:
+            self._cancel_eot()
+            if self._gen:
+                await self._cancel(self._gen)
+        finally:
+            # Hang-up can land while close() is still in _cancel. Finish transcripts either way.
+            await self._finish_transcripts()
+
+    async def _finish_transcripts(self) -> None:
+        # Every in-flight ASR, not only the latest pointer: a later commit replaces it
+        # while the earlier turn is still "[caller audio]". Shielded, and a cancel of
+        # close() waits the shield out. A bare gather would cancel the transcript.
+        tasks = [t for t in list(self._transcript_tasks) if not t.done()]
+        if not tasks:
+            return
+        try:
+            await asyncio.gather(*(asyncio.shield(t) for t in tasks), return_exceptions=True)
+        except asyncio.CancelledError:
+            pending = [t for t in tasks if not t.done()]
+            if pending:
+                await asyncio.gather(*(asyncio.shield(t) for t in pending), return_exceptions=True)
+            raise
 
     # --------------------------------------------------------------- events
     def _emit(self, type_: str, **data: Any) -> None:
@@ -305,8 +323,14 @@ class Session:
         self.history.append({"role": "user", "content": "[caller audio]"})
         self.history.append({"role": "assistant", "content": ""})
         user_idx = len(self.history) - 2
-        self._transcript_task = asyncio.create_task(self._transcribe(gen.audio, user_idx))
-        gen.transcript_task = self._transcript_task   # so a later turn's task is not the one we await
+        task = asyncio.create_task(self._transcribe(gen.audio, user_idx))
+        self._transcript_tasks.add(task)
+        if task.done():
+            self._transcript_tasks.discard(task)
+        else:
+            task.add_done_callback(self._transcript_tasks.discard)
+        self._transcript_task = task
+        gen.transcript_task = task   # so a later turn's task is not the one we await
         gen.user_idx = user_idx
         gen.commit.set()
 
@@ -317,7 +341,10 @@ class Session:
             text = "[inaudible]"
             self._emit("error", where="transcribe", error=repr(e))
         self.history[idx]["content"] = text
-        self._emit("user_transcript", text=text)
+        try:
+            self._emit("user_transcript", text=text)
+        except Exception as e:  # noqa: BLE001  (a store write must not skip the tool round)
+            self._emit("error", where="user_transcript", error=repr(e))
         if self.on_utterance is not None:
             try:
                 self.on_utterance(audio, text, self._last_eot)

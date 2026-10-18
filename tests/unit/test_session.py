@@ -237,6 +237,69 @@ async def test_noise_burst_triggers_nothing():
     assert llm.calls == [] and r.sent == []
 
 
+def test_default_model_context_budget_is_6000_tokens():
+    assert SessionConfig().max_context_tokens == 6000
+
+
+async def test_long_history_is_fitted_for_the_model_but_stored_in_full():
+    llm = FakeLLM([["Okay."]])
+    cfg = SessionConfig(max_context_tokens=200, tts_poll_s=0,
+                        system_prompt="You are a helpful receptionist.")
+    r = Rig(llm, cfg=cfg)
+    seeded = []
+    for i in range(60):
+        seeded.append({"role": "user", "text": f"user-{i:02d}-" + ("abcd" * 8)})
+        seeded.append({"role": "agent", "text": f"agent-{i:02d}-" + ("efgh" * 8)})
+    r.s.seed_history(seeded)
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    shown = llm.calls[0]["history"]
+    from core.history import estimate_messages
+    assert estimate_messages(shown) <= 200
+    assert shown[0]["content"].startswith("You are a helpful")
+    assert any(m["role"] == "user" and "user-59-" in m["content"] for m in shown)
+    stored_users = [m for m in r.s.history if m["role"] == "user" and str(m["content"]).startswith("user-")]
+    assert len(stored_users) == 60
+    assert not any(str(m.get("content", "")).startswith("Earlier in this call:") for m in r.s.history)
+    assert estimate_messages(r.s.history) > 200
+
+
+async def test_tool_round_leaves_room_for_followups_in_the_token_budget():
+    """Tool-call arguments are part of the request. A later round must shrink history to fit them."""
+    from core.history import estimate_messages
+
+    async def lookup(args):
+        return "ok"
+
+    llm = FakeLLM([["Checking. ", ToolCall("t1", "lookup", {"q": "x" * 3000})], ["Done."]])
+    cfg = SessionConfig(max_context_tokens=200, tts_poll_s=0,
+                        system_prompt="You are a helpful receptionist.")
+    r = Rig(llm, cfg=cfg, tools={"lookup": lookup})
+    seeded = []
+    for i in range(30):
+        seeded.append({"role": "user", "text": f"user-{i:02d}-" + ("abcd" * 8)})
+        seeded.append({"role": "agent", "text": f"agent-{i:02d}-" + ("efgh" * 8)})
+    r.s.seed_history(seeded)
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    assert len(llm.calls) >= 2
+    assert estimate_messages(llm.calls[0]["history"]) <= 200
+    followups = llm.calls[1]["followups"]
+    assert followups[0]["tool_calls"][0]["id"] == "t1"
+    assert followups[1]["role"] == "tool" and followups[1]["tool_call_id"] == "t1"
+    assert estimate_messages(followups) > 200          # arguments alone exceed the budget
+    shown = llm.calls[1]["history"]
+    assert shown[0]["content"].startswith("You are a helpful")
+    assert [m for m in shown if m["role"] == "user"] == [
+        m for m in shown if "user-29-" in (m.get("content") or "")]
+    # Nothing older than the system prompt and that latest user message is still attached.
+    assert len(shown) == 2
+    stored_users = [m for m in r.s.history if str(m.get("content", "")).startswith("user-")]
+    assert len(stored_users) == 30
+
+
 async def test_second_turn_history_contains_first_transcript():
     llm = FakeLLM([["First ", "reply."], ["Second ", "reply."]])
     r = Rig(llm)

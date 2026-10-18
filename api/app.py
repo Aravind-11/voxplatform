@@ -249,6 +249,23 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         except toolmod.ToolConfigError as e:
             raise HTTPException(422, str(e)) from e
 
+    def tool_warnings(specs, tenant_id: str) -> list[str]:
+        """Soft cap: a large tool list is saved, and the response says so. Not a 422."""
+        try:
+            resolved = toolmod.resolve_library(specs or [], lambda n: (store.get_tool(tenant_id, n) or {}).get("spec"))
+            schemas, _fns = toolmod.build(resolved)
+        except toolmod.ToolConfigError:
+            return []
+        warning = toolmod.warn_schema_tokens(schemas)
+        return [warning] if warning else []
+
+    def respond_agent(agent: dict, tenant_id: str) -> dict:
+        out = redacted(agent)
+        warnings = tool_warnings(agent["config"].get("tools") or [], tenant_id)
+        if warnings:
+            out["warnings"] = warnings
+        return out
+
     def check_voice(voice, language=None) -> None:
         if voice is not None and voice not in VOICES:
             raise HTTPException(422, f"unknown voice {voice!r}; see GET /v1/voices")
@@ -389,7 +406,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         call_variables(cfg0, None, strict=False)
         a = store.create_agent(t["id"], body.name, cfg0)
         log(t, "agent.create", a["id"], name=body.name)
-        return redacted(a)
+        return respond_agent(a, t["id"])
 
     @app.patch("/v1/agents/{agent_id}")
     async def update_agent(agent_id: str, body: AgentPatch, t: dict = Depends(tenant_write)):
@@ -414,7 +431,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             cfg["voice"] = eff_voice
             changed.append("voice")
         log(t, "agent.update", agent_id, fields=changed)
-        return redacted(store.update_agent(t["id"], agent_id, body.name, cfg))
+        return respond_agent(store.update_agent(t["id"], agent_id, body.name, cfg), t["id"])
 
     @app.delete("/v1/agents/{agent_id}")
     async def delete_agent(agent_id: str, t: dict = Depends(tenant_write)):

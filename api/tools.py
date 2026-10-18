@@ -118,6 +118,22 @@ def resolve_library(specs: list, lookup: Callable[[str], Optional[Any]]) -> list
     return out
 
 
+def schema_tokens(schemas) -> int:
+    """Rough token count of the tool schemas shown to the model (4 characters ≈ 1 token)."""
+    if not schemas:
+        return 0
+    return max(1, len(json.dumps(schemas, separators=(",", ":"))) // 4)
+
+
+def warn_schema_tokens(schemas, limit: int = 2000) -> str | None:
+    """A warning when tool schemas would crowd out the conversation. Never a reason to reject the agent."""
+    n = schema_tokens(schemas)
+    if n > limit:
+        return (f"tool schemas are about {n} tokens, over the {limit} token budget; "
+                "they may crowd out the conversation")
+    return None
+
+
 def validate_specs(specs: list) -> list[dict]:
     """Normalizes an agent's tool list or raises ToolConfigError (surfaced as HTTP 422 at agent creation)."""
     out: list[dict] = []

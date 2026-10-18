@@ -100,6 +100,10 @@ class Runtime:
         """
         self.message_log.wait()
 
+    def peek_message_error(self, call_id: str | None = None) -> BaseException | None:
+        """This call's insert failure, still stored so flush_messages can raise it."""
+        return self.message_log.peek_error(call_id)
+
     def finalize(self, call_id: str) -> Optional[str]:
         """Called when a call ends: forgets the live session and writes the recording. Returns the WAV path."""
         self.live.pop(call_id, None)

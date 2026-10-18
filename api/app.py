@@ -487,9 +487,16 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
         def _read():
             runtime.wait_messages()  # a row still in the writer is not an empty transcript
+            # Peek: finish still has to raise this, so a reader must not pop it.
+            err = runtime.peek_message_error(call_id)
+            if err is not None:
+                return err
             return store.messages(call_id)
 
-        return await to_thread(_read)
+        got = await to_thread(_read)
+        if isinstance(got, BaseException):
+            raise HTTPException(500, f"{type(got).__name__}: {got}")
+        return got
 
     @app.get("/v1/usage")
     async def usage(days: int = 30, t: dict = Depends(tenant)):
@@ -786,12 +793,19 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                         cur = store.get_call_any(call["id"])
                     except Exception as exc:  # noqa: BLE001
                         last = exc
-                    if cur is None or cur.get("status") == "active":
+                    # Resume may already have ended the row as stream_lost. A failed insert still
+                    # has to replace that reason; leaving it reports a lost transcript as a cut-off.
+                    must_record_failure = write_err is not None and (
+                        cur is None or cur.get("status") == "active" or cur.get("end_reason") != "transcript_failed")
+                    if cur is None or cur.get("status") == "active" or must_record_failure:
                         store.update_call(call["id"], status="ended", ended=time.time(), end_reason=end_reason)
                     done = store.get_call_any(call["id"])
-                    # Already ended (or no longer active): don't keep writing. Still active means the
-                    # update did not land; retry once.
+                    # Still active means the update did not land; retry once. Another end reason is
+                    # final unless this call's transcript insert failed.
                     if done is not None and done.get("status") != "active":
+                        if write_err is not None and done.get("end_reason") != "transcript_failed":
+                            last = RuntimeError("transcript failure was not recorded")
+                            continue
                         secs = round((done["ended"] - done["joined"]), 2) if done.get("joined") and done.get("ended") else 0.0
                         return done, secs
                 except Exception as exc:  # noqa: BLE001
@@ -823,9 +837,18 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             except Exception:  # noqa: BLE001  (a failed recording write must not break call teardown)
                 METRICS.inc("vox_errors_total", where="finalize")
             extra = {}
+            failures = []
             if write_err is not None:
-                extra["error"] = f"{type(write_err).__name__}: {write_err}"
-            webhook(t, "call.ended", done, durationSeconds=secs, transcript=transcript, **extra)
+                failures.append(f"{type(write_err).__name__}: {write_err}")
+            if read_err is not None:
+                failures.append(f"{type(read_err).__name__}: {read_err}")
+            if failures:
+                extra["error"] = "; ".join(failures)
+            # An unread transcript is not an empty one: omitting it keeps a retry from
+            # delivering [] for rows that are still in the table.
+            if read_err is None:
+                extra["transcript"] = transcript
+            webhook(t, "call.ended", done, durationSeconds=secs, **extra)
         if write_err is not None:
             raise write_err
         if snap_err is not None:
@@ -980,8 +1003,17 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if call["status"] in ("created", "active"):
             def _lose():
                 # The end row must not land while the last lines are still only in the writer.
+                # A failed insert is not a clean cut-off. finish may already have consumed the
+                # in-memory error and stored transcript_failed; do not replace that.
                 runtime.wait_messages()
-                store.update_call(call_id, status="ended", ended=time.time(), end_reason="stream_lost")
+                err = runtime.peek_message_error(call_id)
+                cur = store.get_call_any(call_id)
+                if cur is not None and cur.get("end_reason") == "transcript_failed" and cur.get("status") != "active":
+                    return
+                reason = "stream_lost"
+                if err is not None or (cur or {}).get("end_reason") == "transcript_failed":
+                    reason = "transcript_failed"
+                store.update_call(call_id, status="ended", ended=time.time(), end_reason=reason)
             await to_thread(_lose)
             limiter.release(call["tenant_id"], call_id)            # frees the dead node's slot at once
         nxt = await to_thread(store.create_call, call["tenant_id"], call["agent_id"], "twilio", call["config"],
@@ -1086,11 +1118,16 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not await to_thread(store.get_call_any, call_id):
             raise HTTPException(404, "call not found")
 
-        def _said() -> list[str]:
+        def _said():
             runtime.wait_messages()
+            err = runtime.peek_message_error(call_id)
+            if err is not None:
+                return err
             return [m["text"] for m in store.messages(call_id) if m["role"] == "user" and m["text"] != "[inaudible]"][-2:]
 
         said = await to_thread(_said)
+        if isinstance(said, BaseException):
+            raise HTTPException(500, f"{type(said).__name__}: {said}")
         clean = lambda x: re.sub(r"[^\w\s.,?!'-]", "", x)[:160]  # noqa: E731
         summary = " Then they said: ".join(clean(x) for x in said) or "They did not leave details"
         from xml.sax.saxutils import escape as xesc

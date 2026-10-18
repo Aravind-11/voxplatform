@@ -423,6 +423,84 @@ def test_close_reports_a_failed_drain_and_stays_idempotent():
     log.close()
 
 
+def test_flush_still_raises_after_close_has_reported_the_insert_error():
+    """Shutdown must not pop the failure finish is waiting to flush, including a second close."""
+    store = Store(":memory:")
+
+    def boom(call_id, role, text, t):
+        raise sqlite3.OperationalError("disk full")
+
+    store.add_message = boom
+    log = MessageLog(store)
+    log.add("c", "user", "bad", 1.0)
+    with pytest.raises(sqlite3.OperationalError, match="disk full"):
+        log.close()
+    log.close()
+    with pytest.raises(sqlite3.OperationalError, match="disk full"):
+        log.flush("c")
+    assert store.messages("c") == []
+
+
+def test_flush_overlapping_close_keeps_each_calls_insert_error():
+    """close and flush run together: each call's insert error still reaches its flush."""
+    store = Store(":memory:")
+    started, release = threading.Event(), threading.Event()
+
+    def boom(call_id, role, text, t):
+        if text == "first":
+            started.set()
+            assert release.wait(3)
+            raise sqlite3.OperationalError("disk full c")
+        raise sqlite3.OperationalError("disk full d")
+
+    store.add_message = boom
+    log = MessageLog(store)
+    errors: dict[str, str | None] = {}
+
+    def _close():
+        try:
+            log.close()
+        except sqlite3.OperationalError as exc:
+            errors["close"] = str(exc)
+        else:
+            errors["close"] = None
+
+    def _flush():
+        try:
+            log.flush("c")
+        except sqlite3.OperationalError as exc:
+            errors["flush_c"] = str(exc)
+        else:
+            errors["flush_c"] = None
+
+    try:
+        log.add("c", "user", "first", 1.0)
+        assert started.wait(1)
+        closer = threading.Thread(target=_close, daemon=True)
+        closer.start()
+        for _ in range(200):
+            if log._closed:
+                break
+            time.sleep(0.01)
+        assert log._closed and not log._drained
+        log.add("d", "user", "second", 2.0)
+        flusher = threading.Thread(target=_flush, daemon=True)
+        flusher.start()
+        time.sleep(0.05)
+        assert flusher.is_alive()
+        release.set()
+        closer.join(3)
+        flusher.join(3)
+        assert not closer.is_alive() and not flusher.is_alive()
+        assert errors.get("close") == "disk full c"
+        assert errors.get("flush_c") == "disk full c"
+        with pytest.raises(sqlite3.OperationalError, match="disk full d"):
+            log.flush("d")
+        log.close()
+    finally:
+        release.set()
+
+
 def _on_loop() -> bool:
     try:
         asyncio.get_running_loop()
@@ -823,6 +901,243 @@ def test_queued_transcript_is_visible_before_whisper_messages_history_or_end():
             rt.message_log.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def test_resume_keeps_a_transcript_failure_and_readers_report_it():
+    """Resume has already seen an active call when the insert fails. That is not a clean stream loss,
+    and whisper / messages must not look like an empty transcript."""
+    import httpx
+
+    from api import security
+    from api.app import create_app
+    from tests.unit.test_api import SETTINGS, sign
+
+    store = Store(":memory:")
+    rt = Runtime(_LLM(), lambda voice: _TTS(), _VAD, store)
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), None, SETTINGS)
+    tid = store.create_tenant("a")
+    key = security.generate_key()
+    store.add_key(tid, security.hash_key(key), "initial")
+    call = store.create_call(tid, None, "twilio", {"systemPrompt": "Be brief."},
+                             {"from": "+15550001", "to": "+15550002"})
+    store.update_call(call["id"], status="active", joined=time.time())
+    seen, release = threading.Event(), threading.Event()
+    real_wait = rt.wait_messages
+    reasons: list[str] = []
+    real_update = store.update_call
+
+    def wait_messages():
+        # _lose is only reached after resume has observed created/active.
+        if not seen.is_set():
+            seen.set()
+            assert release.wait(3)
+        return real_wait()
+
+    def update(call_id, **fields):
+        if fields.get("end_reason"):
+            reasons.append(fields["end_reason"])
+        return real_update(call_id, **fields)
+
+    def boom(call_id, role, text, t):
+        raise sqlite3.OperationalError("disk full")
+
+    rt.wait_messages = wait_messages
+    store.update_call = update
+    store.add_message = boom
+
+    async def _drive():
+        form = {"CallSid": "CA1"}
+        base = "https://vox.example.com"
+        resume = f"/twilio/resume/{call['id']}"
+        whisper = f"/twilio/whisper/{call['id']}"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=base) as client:
+            task = asyncio.create_task(client.post(resume, data=form, headers=sign(base + resume, form)))
+            assert await asyncio.to_thread(seen.wait, 2)
+            assert store.get_call_any(call["id"])["status"] == "active"
+            rt.message_log.add(call["id"], "user", "need a refund", 1.0)
+            release.set()
+            resume_r = await asyncio.wait_for(task, 3)
+            whisper_r = await client.post(whisper, data=form, headers=sign(base + whisper, form))
+            messages_r = await client.get(f"/v1/calls/{call['id']}/messages", headers={"X-API-Key": key})
+        assert resume_r.status_code == 200
+        row = store.get_call_any(call["id"])
+        assert row["status"] == "ended" and row["end_reason"] == "transcript_failed"
+        assert reasons == ["transcript_failed"]
+        assert whisper_r.status_code == 500 and "disk full" in whisper_r.text
+        assert "did not leave details" not in whisper_r.text
+        assert messages_r.status_code == 500 and "disk full" in messages_r.text
+        # finish can still raise: readers only peeked
+        with pytest.raises(sqlite3.OperationalError, match="disk full"):
+            rt.flush_messages(call["id"])
+
+    try:
+        asyncio.run(_drive())
+    finally:
+        release.set()
+        try:
+            rt.message_log.close()
+        except sqlite3.OperationalError:
+            pass
+
+
+def test_resume_does_not_replace_a_stored_transcript_failure():
+    """finish already ended the call as transcript_failed and consumed the insert error. Resume must not
+    overwrite that with stream_lost."""
+    import httpx
+
+    from api import security
+    from api.app import create_app
+    from tests.unit.test_api import SETTINGS, sign
+
+    store = Store(":memory:")
+    rt = Runtime(_LLM(), lambda voice: _TTS(), _VAD, store)
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), None, SETTINGS)
+    tid = store.create_tenant("a")
+    call = store.create_call(tid, None, "twilio", {"systemPrompt": "Be brief."},
+                             {"from": "+15550001", "to": "+15550002"})
+    store.update_call(call["id"], status="active", joined=time.time())
+    seen, release = threading.Event(), threading.Event()
+    real_wait = rt.wait_messages
+    reasons: list[str] = []
+    real_update = store.update_call
+
+    def wait_messages():
+        if not seen.is_set():
+            seen.set()
+            assert release.wait(3)
+        return real_wait()
+
+    def update(call_id, **fields):
+        if fields.get("end_reason"):
+            reasons.append(fields["end_reason"])
+        return real_update(call_id, **fields)
+
+    rt.wait_messages = wait_messages
+    store.update_call = update
+
+    async def _drive():
+        form = {"CallSid": "CA1"}
+        base = "https://vox.example.com"
+        resume = f"/twilio/resume/{call['id']}"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=base) as client:
+            task = asyncio.create_task(client.post(resume, data=form, headers=sign(base + resume, form)))
+            assert await asyncio.to_thread(seen.wait, 2)
+            # flush already raised inside finish; only the ended row remains.
+            real_update(call["id"], status="ended", ended=time.time(), end_reason="transcript_failed")
+            release.set()
+            resume_r = await asyncio.wait_for(task, 3)
+        assert resume_r.status_code == 200
+        row = store.get_call_any(call["id"])
+        assert row["end_reason"] == "transcript_failed" and "stream_lost" not in reasons
+
+    try:
+        asyncio.run(_drive())
+    finally:
+        release.set()
+        rt.message_log.close()
+
+
+def test_finish_rewrites_stream_lost_when_the_transcript_insert_failed():
+    """A row resume already ended as stream_lost is still a lost transcript once flush raises."""
+    from starlette.testclient import TestClient
+
+    from api import security
+    from api.app import create_app
+    from tests.unit.test_api import SETTINGS, silence, tenant
+
+    store = Store(":memory:")
+    rt = Runtime(_LLM(), lambda voice: _TTS(), _VAD, store)
+    events: list[dict] = []
+
+    class D:
+        def spawn(self, url, secret, event):
+            events.append(event)
+
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), D(), SETTINGS)
+
+    def boom(call_id, role, text, t):
+        raise sqlite3.OperationalError("disk full")
+
+    store.add_message = boom
+    c = TestClient(app)
+    k, _ = tenant(c)
+    assert c.put("/v1/webhook", json={"url": "https://hook.example.com/x"}, headers={"X-API-Key": k}).status_code == 200
+    call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers={"X-API-Key": k}).json()
+    path = call["joinUrl"].replace("wss://vox.example.com", "")
+    caught = None
+    try:
+        with c.websocket_connect(path) as ws:
+            for _ in range(50):
+                cur = store.get_call_any(call["id"])
+                if cur and cur["status"] == "active":
+                    break
+                time.sleep(0.02)
+            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="stream_lost")
+            rt.message_log.add(call["id"], "user", "hello", 1.0)
+            ws.send_bytes(silence(1)[0])
+    except BaseException as exc:  # noqa: BLE001 — finish re-raises the failed insert
+        caught = exc
+    row = store.get_call_any(call["id"])
+    assert row["status"] == "ended" and row["end_reason"] == "transcript_failed"
+    assert caught is not None and "disk full" in repr(caught)
+    ended = [e for e in events if e["type"] == "call.ended"]
+    assert len(ended) == 1
+    assert ended[0]["call"]["end_reason"] == "transcript_failed"
+    assert "disk full" in ended[0].get("error", "")
+
+
+def test_transcript_read_failure_is_on_call_ended_not_an_empty_list():
+    """A committed transcript that cannot be read is not delivered as [] with no error."""
+    from starlette.testclient import TestClient
+
+    from api import security
+    from api.app import create_app
+    from tests.unit.test_api import SETTINGS, silence, tenant
+
+    store = Store(":memory:")
+    rt = Runtime(_LLM(), lambda voice: _TTS(), _VAD, store)
+    events: list[dict] = []
+
+    class D:
+        def spawn(self, url, secret, event):
+            events.append(event)
+
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), D(), SETTINGS)
+    phase = {"on": False}
+    real_messages = store.messages
+
+    def messages(call_id):
+        if phase["on"]:
+            raise sqlite3.OperationalError("read failed")
+        return real_messages(call_id)
+
+    store.messages = messages
+    c = TestClient(app)
+    k, _ = tenant(c)
+    assert c.put("/v1/webhook", json={"url": "https://hook.example.com/x"}, headers={"X-API-Key": k}).status_code == 200
+    call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers={"X-API-Key": k}).json()
+    path = call["joinUrl"].replace("wss://vox.example.com", "")
+    caught = None
+    try:
+        with c.websocket_connect(path) as ws:
+            for _ in range(50):
+                cur = store.get_call_any(call["id"])
+                if cur and cur["status"] == "active":
+                    break
+                time.sleep(0.02)
+            store.add_message(call["id"], "user", "saved line", 1.0)
+            phase["on"] = True
+            ws.send_bytes(silence(1)[0])
+    except BaseException as exc:  # noqa: BLE001
+        caught = exc
+    assert real_messages(call["id"]) == [{"role": "user", "text": "saved line", "t": 1.0}]
+    row = store.get_call_any(call["id"])
+    assert row["status"] == "ended"
+    assert caught is not None and "read failed" in repr(caught)
+    ended = [e for e in events if e["type"] == "call.ended"]
+    assert len(ended) == 1
+    assert "read failed" in ended[0].get("error", "")
+    assert "transcript" not in ended[0]
 
 
 async def test_query_corpus_reads_the_store_off_the_event_loop():

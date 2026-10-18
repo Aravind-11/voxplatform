@@ -22,6 +22,7 @@ class MessageLog:
         self._cv = threading.Condition()
         self._closed = False
         self._drained = False
+        self._close_reported = False
         self._late: list[tuple] = []
         self._errors: list[tuple[str, BaseException]] = []
         self._thread = threading.Thread(target=self._run, name="vox-messages", daemon=True)
@@ -66,6 +67,26 @@ class MessageLog:
                 return exc
         return None
 
+    def peek_error(self, call_id: str | None = None) -> BaseException | None:
+        """Insert failure for this call, left in place so flush can still raise it."""
+        with self._cv:
+            if call_id is None:
+                return self._errors[0][1] if self._errors else None
+            for cid, exc in self._errors:
+                if cid == call_id:
+                    return exc
+            return None
+
+    def _report_close_error(self) -> BaseException | None:
+        """Caller holds self._cv. Report the oldest insert failure once, without removing it.
+
+        finish() flushes by call id after shutdown. Popping here made that flush look successful.
+        """
+        if self._close_reported or not self._errors:
+            return None
+        self._close_reported = True
+        return self._errors[0][1]
+
     def _run(self) -> None:
         while True:
             item = self._q.get()
@@ -106,6 +127,7 @@ class MessageLog:
         """Block until every `add` so far has been written. Never call this on the event loop.
 
         Raises this call's insert error (or the oldest, if `call_id` is omitted). The writer keeps running.
+        close() may already have reported that error; it stays stored until this call takes it.
         """
         while True:
             self._q.join()
@@ -121,7 +143,10 @@ class MessageLog:
             raise err
 
     def close(self) -> None:
-        """Stop the writer after it drains the queue. A failed insert is raised once."""
+        """Stop the writer after it drains the queue. The first close raises a failed insert once.
+
+        The error stays stored until flush takes it, so finish still sees it after shutdown.
+        """
         with self._cv:
             leader = not self._closed and not self._drained
             if leader:
@@ -131,7 +156,7 @@ class MessageLog:
                     self._cv.wait()
         if not leader:
             with self._cv:
-                err = self._take_error()
+                err = self._report_close_error()
             if err is not None:
                 raise err
             return
@@ -154,7 +179,7 @@ class MessageLog:
                     batch = self._take_late()
                     if not batch:
                         self._drained = True
-                        err = self._take_error()
+                        err = self._report_close_error()
                         self._cv.notify_all()
                         break
                 for item in batch:

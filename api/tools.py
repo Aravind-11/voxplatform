@@ -66,6 +66,7 @@ class CallContext:
     embedder: Any = None                                            # optional core.embed.OpenAIEmbedder (hybrid KB search)
     base_url: str = ""                                              # public URL of this API (warm-transfer callbacks)
     call_control: Any = None                                        # TwilioCallControl or AsteriskCallControl; None uses ctx.twilio
+    medium: str = ""                                                # sip, twilio, webSocket; which controller a live call may use
 
 
 def _canon(args: dict) -> str:

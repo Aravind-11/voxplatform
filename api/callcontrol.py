@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import os
 from typing import Any, Optional, Protocol
+from urllib.parse import quote
 from xml.sax.saxutils import escape, quoteattr
+
+# A dotted Asterisk uniqueid (1730000000.42) is one segment. "/", "?", and a bare ".." are not.
+_SAFE_CHANNEL = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-")
 
 
 class CallControl(Protocol):
@@ -65,6 +69,15 @@ class TwilioCallControl:
             raise RuntimeError(f"twilio hangup failed: HTTP {r.status_code}")
 
 
+def _channel_segment(call_sid: str) -> str:
+    """One ARI path segment. A raw slash, question mark, or '..' would redirect or delete another resource."""
+    if not isinstance(call_sid, str) or not call_sid:
+        raise RuntimeError("asterisk channel id is empty")
+    if call_sid not in {".", ".."} and all(c in _SAFE_CHANNEL for c in call_sid):
+        return call_sid
+    return quote(call_sid, safe="").replace(".", "%2E")
+
+
 class AsteriskCallControl:
     """ARI. `originate` enters Stasis app `vox` (this process does not run that app). `appArgs` of
     `amd,<call id>` tells it to POST AnsweredBy to /sip/amd/<call id>. `transfer` is a blind redirect;
@@ -84,27 +97,42 @@ class AsteriskCallControl:
             params["appArgs"] = twiml_or_app
         return await self.client.post(f"{self.ari_url}/ari/channels", params=params, auth=self._auth(), timeout=15)
 
+    def _channel_url(self, call_sid: str) -> str:
+        return f"{self.ari_url}/ari/channels/{_channel_segment(call_sid)}"
+
     async def transfer(self, call_sid: str, to: str, mode: str = "cold", *, call_id: str = "", target: str = "") -> None:
         del mode, call_id, target
         r = await self.client.post(
-            f"{self.ari_url}/ari/channels/{call_sid}/redirect",
+            self._channel_url(call_sid) + "/redirect",
             params={"endpoint": f"PJSIP/{to}"}, auth=self._auth(), timeout=10)
         if r.status_code >= 300:
             raise RuntimeError(f"asterisk transfer failed: HTTP {r.status_code}")
 
     async def hangup(self, call_sid: str) -> None:
-        r = await self.client.delete(f"{self.ari_url}/ari/channels/{call_sid}", auth=self._auth(), timeout=10)
+        r = await self.client.delete(self._channel_url(call_sid), auth=self._auth(), timeout=10)
         if r.status_code >= 300:
             raise RuntimeError(f"asterisk hangup failed: HTTP {r.status_code}")
 
 
-def control_from_env(client: Any, public_url: str = "") -> Optional[CallControl]:
-    """ARI wins when ASTERISK_ARI_URL is set; otherwise Twilio when both account sid and token are set."""
+def control_from_env(client: Any, public_url: str = "", medium: Optional[str] = None) -> Optional[CallControl]:
+    """SIP uses ARI when ASTERISK_ARI_URL is set. Twilio keeps Twilio even if ARI is also set.
+    Any other medium (a browser call) gets no controller. Callers that omit medium keep the
+    previous rule, ARI if set, otherwise Twilio, so a session with no medium is unchanged."""
     ari = os.environ.get("ASTERISK_ARI_URL", "").strip()
-    if ari:
+    sid, token = os.environ.get("TWILIO_ACCOUNT_SID", ""), os.environ.get("TWILIO_AUTH_TOKEN", "")
+
+    def asterisk() -> AsteriskCallControl:
         return AsteriskCallControl(client, ari, os.environ.get("ASTERISK_ARI_USER", ""),
                                    os.environ.get("ASTERISK_ARI_PASSWORD", ""))
-    sid, token = os.environ.get("TWILIO_ACCOUNT_SID", ""), os.environ.get("TWILIO_AUTH_TOKEN", "")
+
+    if medium == "sip":
+        return asterisk() if ari else None
+    if medium == "twilio":
+        return TwilioCallControl(client, sid, token, public_url) if sid and token else None
+    if medium:
+        return None
+    if ari:
+        return asterisk()
     if sid and token:
         return TwilioCallControl(client, sid, token, public_url)
     return None

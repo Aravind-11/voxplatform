@@ -161,6 +161,9 @@ def make(defn: dict, ctx, client):
         # Tests that only set ctx.twilio leave it empty and keep the same credential and URL checks.
         control = getattr(ctx, "call_control", None)
         if control is None:
+            # A SIP call must not fall through to Twilio: the AudioSocket id is not a Twilio Call SID.
+            if getattr(ctx, "medium", "") == "sip":
+                return {"error": "transfer is only available on SIP calls when ASTERISK_ARI_URL is configured"}
             if not ctx.call_sid or not ctx.twilio or client is None:
                 return {"error": "transfer is only available on phone calls with Twilio credentials configured"}
             # Older callers pass a small ctx with no base_url; cold transfer never needed it.
@@ -170,6 +173,9 @@ def make(defn: dict, ctx, client):
             control = TwilioCallControl(client, ctx.twilio["sid"], ctx.twilio["token"], base_url)
         elif isinstance(control, TwilioCallControl) and mode == "warm" and (not control.base_url or not getattr(ctx, "call_id", "")):
             return {"error": "warm transfer needs the public URL configured"}
+        if not ctx.call_sid:
+            # A controller from the environment used to skip this check and report success with no channel.
+            return {"error": "transfer is only available on a live phone call"}
 
         async def do() -> None:
             await control.transfer(ctx.call_sid, number, mode, call_id=getattr(ctx, "call_id", ""), target=to)

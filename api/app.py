@@ -1115,8 +1115,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             sess, transport = live
 
             async def go():
-                await sess.say_and_wait(msg)
-                await transport.end()
+                try:
+                    await sess.say_and_wait(msg)
+                finally:
+                    # A TTS failure must still drop the line; otherwise the machine stays connected.
+                    await transport.end()
             import asyncio
             asyncio.get_running_loop().create_task(go())
             return {"action": "voicemail"}

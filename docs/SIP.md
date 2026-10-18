@@ -34,7 +34,7 @@ Without Docker: install Asterisk 18+ (needs the AudioSocket modules), copy the f
 ## Outbound, transfer, voicemail
 `POST /v1/calls/outbound` with `"channel": "sip"` (default is still `"twilio"`) originates through Asterisk ARI: `POST {ASTERISK_ARI_URL}/ari/channels` with `endpoint=PJSIP/{to}@voxsun`, `app=vox`, and basic auth from `ASTERISK_ARI_USER` / `ASTERISK_ARI_PASSWORD`. A `voicemailMessage` sets `appArgs` to `amd,<call id>`. The Stasis app posts `AnsweredBy` (form or JSON) to `POST /sip/amd/{call id}` with header `X-Vox-Sip-Token` (`VOX_SIP_TOKEN`). An empty token turns that route off (404); a mismatch is 403. On `machine_end` while the call is live, the engine speaks the message and hangs up, the same action as Twilio AMD.
 
-A transfer on a SIP call is `POST /ari/channels/{id}/redirect` with `endpoint=PJSIP/{number}`. Hangup is `DELETE /ari/channels/{id}`. The runtime picks Asterisk when `ASTERISK_ARI_URL` is set, otherwise Twilio when the Twilio credentials are set.
+A transfer on a SIP call is `POST /ari/channels/{id}/redirect` with `endpoint=PJSIP/{number}`. Hangup is `DELETE /ari/channels/{id}`. The channel id is one path segment, so a slash or `..` cannot select another ARI resource. A SIP call uses Asterisk when `ASTERISK_ARI_URL` is set. A Twilio call keeps using Twilio even if that URL is also set.
 
 ## Known limits
 - **Caller number is not passed:** AudioSocket carries only a call UUID. The agent does not know who is calling until we add it (Asterisk can pass it another way; not built).

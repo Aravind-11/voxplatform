@@ -667,6 +667,34 @@ def test_sip_outbound_originates_on_asterisk_and_not_twilio(monkeypatch):
                    headers={"X-Vox-Sip-Token": "s3cret"}).status_code == 404
 
 
+def test_sip_amd_hangs_up_when_the_voicemail_cannot_be_spoken(monkeypatch):
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    c, store, rt = make_outbound(lambda req: httpx.Response(200, json={"id": "chan-9"}), sip_token="s3cret")
+    k, _ = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                           "voicemailMessage": "leave this"}, headers=H(k))
+    assert r.status_code == 200, r.text
+    cid = r.json()["id"]
+    spoke = []
+
+    class S:
+        async def say_and_wait(self, m):
+            spoke.append(m)
+            raise RuntimeError("tts down")
+
+    class Tr:
+        async def end(self):
+            spoke.append("END")
+    rt.live[cid] = (S(), Tr())
+    res = c.post(f"/sip/amd/{cid}", json={"AnsweredBy": "machine_end_beep"}, headers={"X-Vox-Sip-Token": "s3cret"})
+    assert res.json()["action"] == "voicemail"
+    deadline = time.time() + 2
+    while spoke != ["leave this", "END"] and time.time() < deadline:
+        time.sleep(0.05)
+    assert spoke == ["leave this", "END"]
+
+
 def test_sip_outbound_without_ari_is_503_and_stores_nothing(monkeypatch):
     monkeypatch.delenv("ASTERISK_ARI_URL", raising=False)
     c, store, _ = make_outbound(lambda req: httpx.Response(500, json={"message": "no"}))

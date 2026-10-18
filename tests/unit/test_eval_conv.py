@@ -355,6 +355,38 @@ async def test_replay_keeps_end_ms_when_the_end_of_turn_verdict_misses_the_cap(m
     assert out["first_audio_ms"] == 640
 
 
+async def test_replay_cancels_a_late_end_of_turn_verdict_before_the_next_frame(monkeypatch):
+    """The cap used to leave the verdict pending. The next silence frame then ran it,
+    apply_eot(0.0) raised patient_end_ms, and first_audio_ms was 1024 instead of end_ms."""
+    monkeypatch.setattr(eval_conv, "_TURN_WAIT_S", 0.1)
+    held = {}
+
+    async def not_done(audio, history):
+        turn = held["session"].turn
+        mark = turn._silence_ms
+        while turn._silence_ms <= mark:
+            await asyncio.sleep(0)
+        return 0.0
+
+    def patient():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        session = Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"})], ["All set."]]),
+                          tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                          clock=Clock(), tools={"book": _book, "cancel": _cancel},
+                          cfg=SessionConfig(tts_poll_s=0), eot_async=not_done)
+        held["session"] = session
+        return session
+
+    out = await replay(patient, _case())
+    assert out["task_success"] is True
+    assert out["first_audio_ms"] == 640
+
+
 async def test_replay_counts_first_audio_only_after_the_write_returns():
     """agent_first_audio is emitted before send_audio returns. close() used to cancel
     that write and still report its latency."""

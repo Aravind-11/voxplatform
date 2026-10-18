@@ -136,15 +136,19 @@ async def _await_pending_eot(session, seen: set[asyncio.Task]) -> None:
     """Hold the next silence frame so a verdict can move the end target.
 
     The tail is otherwise ``sleep(0)``, so ``end_ms`` commits and resets the turn
-    before a real await in ``eot_async`` can call ``apply_eot``. One cap per task:
-    if it is still pending, later frames continue and ``end_ms`` stands. This wait
-    does not feed silence and does not move a rig clock.
+    before a real await in ``eot_async`` can call ``apply_eot``. One cap per task.
+    A task still pending at the cap is cancelled before the next frame: the next
+    ``feed`` would otherwise yield into ``apply_eot`` and raise ``patient_end_ms``.
+    This wait does not feed silence and does not move a rig clock.
     """
     task = getattr(session, "_eot_task", None)
     if task is None or task.done() or task in seen:
         return
     seen.add(task)
     await asyncio.wait({task}, timeout=_TURN_WAIT_S)
+    if not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def _drive(session, audio: np.ndarray) -> bool:

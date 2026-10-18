@@ -83,16 +83,16 @@ async def test_twilio_outbound_media_mark_clear_and_chunking():
     tr = TwilioTransport(ws, None)
     tr.stream_sid = "MZ9"
     pcm = (np.arange(400) * 20).astype(np.int16)
-    await tr.send_audio(pcm, 8000)
+    name = await tr.send_audio(pcm, 8000)
     media, mark = ws.sent
     assert media["event"] == "media" and media["streamSid"] == "MZ9"
     raw = base64.b64decode(media["media"]["payload"])
     assert len(raw) == 400 and np.array_equal(mulaw_to_pcm16(raw), mulaw_to_pcm16(pcm16_to_mulaw(pcm)))
-    assert mark == {"event": "mark", "streamSid": "MZ9", "mark": {"name": "m1"}}
+    assert mark == {"event": "mark", "streamSid": "MZ9", "mark": {"name": "m1"}} and name == "m1"
     ws.sent.clear()
-    await tr.send_audio(np.zeros(20000, dtype=np.int16), 8000)
+    name = await tr.send_audio(np.zeros(20000, dtype=np.int16), 8000)
     sizes = [len(base64.b64decode(m["media"]["payload"])) for m in ws.sent if m["event"] == "media"]
-    assert sizes == [8000, 8000, 4000] and ws.sent[-1]["mark"]["name"] == "m2"
+    assert sizes == [8000, 8000, 4000] and ws.sent[-1]["mark"]["name"] == "m2" and name == "m2"
     ws.sent.clear()
     await tr.clear()
     assert ws.sent == [{"event": "clear", "streamSid": "MZ9"}]
@@ -163,6 +163,41 @@ async def test_failed_mark_write_holds_say_and_wait_until_the_mark_timeout():
     clk.t = sess.tracker.ends_at() + sess.cfg.mark_timeout_ms
     await asyncio.sleep(0.3)
     assert task.done() and task.exception() is None
+
+
+async def test_session_arms_the_mark_name_twilio_writes_and_releases_on_that_echo():
+    """The string on the wire is the string send_audio returns, and that is what the session arms.
+
+    Echoing it while the clock is still before ends_at marks the chunk heard and lets say_and_wait return.
+    """
+    ws = FakeTwilioWS([])
+    tr = TwilioTransport(ws, None)
+    tr.stream_sid = "MZ9"
+    returned = []
+
+    async def send(pcm, rate):
+        name = await tr.send_audio(pcm, rate)
+        returned.append(name)
+        return name
+
+    clk = Clock()
+    sess = Session(llm=FakeLLM([["x."]]), tts=FakeTTS(word_ms=200), vad=EnergyVAD(),
+                   send_audio=send, clear_audio=tr.clear, clock=clk,
+                   cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500))
+    sess.attach_transport_marks(tr)
+    task = asyncio.create_task(sess.say_and_wait("Hello there friend."))
+    for _ in range(400):
+        await asyncio.sleep(0)
+    wire = [m["mark"]["name"] for m in ws.sent if m["event"] == "mark"]
+    assert returned == wire == ["m1"]
+    assert set(sess.tracker.pending_marks) == {"m1"}
+    assert clk.t < sess.tracker.ends_at() and not task.done()
+    tr._on_mark(returned[0])
+    assert sess.tracker.heard() == ("Hello there friend.", False)
+    assert sess.tracker.buffered_ms() == 0 and not sess.tracker.is_playing()
+    await asyncio.sleep(0.3)
+    assert task.done() and task.exception() is None
+    assert clk.t < sess.tracker.ends_at()
 
 
 class FakeBrowserWS:

@@ -105,6 +105,23 @@ def test_acked_mark_limits_what_was_heard_even_if_the_clock_is_ahead():
     assert not tr.is_playing() and tr.buffered_ms() == 0
 
 
+def test_full_ack_while_the_clock_is_behind_clears_the_buffer():
+    """Every mark acked before ends_at is fully heard. The clock remainder must not stay buffered."""
+    clk = Clock()
+    tr = PlaybackTracker(clk, mark_timeout_ms=1500)
+    tr.on_sent("Hello there friend.", 1000)
+    tr.arm_mark("m1")
+    tr.on_sent("How can I help you today?", 2000)
+    tr.arm_mark("m2")
+    clk.t = 500
+    assert clk.t < tr.ends_at()
+    tr.note_mark("m1")
+    tr.note_mark("m2")
+    assert tr.pending_marks == {} and tr.buffered_ms() == 0
+    assert tr.heard() == ("Hello there friend. How can I help you today?", False)
+    assert not tr.is_playing()
+
+
 def test_reset_forgets_marks_so_a_late_echo_is_not_what_was_heard():
     clk = Clock()
     tr = PlaybackTracker(clk)
@@ -118,10 +135,13 @@ def test_reset_forgets_marks_so_a_late_echo_is_not_what_was_heard():
 
 
 def _mark_sending(r: Rig) -> None:
-    """Send callback that names each chunk the way Twilio's m{n} marks do."""
+    """Return a mark name the session cannot rebuild by counting chunks.
+
+    A drain that ignored this string and armed m{n} itself would not match the pending keys.
+    """
     async def send(pcm, rate):
         r.sent.append((r.clk.t, len(pcm), rate))
-        return f"m{len(r.sent)}"
+        return f"played-{len(r.sent)}"
 
     r.s.send_audio = send
 
@@ -147,7 +167,7 @@ async def test_hangup_waits_for_the_playback_mark_after_the_clock_has_passed():
     await r.frames("q", 22)
     await r.settle()
     assert r.tts.texts == ["Goodbye now.", "Bye then."]
-    assert set(r.s.tracker.pending_marks) == {"m1", "m2"} and ended == []
+    assert set(r.s.tracker.pending_marks) == {"played-1", "played-2"} and ended == []
     # Clock is already past the estimated end, still inside the mark timeout: the line stays up.
     r.clk.t = r.s.tracker.ends_at() + 100
     await asyncio.sleep(0.25)
@@ -168,6 +188,41 @@ async def test_hangup_runs_when_a_playback_mark_never_arrives():
     r.clk.t = r.s.tracker.ends_at() + r.s.cfg.mark_timeout_ms + 1
     await asyncio.sleep(0.25)
     assert ended == [1]
+
+
+async def test_full_ack_before_ends_at_releases_the_hangup():
+    """Twilio can ack the goodbye while the local clock is still inside it. That releases the hang-up."""
+    r, ended = _hangup_with_marks()
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    assert set(r.s.tracker.pending_marks) == {"played-1", "played-2"} and ended == []
+    assert r.clk.t < r.s.tracker.ends_at()
+    held = r.clk.t
+    for name in ("played-1", "played-2"):
+        r.s.tracker.note_mark(name)
+    assert r.s.tracker.buffered_ms() == 0
+    assert r.s.tracker.heard() == ("Goodbye now. Bye then.", False)
+    assert not r.s.tracker.is_playing()
+    await asyncio.sleep(0.3)
+    assert ended == [1] and r.clk.t == held
+
+
+async def test_full_ack_before_ends_at_releases_say_and_wait():
+    r = Rig(FakeLLM([["x."]]), tts=FakeTTS(word_ms=200),
+            cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500))
+    _mark_sending(r)
+    task = asyncio.create_task(r.s.say_and_wait("Please call us back."))
+    await r.settle()
+    assert set(r.s.tracker.pending_marks) == {"played-1"}
+    assert r.clk.t < r.s.tracker.ends_at() and not task.done()
+    r.s.tracker.note_mark("played-1")
+    assert r.s.tracker.buffered_ms() == 0
+    assert r.s.tracker.heard() == ("Please call us back.", False)
+    assert not r.s.tracker.is_playing()
+    await asyncio.sleep(0.3)
+    assert task.done() and task.exception() is None
+    assert r.clk.t < r.s.tracker.ends_at()
 
 
 async def test_say_and_wait_holds_for_marks_after_the_clock_is_past():
@@ -319,8 +374,8 @@ async def test_acked_mark_does_not_block_the_tool_followup_past_the_timeout():
     await r.frames("q", 22)
     await r.settle()
     assert r.tts.texts == ["Goodbye now.", "Please hold the line a moment longer now."]
-    assert set(r.s.tracker.pending_marks) == {"m1", "m2"} and not r.s._gen.produce_done
-    r.s.tracker.note_mark("m1")
+    assert set(r.s.tracker.pending_marks) == {"played-1", "played-2"} and not r.s._gen.produce_done
+    r.s.tracker.note_mark("played-1")
     # Clock buffer would already release the follow-up; the unacked mark must still hold it.
     r.clk.t = r.s.tracker.ends_at() - 100
     assert r.s.tracker.ends_at() - r.clk.t < r.s.cfg.tts_lookahead_ms
@@ -349,7 +404,7 @@ async def test_lost_last_mark_does_not_barge_in_after_the_timeout():
     await r.frames("q", 22)
     await r.settle()
     assert r.tts.texts == ["Hello there friend.", "How can I help you today?"]
-    r.s.tracker.note_mark("m1")
+    r.s.tracker.note_mark("played-1")
     assert r.s.tracker.is_playing() and r.s.tracker.buffered_ms() == 480
     r.clk.t = r.s.tracker.ends_at() + r.s.cfg.mark_timeout_ms
     assert not r.s.tracker.is_playing() and r.s.tracker.buffered_ms() == 0
@@ -420,15 +475,15 @@ async def test_hangup_deadline_follows_audio_armed_while_waiting():
     await r.frames("q", 22)
     await r.settle()
     assert r.s._gen.produce_done and r.s._gen.after is not None and ended == []
-    assert set(r.s.tracker.pending_marks) == {"m1"}
+    assert set(r.s.tracker.pending_marks) == {"played-1"}
     base = r.s.tracker.ends_at()
     r.s.say("one two three four five six seven eight nine ten.")
     await r.settle()
-    assert set(r.s.tracker.pending_marks) == {"m1", "m2"}
+    assert set(r.s.tracker.pending_marks) == {"played-1", "played-2"}
     assert r.s.tracker.ends_at() > base and r.s.tracker.is_playing()
     r.clk.t = base + r.s.cfg.mark_timeout_ms
     await asyncio.sleep(0.3)
-    assert ended == [] and "m2" in r.s.tracker.pending_marks and r.s.tracker.is_playing()
+    assert ended == [] and "played-2" in r.s.tracker.pending_marks and r.s.tracker.is_playing()
     r.clk.t = r.s.tracker.ends_at() + r.s.cfg.mark_timeout_ms
     await asyncio.sleep(0.3)
     assert ended == [1]
@@ -441,22 +496,22 @@ async def test_say_and_wait_deadline_follows_audio_armed_while_waiting():
     _mark_sending(r)
     r.s.say("Hello there friend. How can I help you today?")
     await r.settle()
-    assert r.tts.texts == ["Hello there friend."] and set(r.s.tracker.pending_marks) == {"m1"}
+    assert r.tts.texts == ["Hello there friend."] and set(r.s.tracker.pending_marks) == {"played-1"}
     task = asyncio.create_task(r.s.say_and_wait("Short voicemail."))
     await r.settle()
     assert r.tts.texts == ["Hello there friend.", "Short voicemail."]
-    assert set(r.s.tracker.pending_marks) == {"m1", "m2"} and not task.done()
+    assert set(r.s.tracker.pending_marks) == {"played-1", "played-2"} and not task.done()
     base = r.s.tracker.ends_at()
     # Buffered audio has fallen to the lookahead, so the greeting's second sentence is armed.
     r.clk.t = base - r.s.cfg.tts_lookahead_ms
     await asyncio.sleep(0.3)
     assert r.tts.texts == ["Hello there friend.", "Short voicemail.", "How can I help you today?"]
-    assert set(r.s.tracker.pending_marks) == {"m1", "m2", "m3"}
+    assert set(r.s.tracker.pending_marks) == {"played-1", "played-2", "played-3"}
     assert r.s.tracker.ends_at() > base and not task.done()
     r.clk.t = base + r.s.cfg.mark_timeout_ms
     await asyncio.sleep(0.3)
     assert not task.done() and r.s.tracker.is_playing()
-    assert set(r.s.tracker.pending_marks) == {"m1", "m2", "m3"}
+    assert set(r.s.tracker.pending_marks) == {"played-1", "played-2", "played-3"}
     r.clk.t = r.s.tracker.ends_at() + r.s.cfg.mark_timeout_ms
     await asyncio.sleep(0.3)
     assert task.done() and task.exception() is None

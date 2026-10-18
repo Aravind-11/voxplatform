@@ -958,13 +958,25 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         store.update_call(call["id"], status="created", ended=None, end_reason=None)
         return store.get_call_any(call["id"])
 
+    def end_dead_sip(call: dict, end_reason: Optional[str] = None) -> None:
+        """Hangup of a row this process is not running. finish still owns a live socket."""
+        if call["id"] in runtime.live or call["status"] not in ("created", "active"):
+            return
+        fields: dict[str, Any] = {"status": "ended", "ended": time.time()}
+        if end_reason is not None:
+            fields["end_reason"] = end_reason
+        store.update_call(call["id"], **fields)
+        limiter.release(call["tenant_id"], call["id"])
+
     def sip_resume(call: dict) -> dict:
         """What POST /sip/recover and the next AudioSocket do with the newest row for a uuid.
 
         action is hangup (no new row), busy (this process still has the socket), or continue
         (call is the row to admit). A never-joined continuation is returned as-is.
+        A hangup of a dead created/active row ends it so the slot is not kept.
         """
         if call.get("end_reason") in SIP_OURS:
+            end_dead_sip(call)                                 # keep the reason finish or mark_hangup stored
             return {"action": "hangup"}
         # Ending a call this process is still running frees the slot under the session and the
         # next socket opens a second call on the same caller.
@@ -976,6 +988,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         n = int(meta.get("resumes", 0))
         if n >= MAX_RESUMES:
             METRICS.inc("vox_call_resume_refused_total")
+            # stream_lost, same as a resume that is still allowed, so the next socket does not mint a blank call
+            end_dead_sip(call, "stream_lost")
             return {"action": "hangup", "reason": "resume cap"}
         if call["status"] in ("created", "active"):
             store.update_call(call["id"], status="ended", ended=time.time(), end_reason="stream_lost")

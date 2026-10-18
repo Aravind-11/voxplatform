@@ -370,6 +370,83 @@ def test_sip_recover_stops_at_two_resumes():
     assert last["status"] == "ended" and last["end_reason"] == "stream_closed"
 
 
+def test_dead_sip_hangup_ends_the_row_and_frees_its_slot():
+    """A recover hangup for a leg this process is not running must end it. Leaving it active keeps the slot."""
+    lab = _sip_lab()
+    headers = {"X-Vox-Sip-Token": "sip-secret"}
+
+    def open_row(status="active", end_reason=None, resumes=0, hold=False):
+        uid = str(uuid.uuid4())
+        meta = {"callSid": uid, "channel": "sip"}
+        if resumes:
+            meta["resumes"] = resumes
+        call = lab.store.create_call(lab.tid, lab.ag["id"], "sip", lab.ag["config"], meta)
+        fields = {}
+        if status != "created":
+            fields["status"] = status
+            fields["joined"] = time.time()
+        if end_reason is not None:
+            fields["end_reason"] = end_reason
+        if fields:
+            lab.store.update_call(call["id"], **fields)
+        if hold:
+            assert lab.lim.acquire(lab.tid, call["id"], 1)
+        return uid, call["id"]
+
+    def recover(c, uid):
+        return c.post("/sip/recover", json={"uuid": uid}, headers=headers)
+
+    def assert_dead_hangup(c, uid, call_id, body, end_reason):
+        before = len(lab.store.list_calls(lab.tid))
+        assert call_id not in lab.rt.live
+        r = recover(c, uid)
+        assert r.status_code == 200 and r.json() == body
+        row = lab.store.get_call_any(call_id)
+        assert row["status"] == "ended" and row["end_reason"] == end_reason and row["ended"] is not None
+        assert lab.lim.total_active() == 0
+        assert len(lab.store.list_calls(lab.tid)) == before
+        assert _push_uuid(lab, uid)
+        assert len(lab.store.list_calls(lab.tid)) == before
+        again = lab.store.get_call_any(call_id)
+        assert again["status"] == "ended" and again["end_reason"] == end_reason
+        assert lab.lim.total_active() == 0 and call_id not in lab.rt.live
+
+    with lab.client(lab.app) as c:
+        uid, cid = open_row(resumes=2, hold=True)
+        lab.rt.live[cid] = (object(), object())
+        before = len(lab.store.list_calls(lab.tid))
+        live = recover(c, uid)
+        assert live.status_code == 409
+        row = lab.store.get_call_any(cid)
+        assert row["status"] == "active" and row.get("end_reason") is None and row.get("ended") is None
+        assert lab.lim.total_active() == 1 and len(lab.store.list_calls(lab.tid)) == before
+        del lab.rt.live[cid]
+        assert lab.lim.acquire(lab.tid, "other", 1) is False
+        assert_dead_hangup(c, uid, cid, {"action": "hangup", "reason": "resume cap"}, "stream_lost")
+        assert lab.lim.acquire(lab.tid, "other", 1) is True
+        lab.lim.release(lab.tid, "other")
+
+        uid, cid = open_row(status="created", resumes=2)
+        assert lab.store.get_call_any(cid)["status"] == "created"
+        assert_dead_hangup(c, uid, cid, {"action": "hangup", "reason": "resume cap"}, "stream_lost")
+
+        uid, cid = open_row(end_reason="agent_hangup", hold=True)
+        lab.rt.live[cid] = (object(), object())
+        before = len(lab.store.list_calls(lab.tid))
+        live = recover(c, uid)
+        assert live.status_code == 200 and live.json() == {"action": "hangup"}
+        row = lab.store.get_call_any(cid)
+        assert row["status"] == "active" and row["end_reason"] == "agent_hangup" and row.get("ended") is None
+        assert lab.lim.total_active() == 1 and len(lab.store.list_calls(lab.tid)) == before
+        del lab.rt.live[cid]
+        assert_dead_hangup(c, uid, cid, {"action": "hangup"}, "agent_hangup")
+
+        for reason in ("transfer", "no_credit"):
+            uid, cid = open_row(end_reason=reason, hold=True)
+            assert lab.lim.total_active() == 1
+            assert_dead_hangup(c, uid, cid, {"action": "hangup"}, reason)
+
+
 def test_rejected_resume_keeps_the_same_continuation_and_transcript():
     """A full tenant cap must not spend the resume. Two rejected sockets and a retry POST stay on one call id."""
     lab = _sip_lab(concurrency=1)

@@ -67,6 +67,8 @@ def validate_experiment(experiment: Any) -> dict:
         vid = raw.get("id")
         if not isinstance(vid, str) or not vid.strip():
             raise ExperimentError("variant id must be a non-empty string")
+        if "\n" in vid or "\r" in vid:
+            raise ExperimentError("variant id must not contain a newline")
         if vid in seen:
             raise ExperimentError(f"duplicate variant id {vid!r}")
         seen.append(vid)

@@ -51,7 +51,8 @@ def _count(e: dict, variant: str = "") -> None:
     elif t == "user_interrupted":
         METRICS.inc("vox_interruptions_total")
     elif t == "user_end_of_turn":
-        if variant:
+        # The label is one sample in the shared scrape. A line break would render as a second sample.
+        if variant and "\n" not in variant and "\r" not in variant:
             METRICS.inc("vox_turns_total", variant=variant)
         else:
             METRICS.inc("vox_turns_total")
@@ -117,7 +118,7 @@ class Runtime:
         A resume or a failed transfer is a new call row. Walk `resumedFrom` (same tenant, at most 4 rows, the same
         cap as `_earlier_messages`) and bucket off that root id so the conversation keeps one variant. Reuse an
         ancestor's recorded variant id only when it still belongs to this experiment. This call's own metadata
-        `variant` is not an assignment: `POST /v1/calls` copies client metadata onto the row.
+        `variant` is not an assignment.
         """
         variants = [v for v in (experiment.get("variants") or []) if isinstance(v, dict)]
         by_id = {v.get("id"): v for v in variants if isinstance(v.get("id"), str)}
@@ -150,8 +151,8 @@ class Runtime:
             if not isinstance(raw, dict):
                 continue
             vid = raw.get("variant")
-            # Own metadata.variant is ignored above: a client can set it on POST /v1/calls. An ancestor's
-            # recorded id is the assignment only while this experiment still has that id.
+            # Own metadata.variant is ignored above. An ancestor's recorded id counts only while this experiment
+            # still has that id. Caller creates do not get to write it; build_session does.
             if isinstance(vid, str) and vid in by_id:
                 return dict(by_id[vid])
         root_id = str(chain[-1]["id"]) if chain else str(call.get("id") or "")

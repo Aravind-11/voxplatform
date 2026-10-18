@@ -302,6 +302,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                                          f"(and {len(gone) - 1} more) but no value was given: missing {gone}")
         return given
 
+    def caller_metadata(raw: dict) -> dict:
+        """experiment, variant, and promptSuffix are server writes. A caller cannot pin a bucket or extend the prompt."""
+        return {k: v for k, v in raw.items() if k not in ("experiment", "variant", "promptSuffix")}
+
     def pick_voice(cur_voice, cur_lang, new_voice, new_lang, voice_given: bool):
         """Effective (voice, language) after a change. Setting only a language switches to that language's default voice."""
         lang = new_lang if new_lang is not None else cur_lang
@@ -506,8 +510,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         base["voice"], base["language"] = pick_voice(base.get("voice", "af_heart"), base.get("language"), body.voice,
                                                       body.language, "voice" in body.model_fields_set)
         check_voice(base["voice"], base["language"])
-        call = store.create_call(t["id"], body.agentId, "webSocket", base,
-                                 {**body.metadata, **({"variables": given_vars} if given_vars else {})})
+        meta = caller_metadata(body.metadata)
+        if given_vars:
+            meta["variables"] = given_vars
+        call = store.create_call(t["id"], body.agentId, "webSocket", base, meta)
         return public_call(call, with_join=True)
 
     @app.get("/v1/calls")
@@ -1008,7 +1014,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if body.record is not None:
             cfg["record"] = body.record
         given_vars = call_variables(cfg, body.variables, strict=True)
-        meta = {**body.metadata, "direction": "outbound", "from": caller_id, "to": body.to}
+        meta = caller_metadata(body.metadata)
+        meta["direction"] = "outbound"
+        meta["from"] = caller_id
+        meta["to"] = body.to
         if given_vars:
             meta["variables"] = given_vars
         if body.voicemailMessage:

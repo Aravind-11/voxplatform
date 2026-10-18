@@ -52,6 +52,31 @@ def test_word_cap_does_not_apply_after_the_first_chunk():
     assert run(["Hello there. " + second]) == ["Hello there.", second]
 
 
+def test_midline_cut_keeps_list_shaped_tokens():
+    # A twelve-word space cut is not a source line. The tail must keep 1), 1., -, and +.
+    numbered = "Thanks for calling I can help with that request right away now 1) red and 2) blue."
+    code = "I have told you several times now that the pairing code is 1. 2 3 4 today"
+    for text in (numbered, code):
+        for n in (1, 3, len(text)):
+            assert " ".join(run(split_every(text, n))) == text
+    for mark in ("-", "+"):
+        text = (
+            "Thanks for calling I can help with that request right away now "
+            f"{mark} first thing {mark} second"
+        )
+        for n in (1, 3, len(text)):
+            assert " ".join(run(split_every(text, n))) == text
+    # A real line break still drops the marker, including after that same word cut.
+    lined = "Thanks for calling I can help with that request right away now 1) red\n- item two"
+    expect = "Thanks for calling I can help with that request right away now 1) red item two"
+    for n in (1, 3, len(lined)):
+        assert " ".join(run(split_every(lined, n))) == expect
+    # A comma cut is mid-line too: the marker stays, and flush does not drop it.
+    clause = "I understand your concern about this, 1) stay and 2) stay."
+    for n in (1, 3, len(clause)):
+        assert " ".join(run(split_every(clause, n))) == clause
+
+
 def test_short_clause_is_not_split_early():
     out = run(["Well, I think so. Okay."])
     assert out == ["Well, I think so.", "Okay."]

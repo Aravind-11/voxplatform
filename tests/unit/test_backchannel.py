@@ -134,16 +134,21 @@ async def test_short_overlap_does_not_barge_and_a_yeah_after_a_real_cut_is_marke
     await r2.frames("s", 15)
     await r2.frames("q", 22)
     await r2.settle()
-    await r2.frames("s", 6)                                      # high sensitivity still cuts at 192 ms
+    # High sensitivity opens a turn at 192 ms. That is still under barge_confirm_ms (400),
+    # so the burst pauses and then resumes instead of trimming the reply. A counted
+    # interruption, and the backchannel un-count that followed it, only happens once
+    # speech reaches the confirm window.
+    await r2.frames("s", 6)
     await r2.settle()
-    assert r2.clears == 1 and r2.s.stats["interruptions"] == 1
-    assert all(m["role"] != "assistant" for m in r2.s.history)  # cut already applied; nothing heard to keep
-    await r2.frames("q", 30)
+    assert r2.clears == 1 and r2.s.stats["interruptions"] == 0
+    assert r2.s._gen is not None and r2.s._gen.holding
+    assert any(m["role"] == "assistant" for m in r2.s.history)
+    await r2.frames("q", 8)
     await r2.settle()
-    ev = r2.last("backchannel")
-    assert ev["text"] == "yeah" and ev["duration_ms"] == 192
-    assert r2.clears == 1                                  # playback clear cannot be undone
-    assert r2.s.stats["interruptions"] == 0                # a backchannel is not counted
+    assert r2.last("barge_aborted")["text"]
+    assert "user_interrupted" not in r2.types()
+    assert r2.s.stats["interruptions"] == 0
+    assert any(m["role"] == "assistant" for m in r2.s.history)
 
 
 async def test_empty_inaudible_or_failed_transcript_leaves_playback_up():

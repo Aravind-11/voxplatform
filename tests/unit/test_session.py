@@ -71,6 +71,16 @@ class FakeLLM:
         return f"caller said {self.n_transcribe}"
 
 
+def _high_barge(cfg=None):
+    """192 ms gate: a short burst pauses, and barge_confirm_ms (400) can still abort it.
+
+    The default gate is 450 ms, already past that window, so a cough never opens a turn.
+    """
+    cfg = cfg or SessionConfig(tts_poll_s=0)
+    cfg.turn.backchannel_ms = 192
+    return cfg
+
+
 class Rig:
     def __init__(self, llm, tts=None, tools=None, cfg=None):
         self.clk = Clock()
@@ -155,7 +165,7 @@ async def test_barge_in_clears_audio_and_trims_history_to_what_was_heard():
     sent_before = len(r.sent)
     await r.frames("s", 16)           # 512 ms: backchannel gate is 450 ms, so this still interrupts
     await r.settle()
-    assert r.clears == 1
+    assert r.clears >= 1
     ev = r.last("user_interrupted")
     assert ev["cut"] is True
     # the longer gate lets one more word play than the old 192 ms barge threshold
@@ -170,6 +180,73 @@ async def test_barge_in_clears_audio_and_trims_history_to_what_was_heard():
     second = llm.calls[1]["history"]
     assert second[-1]["content"].endswith("[interrupted]")
     assert second[1]["content"] == "caller said 1"
+
+
+async def test_short_barge_in_pauses_and_resumes_without_trimming():
+    reply = ["One ", "two ", "three ", "four ", "five. ", "Six ", "seven ", "eight ", "nine ", "ten. ",
+             "Eleven ", "twelve ", "thirteen ", "fourteen ", "fifteen."]
+    llm = FakeLLM([reply])
+    r = Rig(llm, tts=FakeTTS(word_ms=200), cfg=_high_barge())
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    await r.frames("q", 45)
+    await r.settle()
+    await r.frames("s", 6)            # 192 ms: pause only, not a confirmed interrupt
+    await r.settle()
+    assert r.clears >= 1 and "user_interrupted" not in r.types()
+    assert r.s.stats["interruptions"] == 0
+    before = list(r.tts.texts)
+    await r.frames("q", 8)            # silence aborts the short burst
+    await r.settle()
+    assert "barge_aborted" in r.types()
+    assert not any("[interrupted]" in (m.get("content") or "") for m in r.s.history)
+    resumed = r.last("barge_aborted")["text"]
+    assert resumed
+    new = " ".join(r.tts.texts[len(before):])
+    assert new and resumed.split()[0] in new
+    # say() would open a second assistant turn, and the cleared buffer must not stay
+    # scheduled in front of the tail (that is what a later interrupt would call "heard").
+    assert len([m for m in r.s.history if m["role"] == "assistant"]) == 1
+    assert r.s.tracker.buffered_ms() < 2000
+    assert not r.s._gen.holding
+
+
+async def test_false_barge_keeps_the_unsent_sentence_and_does_not_restart():
+    """Pause while sentence 3 is still inside synth: a cough must play the cleared tail
+    and that sentence, not the words the caller already heard and not a second history row."""
+    reply = ["One ", "two ", "three ", "four ", "five. ", "Six ", "seven ", "eight ", "nine ", "ten. ",
+             "Eleven ", "twelve ", "thirteen ", "fourteen ", "fifteen."]
+    llm = FakeLLM([reply])
+    r = Rig(llm, tts=FakeTTS(word_ms=200), cfg=_high_barge())
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    await r.frames("s", 6)             # 192 ms: pause only
+    await r.settle()
+    before = list(r.tts.texts)
+    assert before and not any("Eleven" in t for t in before)
+    await r.frames("q", 8)             # silence: the burst was a cough
+    await r.settle()
+    assert "barge_aborted" in r.types() and "user_interrupted" not in r.types()
+    assert r.s.stats["interruptions"] == 0 and not r.s._gen.holding
+    for _ in range(80):
+        r.clk.t += 40
+        await r.settle(4)
+    new = r.tts.texts[len(before):]
+    assert any("two three four five" in t for t in new)
+    assert any("Eleven twelve" in t for t in new)
+    assert not any(t.startswith("One two") for t in new)
+    assistant = [m for m in r.s.history if m["role"] == "assistant"]
+    assert len(assistant) == 1
+    # Replay audio is already in the turn. Appending it again would repeat the cleared tail.
+    assert assistant[0]["content"] == (
+        "One two three four five. Six seven eight nine ten. "
+        "Eleven twelve thirteen fourteen fifteen.")
+    assert assistant[0]["content"].count("Six") == 1
+    assert assistant[0]["content"].count("five") == 1
+    assert assistant[0]["content"].count("Eleven") == 1
+    assert "[interrupted]" not in assistant[0]["content"]
 
 
 async def test_no_barge_in_after_agent_finished_playing():
@@ -534,7 +611,8 @@ async def test_barge_in_while_tool_round_waits_keeps_the_transcript():
     assert _contents(llm.calls[0]["history"]) == [r.s.cfg.system_prompt]
     await r.frames("s", 16)            # 512 ms: past the 450 ms backchannel gate, so this still barges
     await r.settle()
-    assert r.clears == 1 and ran == []
+    # Pause and the confirmed interrupt each clear the transport buffer.
+    assert r.clears == 2 and ran == []
     release.set()
     await r.settle()
     assert _contents(r.s.history)[1] == "tuesday at eleven"
@@ -1767,7 +1845,8 @@ async def test_say_and_wait_playback_stays_interruptible():
     assert r.sent
     await asyncio.wait_for(r.frames("s", 16), 2)  # 512 ms crosses the 450 ms backchannel gate while audio is queued
     await r.settle()
-    assert r.clears == 1 and r.s.stats["interruptions"] == 1
+    # Pause and the confirmed interrupt each clear the transport buffer.
+    assert r.clears == 2 and r.s.stats["interruptions"] == 1
     await asyncio.wait_for(task, 2)
 
 
@@ -1775,7 +1854,7 @@ async def test_say_and_wait_playback_stays_interruptible():
 from core.session import ToolResult  # noqa: E402
 
 
-def _hangup_rig(strict):
+def _hangup_rig(strict, backchannel_ms=None):
     ended = []
 
     async def hang(args):
@@ -1784,7 +1863,10 @@ def _hangup_rig(strict):
         return ToolResult({"ok": True}, after=after, strict=strict)
 
     llm = FakeLLM([["Goodbye ", "now. ", ToolCall("h", "hang", {})], ["Bye ", "then."]])
-    return Rig(llm, tts=FakeTTS(word_ms=400), tools={"hang": hang}), ended
+    cfg = SessionConfig(tts_poll_s=0)
+    if backchannel_ms is not None:
+        cfg.turn.backchannel_ms = backchannel_ms
+    return Rig(llm, tts=FakeTTS(word_ms=400), tools={"hang": hang}, cfg=cfg), ended
 
 
 async def test_hangup_runs_only_after_the_goodbye_has_finished_playing():
@@ -1970,7 +2052,7 @@ async def test_strict_hangup_still_happens_if_caller_talks_over_the_goodbye():
     await r.settle()
     await r.frames("s", 16)            # 512 ms: past the 450 ms backchannel gate, so the goodbye is cut
     await r.settle()
-    assert r.clears == 1 and ended == [1]
+    assert r.clears >= 1 and ended == [1]
 
 
 async def test_non_strict_hangup_is_cancelled_by_the_caller_talking():
@@ -1982,7 +2064,264 @@ async def test_non_strict_hangup_is_cancelled_by_the_caller_talking():
     await r.settle()
     r.clk.t += 5000
     await asyncio.sleep(0.2)
-    assert r.clears == 1 and ended == []
+    assert r.clears >= 1 and ended == []
+
+
+async def _park_hangup_tail(r, target_ms=430):
+    """Commit the goodbye and leave the drain inside _finish_action with audio still buffered."""
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    g = r.s._gen
+    assert g is not None and g.after is not None and not g.tasks[-1].done()
+    for _ in range(80):
+        if r.s.tracker.buffered_ms() <= target_ms:
+            break
+        r.clk.t += 32
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("playback buffer did not reach the barge window")
+    assert r.s.tracker.is_playing()
+    return g
+
+
+async def _elapse_playout_wait(r):
+    """Let _finish_action's poll observe a clock that has moved past the buffered goodbye.
+
+    frames() only steps the clock between feeds. The hang-up wait sleeps on its own, and a
+    real clock keeps running there, so the same step has to happen across that sleep.
+    """
+    r.clk.t += r.s.tracker.buffered_ms() + 50
+    await asyncio.sleep(0.1)
+    await r.settle()
+
+
+async def test_short_barge_does_not_hang_up_while_the_goodbye_is_still_paused():
+    r, ended = _hangup_rig(strict=True, backchannel_ms=192)
+    g = await _park_hangup_tail(r)
+    await r.frames("s", 6)             # 192 ms: pause only, about 250 ms of goodbye left
+    assert g.holding and 200 <= r.s.tracker.buffered_ms() <= 300
+    await _elapse_playout_wait(r)      # shorter than the silence that will abort this cough
+    assert ended == [] and g.holding and g.after is not None
+    await r.frames("q", 8)             # silence: the burst was a cough, so the tail resumes
+    await r.settle()
+    assert ended == [] and "user_interrupted" not in r.types()
+    assert r.last("barge_aborted")["text"] == "then."
+    assert "then." in r.tts.texts
+    assert "[interrupted]" not in (r.s.history[-1].get("content") or "")
+    r.clk.t += 5000                    # strict hang-up still runs once that resumed tail finishes
+    await asyncio.sleep(0.2)
+    assert ended == [1]
+
+
+async def test_non_strict_hangup_does_not_run_when_the_buffer_ends_before_confirm():
+    r, ended = _hangup_rig(strict=False, backchannel_ms=192)
+    g = await _park_hangup_tail(r)
+    await r.frames("s", 6)
+    assert g.holding and 200 <= r.s.tracker.buffered_ms() <= 300 and r.s.turn.speech_ms < 400
+    await _elapse_playout_wait(r)
+    assert ended == [] and g.holding and r.s.turn.speech_ms < r.s.cfg.turn.barge_confirm_ms
+    await r.frames("s", 8)             # 14 speech frames: the pause becomes an interrupt
+    await r.settle()
+    assert r.s.stats["interruptions"] == 1 and ended == []
+    assert "call_action_done" not in r.types()
+
+
+class _FailTTS(FakeTTS):
+    """Raises RuntimeError on the next `fail_remaining` synthesize calls."""
+
+    def __init__(self, word_ms=200):
+        super().__init__(word_ms=word_ms)
+        self.fail_remaining = 0
+
+    async def synthesize(self, text):
+        if self.fail_remaining > 0:
+            self.fail_remaining -= 1
+            raise RuntimeError("tts blip")
+        async for pcm in super().synthesize(text):
+            yield pcm
+
+
+async def test_replay_tts_error_unsticks_pause_and_still_sends_unsent_sentence():
+    """A cough while textq still has a sentence must not escape feed or stay paused if replay TTS raises."""
+    reply = ["One ", "two ", "three ", "four ", "five. ", "Six ", "seven ", "eight ", "nine ", "ten. ",
+             "Eleven ", "twelve ", "thirteen ", "fourteen ", "fifteen."]
+    tts = _FailTTS(word_ms=200)
+    r = Rig(FakeLLM([reply]), tts=tts, cfg=_high_barge())
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    g = r.s._gen
+    assert g is not None and not g.textq.empty() and not r.s._outgoing_idle(g)
+    await r.frames("s", 6)
+    assert g.holding and not g.tasks[-1].done() and not g.tasks[1].done()
+    drain = g.tasks[-1]
+    tts.fail_remaining = 1            # the replay of the cleared tail, not the unsent sentence
+    sent_before = len(r.sent)
+    await r.frames("q", 8)            # feed must return; the error used to propagate out of it
+    assert not g.holding and not g.barge_paused and not g.cancelled
+    assert g.tasks[-1] is drain       # the live pipeline stays; nothing was queued to replay
+    assert "barge_aborted" not in r.types()
+    assert any(e["type"] == "error" and e["where"] == "tts" and "tts blip" in e["error"] for e in r.events)
+    for _ in range(80):
+        r.clk.t += 40
+        await r.settle(4)
+    assert any("Eleven twelve" in t for t in tts.texts)
+    assert len(r.sent) > sent_before
+    assert "user_interrupted" not in r.types()
+
+
+async def test_idle_replay_tts_error_does_not_hang_up_or_report_the_tail_played():
+    """Idle goodbye: a failed replay must not finish the generation and run the strict hang-up."""
+    r, ended = _hangup_rig(strict=True, backchannel_ms=192)
+    fail = {"n": 0}
+    orig = r.tts.synthesize
+
+    async def synthesize(text):
+        if fail["n"] > 0:
+            fail["n"] -= 1
+            raise RuntimeError("tts blip")
+        async for pcm in orig(text):
+            yield pcm
+
+    r.tts.synthesize = synthesize
+    g = await _park_hangup_tail(r)
+    await r.frames("s", 6)
+    assert g.holding and r.s._outgoing_idle(g) and g.after is not None
+    fail["n"] = 1
+    await r.frames("q", 8)
+    await r.settle()
+    r.clk.t += 5000
+    await asyncio.sleep(0.2)
+    await r.settle()
+    assert ended == [] and "call_action_done" not in r.types()
+    assert g.after is not None
+    assert "barge_aborted" not in r.types()
+    assert any(e["type"] == "error" and e["where"] == "tts" and "tts blip" in e["error"] for e in r.events)
+
+
+async def _resume_silence_with_keypad(r, goodbye):
+    """Eight silence frames, with a keypad turn as soon as the idle drain finishes cancelling.
+
+    That is the DTMF flush: it runs on its own task and can enter inject_text at the gather
+    inside the idle resume. The hook runs it before resume continues, on the real await.
+    """
+    import core.session as session_mod
+    drain = goodbye.tasks[-1]
+    orig = session_mod.asyncio.gather
+    state = {"arm": True}
+
+    def gather(*aws, **kwargs):
+        if state["arm"] and any(a is drain for a in aws):
+            state["arm"] = False
+
+            async def run():
+                result = await orig(*aws, **kwargs)
+                await r.s.inject_text("[The caller pressed these keypad digits: 42]")
+                return result
+
+            return run()
+        return orig(*aws, **kwargs)
+
+    session_mod.asyncio.gather = gather
+    try:
+        await r.frames("q", 8)
+        await r.settle()
+    finally:
+        session_mod.asyncio.gather = orig
+    assert not state["arm"]
+
+
+async def test_keypad_during_playing_idle_resume_does_not_replay_the_goodbye():
+    """Buffer still playing: the keypad interrupt may hang up, but the cough must not resume."""
+    r, ended = _hangup_rig(strict=True, backchannel_ms=192)
+    g = await _park_hangup_tail(r)
+    await r.frames("s", 6)
+    assert g.holding and r.s._agent_active() and r.s._outgoing_idle(g)
+    spoken = list(r.tts.texts)
+    await _resume_silence_with_keypad(r, g)
+    assert "user_interrupted" in r.types() and ended == [1]
+    assert "barge_aborted" not in r.types()
+    assert "then." not in r.tts.texts[len(spoken):]
+    assert g.cancelled and r.s._gen is not g
+
+
+async def test_keypad_during_expired_idle_resume_does_not_leave_a_detached_drain():
+    """Buffer already elapsed: the keypad turn replaces the goodbye, and close must stop it."""
+    r, ended = _hangup_rig(strict=True, backchannel_ms=192)
+    g = await _park_hangup_tail(r)
+    await r.frames("s", 6)
+    await _elapse_playout_wait(r)
+    assert g.holding and g.after is not None and not r.s._agent_active()
+    spoken = list(r.tts.texts)
+    await _resume_silence_with_keypad(r, g)
+    assert ended == [] and "barge_aborted" not in r.types() and "user_interrupted" not in r.types()
+    assert "then." not in r.tts.texts[len(spoken):]
+    assert r.s._gen is not g and r.s._gen is not None
+    assert any(m.get("content") == "[The caller pressed these keypad digits: 42]" for m in r.s.history)
+    await r.s.close()
+    assert all(t.done() for t in g.tasks)
+    r.clk.t += 5000
+    await asyncio.sleep(0.2)
+    await r.settle()
+    assert ended == [] and g.after is not None
+
+
+async def test_send_failure_during_pause_replays_tail_on_a_new_drain():
+    """An in-flight send_audio error kills the drain; the cough must still play the cleared tail."""
+    reply = ["One ", "two ", "three ", "four ", "five. ", "Six ", "seven ", "eight ", "nine ", "ten. ",
+             "Eleven ", "twelve ", "thirteen ", "fourteen ", "fifteen."]
+    r = Rig(FakeLLM([reply]), tts=FakeTTS(word_ms=200), cfg=_high_barge())
+    state = {"n": 0, "release": asyncio.Event(), "started": asyncio.Event()}
+
+    async def send(pcm, rate):
+        i = state["n"]
+        state["n"] += 1
+        if i == 1:
+            state["started"].set()
+            await state["release"].wait()
+            raise RuntimeError("socket write failed")
+        r.sent.append((r.clk.t, len(pcm), rate))
+
+    r.s.send_audio = send
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    g = r.s._gen
+    assert g is not None and state["started"].is_set() and g.sending
+    assert not g.tasks[1].done() and not r.s._outgoing_idle(g)
+    old_drain = g.tasks[-1]
+    synth = g.tasks[1]
+    feeder = asyncio.create_task(r.frames("s", 6))
+    for _ in range(200):
+        if g.holding and g.sending:
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("pause did not observe the in-flight send")
+    state["release"].set()
+    await feeder
+    assert old_drain.done()
+    assert any(e["type"] == "error" and e["where"] == "send" and "socket write failed" in e["error"]
+               for e in r.events)
+    sent_before = len(r.sent)
+    await r.frames("q", 8)
+    await r.settle()
+    for _ in range(80):
+        r.clk.t += 40
+        await r.settle(4)
+    assert g.tasks[-1] is not old_drain
+    assert g.tasks[1] is synth          # the sentence still in synth is not orphaned
+    assert not g.holding
+    # Cleared tail, the chunk send_audio never wrote, then the sentence that was still in synth.
+    assert [n for _, n, _ in r.sent[sent_before:]] == [6400, 8000, 8000]
+    assert g.outbox.empty()
+    heard = r.s.history[-1]["content"]
+    assert heard.count("Six seven eight nine ten.") == 1
+    assert heard == (
+        "One two three four five. Six seven eight nine ten. "
+        "Eleven twelve thirteen fourteen fifteen.")
+    assert r.last("barge_aborted")["text"]
 
 
 # ---------------------------------------------------------------------------------- greeting
@@ -2014,7 +2353,7 @@ async def test_caller_can_talk_over_the_greeting_and_the_next_turn_proceeds():
     await r.frames("q", 30)            # ~1 s of the greeting plays...
     await r.frames("s", 16)            # 512 ms over the greeting: past the 450 ms backchannel gate
     await r.settle()
-    assert r.clears == 1 and r.last("user_interrupted")["cut"] is True
+    assert r.clears >= 1 and r.last("user_interrupted")["cut"] is True
     await r.frames("s", 10)
     await r.frames("q", 30)
     await r.settle()

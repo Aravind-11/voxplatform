@@ -49,6 +49,7 @@ class TurnConfig:
     start_ms_agent_speaking: float = 192.0  # floor for barge-in; backchannel_ms may hold longer
     backchannel_ms: float = 450.0       # while the agent talks, bursts shorter than this are not turns
     min_speech_ms: float = 160.0        # shorter utterances are treated as noise
+    barge_confirm_ms: float = 400.0     # while the agent was speaking, speech shorter than this can still abort
     speculate_ms: float = 192.0         # silence before speculative generation starts
     fast_end_ms: float = 320.0          # end of turn when the scorer is confident
     end_ms: float = 640.0               # end of turn otherwise
@@ -79,6 +80,7 @@ class TurnManager:
         self._onset_ms = 0.0
         self._run_start_ms = 0.0
         self._hole_ms = 0.0
+        self._barge = False             # agent was speaking when this turn started; frozen for the abort check
 
     def apply_eot(self, score: float) -> list[TurnEvent]:
         """Feed a late end-of-turn verdict (P(caller is done), 0..1) from an async scorer.
@@ -119,8 +121,15 @@ class TurnManager:
         """Speech accumulated toward a turn that has not opened yet."""
         return self._run_ms > 0.0
 
+    @property
+    def speech_ms(self) -> float:
+        """How much speech the current turn has accumulated (0 when idle)."""
+        return self._speech_ms
+
     def _begin_turn(self, out: list[TurnEvent], t: float) -> None:
         self._speaking = True
+        # Frozen for the abort check. Later frames may clear playback; the threshold stays.
+        self._barge = self.agent_speaking
         self._onset_ms = self._run_start_ms
         self._speech_ms = self._run_ms
         self._silence_ms = 0.0
@@ -176,6 +185,7 @@ class TurnManager:
                 self._silence_ms = self._hole_ms
                 self._onset_ms = self._run_start_ms
                 self._speaking = True
+                self._barge = False          # playback already stopped; not a tentative barge
                 self._speculated = False
                 self._end_target = c.end_ms
                 self._run_ms = 0.0
@@ -197,7 +207,11 @@ class TurnManager:
             return out
 
         self._silence_ms += c.frame_ms
-        if self._speech_ms < c.min_speech_ms and self._silence_ms >= c.speculate_ms:
+        # A turn that opened while the agent was speaking can still be a cough. The default
+        # backchannel gate is 450 ms, already past barge_confirm_ms, so this abort fires when
+        # backchannel_ms is shorter (bargeIn=high) and the burst never reaches the confirm window.
+        noise_limit = c.barge_confirm_ms if self._barge else c.min_speech_ms
+        if self._speech_ms < noise_limit and self._silence_ms >= c.speculate_ms:
             out.append(TurnEvent(Ev.SPEECH_ABORT, t, self._onset_ms))
             self._close_utterance()
             return out

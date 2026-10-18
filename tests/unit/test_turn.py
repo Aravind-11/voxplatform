@@ -94,6 +94,22 @@ def test_overlap_check_reports_how_long_the_burst_was():
     assert opened[0].kind is Ev.SPEECH_START
 
 
+def test_short_barge_aborts_and_a_long_one_does_not():
+    # The default 450 ms gate never opens a turn under barge_confirm_ms (400), so a cough
+    # there is an overlap check, not an abort. bargeIn=high lowers the gate to 192 ms:
+    # 224 ms starts and then aborts, 448 ms is past 400 and speculates.
+    cfg = TurnConfig(backchannel_ms=192)
+    tm = TurnManager(cfg)
+    tm.set_agent_speaking(True)
+    ev = feed(tm, [(True, 7), (False, 6)])
+    assert kinds(ev) == [Ev.SPEECH_START, Ev.SPEECH_ABORT]
+    assert not tm.in_turn
+    tm2 = TurnManager(cfg)
+    tm2.set_agent_speaking(True)
+    ev2 = feed(tm2, [(True, 14), (False, 6)])
+    assert kinds(ev2) == [Ev.SPEECH_START, Ev.SPECULATE]
+
+
 def test_onset_time_is_reported():
     tm = TurnManager()
     events = []

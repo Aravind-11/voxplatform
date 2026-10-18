@@ -4,8 +4,9 @@ Design points
   * Speculative generation: a reply starts on a short pause (SPECULATE) but its audio is held
     until END_OF_TURN commits it; SPEECH_RESUME cancels it. Tool calls also wait for commit so a
     cancelled speculation can never cause a side effect.
-  * Barge-in: caller speech during playback clears the far-end buffer, cancels generation and
-    trims history to the text the caller actually heard.
+  * Barge-in: caller speech during playback pauses the far end at once. If the burst
+    ends before barge_confirm_ms it was a cough: playback resumes and history is not
+    trimmed. If speech keeps going, that pause becomes a real interrupt.
   * The speech model emits text only and the server accepts one audio clip per request, so
     earlier caller turns live in history as transcripts (produced by a side request that runs in
     parallel with the reply and is awaited before the next turn).
@@ -115,6 +116,13 @@ class _Generation:
         self.uncommitted_tts_failed = False  # speculative TTS died; later ordinary sentences will not play
         self.speak_lock = asyncio.Lock()  # filler audio and sentence audio must not synthesize at the same time
         self.holding_sentence = False     # dequeued by _synth but not spoken yet (off textq during lookahead)
+        self.holding = False           # tentative barge-in: drain must not send until this clears
+        self.barge_paused = False
+        self.paused_heard = ""
+        self.paused_cut = False
+        self.paused_spoken: list[str] = []
+        self.spoken_mark = 0           # len(spoken) when a tentative barge-in began
+        self.sending = False           # drain is inside send_audio; pause waits so clear cannot race it
         self.after: Optional[ToolResult] = None   # deferred call action requested by a tool this reply
         # Transcript already running when this generation was created. Not this turn's task:
         # _commit may replace the session pointer before _produce is scheduled.
@@ -167,6 +175,24 @@ class Session:
         self._overlap_dropped: set[int] = set()
         self._overlap_commit_lock = asyncio.Lock()  # one real overlap commits at a time
         self.stats = {"turns": 0, "speculations": 0, "speculations_cancelled": 0, "interruptions": 0}
+        self._turn_owner = None
+
+    async def _without_turn_lock(self, awaitable):
+        """Drop the turn lock across a socket wait so keypad can enter on this task.
+
+        feed holds the lock so a frame is applied before say or inject. Resume awaits the
+        drain on that same task; inject_text has to take the lock there, before commit_heard.
+        """
+        owner = self._turn_owner is asyncio.current_task()
+        if owner:
+            self._turn_owner = None
+            self._turn_lock.release()
+        try:
+            return await awaitable
+        finally:
+            if owner:
+                await self._turn_lock.acquire()
+                self._turn_owner = asyncio.current_task()
 
     # ------------------------------------------------------------------ input
     async def feed(self, frame: np.ndarray) -> None:
@@ -174,37 +200,48 @@ class Session:
         # Scoring awaits. Keep the lock until this frame is applied so a verdict, inject_text,
         # or say that becomes runnable during the score cannot commit or barge ahead of it.
         async with self._turn_lock:
-            if self.recorder is not None:
-                self.recorder.mic(frame)
-            if self.vad_scheduler is not None:
-                prob = await self.vad_scheduler.prob(self.vad, frame)
-            else:
-                prob = self.vad.prob(frame)   # no scheduler: stay on this task (Rig tests depend on it)
-            speech = prob >= self.cfg.turn.threshold
-            if speech:
-                self._last_speech_clock = self.clock()
-            agent = self._agent_active()
-            self.turn.set_agent_speaking(agent)
-            # Keep the burst ourselves. _pre is only 320 ms, shorter than the backchannel gate,
-            # so a "stop" that ends before the gate would already have fallen out of it.
-            # Collection continues after playback stops; clearing here would cut the onset.
-            if speech and not self.turn.in_turn and (agent or self._collecting_overlap):
-                self._overlap_audio.append(frame)
-                self._collecting_overlap = True
-                if len(self._overlap_audio) > 40:
-                    del self._overlap_audio[:-40]
-            self._fed_speech = speech
-            (self._utt if self.turn.in_turn else self._pre).append(frame)
-            events = self.turn.process(prob)
-            # A cough under the barge floor never opens a check. Drop it, or the next yeah is
-            # transcribed glued to that audio with the silence between them removed.
-            # A run still pending (a short hole, or playback that just stopped) keeps its audio.
-            if (not speech and not self.turn.in_turn and not self.turn.pending_run
-                    and not any(ev.kind is Ev.OVERLAP_CHECK for ev in events)):
-                self._overlap_audio.clear()
-                self._collecting_overlap = False
-            for ev in events:
-                await self._handle(ev)
+            self._turn_owner = asyncio.current_task()
+            try:
+                if self.recorder is not None:
+                    self.recorder.mic(frame)
+                if self.vad_scheduler is not None:
+                    prob = await self.vad_scheduler.prob(self.vad, frame)
+                else:
+                    prob = self.vad.prob(frame)   # no scheduler: stay on this task (Rig tests depend on it)
+                speech = prob >= self.cfg.turn.threshold
+                if speech:
+                    self._last_speech_clock = self.clock()
+                agent = self._agent_active()
+                self.turn.set_agent_speaking(agent)
+                # Keep the burst ourselves. _pre is only 320 ms, shorter than the backchannel gate,
+                # so a "stop" that ends before the gate would already have fallen out of it.
+                # Collection continues after playback stops; clearing here would cut the onset.
+                if speech and not self.turn.in_turn and (agent or self._collecting_overlap):
+                    self._overlap_audio.append(frame)
+                    self._collecting_overlap = True
+                    if len(self._overlap_audio) > 40:
+                        del self._overlap_audio[:-40]
+                self._fed_speech = speech
+                (self._utt if self.turn.in_turn else self._pre).append(frame)
+                events = self.turn.process(prob)
+                # A cough under the barge floor never opens a check. Drop it, or the next yeah is
+                # transcribed glued to that audio with the silence between them removed.
+                # A run still pending (a short hole, or playback that just stopped) keeps its audio.
+                if (not speech and not self.turn.in_turn and not self.turn.pending_run
+                        and not any(ev.kind is Ev.OVERLAP_CHECK for ev in events)):
+                    self._overlap_audio.clear()
+                    self._collecting_overlap = False
+                for ev in events:
+                    await self._handle(ev)
+                g = self._gen
+                # barge_confirm_ms is from the start of the utterance, not the pause.
+                # The default backchannel gate is already past it, so a normal barge confirms
+                # on the same frame. A shorter gate stays paused until speech reaches it.
+                if g and g.holding and not g.cancelled and self.turn.speech_ms >= self.cfg.turn.barge_confirm_ms:
+                    await self._interrupt(g)
+            finally:
+                if self._turn_owner is asyncio.current_task():
+                    self._turn_owner = None
 
     async def start(self) -> None:
         """Called by the transport once the call is connected: speaks the configured greeting, if any."""
@@ -329,7 +366,7 @@ class Session:
             self._pre.clear()
             g = self._gen
             if g and g.committed and self._agent_active():
-                await self._interrupt(g)
+                await self._pause_for_barge(g)
             self._emit("user_speech_start")
         elif ev.kind is Ev.SPECULATE:
             self.stats["speculations"] += 1
@@ -368,6 +405,9 @@ class Session:
             self._utt = []
             self._overlapped = False
             self._emit("speech_abort")
+            g = self._gen
+            if g and g.holding:
+                await self._resume_after_barge(g)
 
     def _overlap_stale(self, token: int) -> bool:
         return token in self._overlap_dropped
@@ -758,6 +798,11 @@ class Session:
         idx = 0
         try:
             while True:
+                # A tentative barge-in must keep the sentence already pulled off textq.
+                while gen.holding and not gen.cancelled:
+                    await asyncio.sleep(self.cfg.tts_poll_s)
+                if gen.cancelled:
+                    return
                 item = await gen.textq.get()
                 if item is None:
                     return
@@ -779,8 +824,12 @@ class Session:
                         text = item
                         if idx > 0:
                             await gen.commit.wait()
-                            while self.tracker.buffered_ms() + gen.pending_ms > self.cfg.tts_lookahead_ms:
+                            while not gen.cancelled and (
+                                    gen.holding
+                                    or self.tracker.buffered_ms() + gen.pending_ms > self.cfg.tts_lookahead_ms):
                                 await asyncio.sleep(self.cfg.tts_poll_s)
+                    if gen.cancelled:
+                        return
                     try:
                         await self._speak(gen, text)
                     except asyncio.CancelledError:
@@ -888,8 +937,14 @@ class Session:
 
     async def _finish_action(self, gen: _Generation) -> None:
         deadline = self.clock() + 30000.0
-        while self.tracker.buffered_ms() > 0 and self.clock() < deadline:   # the reply must finish playing first
+        # buffered_ms stays > 0 after clear() until the estimate catches up. A tentative barge
+        # must not take gen.after in that gap: a cough resumes the tail, a confirmed interrupt
+        # decides strict vs cancelled. Both cancel this wait.
+        while not gen.cancelled and self.clock() < deadline and (
+                gen.holding or self.tracker.buffered_ms() > 0):
             await asyncio.sleep(0.05)
+        if gen.cancelled or gen.holding:
+            return
         a, gen.after = gen.after, None      # taken only now: a barge-in during the wait still sees it
         if a is not None:
             self._spawn_action(a)
@@ -911,45 +966,281 @@ class Session:
             return
         await self._speak(gen, str(text))
 
+    async def _render(self, text: str) -> tuple[np.ndarray, float]:
+        t_tts = self.clock()
+        parts = [p async for p in self.tts.synthesize(text)]
+        self._emit("tts_done", ms=self.clock() - t_tts, chars=len(text))
+        pcm = np.concatenate(parts) if parts else np.zeros(0, np.int16)
+        pcm = resample(pcm, self.tts.sample_rate, self.cfg.out_rate)
+        return pcm, pcm_duration_ms(len(pcm), self.cfg.out_rate)
+
     async def _speak(self, gen: _Generation, text: str) -> None:
         # Held by both the synth loop and a tool filler so their audio cannot interleave.
         async with gen.speak_lock:
-            t_tts = self.clock()
-            parts = [p async for p in self.tts.synthesize(text)]
-            self._emit("tts_done", ms=self.clock() - t_tts, chars=len(text))
-            pcm = np.concatenate(parts) if parts else np.zeros(0, np.int16)
-            pcm = resample(pcm, self.tts.sample_rate, self.cfg.out_rate)
-            gen.pending_ms += pcm_duration_ms(len(pcm), self.cfg.out_rate)
+            pcm, dur = await self._render(text)
+            gen.pending_ms += dur
             await gen.outbox.put((text, pcm))
+
+    def _requeue_front(self, gen: _Generation, item: Any) -> None:
+        rest = []
+        while True:
+            try:
+                rest.append(gen.outbox.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        gen.outbox.put_nowait(item)
+        for queued in rest:
+            gen.outbox.put_nowait(queued)
 
     async def _drain(self, gen: _Generation) -> None:
         await gen.commit.wait()
         while True:
+            # A tentative barge-in holds the buffer. A strict hang-up must not run until the
+            # interrupt is confirmed (or the hold is released); a cough must not drop the call.
+            while gen.holding and not gen.cancelled:
+                await asyncio.sleep(self.cfg.tts_poll_s)
+            if gen.cancelled:
+                return
             item = await gen.outbox.get()
+            if gen.holding and not gen.cancelled:
+                # Already taken off the queue: put it back so the cleared tail can be prepended.
+                self._requeue_front(gen, item)
+                continue
+            if gen.cancelled:
+                return
             if item is None:
                 if gen.after is not None and not gen.cancelled:
                     await self._finish_action(gen)
                 return
-            text, pcm = item
+            replay = False
+            if isinstance(item, tuple) and len(item) == 3:
+                text, pcm, replay = item
+            else:
+                text, pcm = item
             if not gen.first_audio_sent:
                 gen.first_audio_sent = True
                 self._emit("agent_first_audio",
                            latency_ms=self.clock() - gen.speech_end_clock)
-            await self.send_audio(pcm, self.cfg.out_rate)
-            if self.recorder is not None:
-                self.recorder.agent(pcm, self.cfg.out_rate)
-            dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
-            self.tracker.on_sent(text, dur)
-            gen.pending_ms -= dur
-            gen.spoken.append(text)
-            self._emit("agent_speech", text=text)
-            if self.history and self.history[-1]["role"] == "assistant":
-                self.history[-1]["content"] = " ".join(gen.spoken)
+            gen.sending = True
+            try:
+                try:
+                    await self.send_audio(pcm, self.cfg.out_rate)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    # Not sent, so it is not in spoken. This drain is done: a cough has to start
+                    # another player. Leaving the chunk here is what that player sends.
+                    self._emit("error", where="send", error=repr(e))
+                    self._requeue_front(gen, item)
+                    return
+                if self.recorder is not None:
+                    self.recorder.agent(pcm, self.cfg.out_rate)
+                dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
+                self.tracker.on_sent(text, dur)
+                gen.pending_ms -= dur
+                # A replay is audio clear() threw away. spoken/history already include it.
+                if not replay:
+                    gen.spoken.append(text)
+                    if self.history and self.history[-1]["role"] == "assistant":
+                        self.history[-1]["content"] = " ".join(gen.spoken)
+                self._emit("agent_speech", text=text)
+            finally:
+                gen.sending = False
 
     # ----------------------------------------------------------- barge-in
+    async def _pause_for_barge(self, gen: _Generation) -> None:
+        """Stop the far end without cancelling the reply. Speech may still turn out to be noise."""
+        if gen.holding or gen.cancelled:
+            return
+        heard, cut = self.tracker.heard()
+        gen.barge_paused = True
+        gen.paused_heard = heard
+        gen.paused_cut = cut
+        gen.paused_spoken = list(gen.spoken)
+        gen.spoken_mark = len(gen.spoken)
+        gen.holding = True                 # before the first await, so drain cannot send another chunk
+        while gen.sending:
+            await asyncio.sleep(0)
+        await self.clear_audio()
+        if self.recorder is not None:
+            self.recorder.clear()
+
+    def _outgoing_idle(self, gen: _Generation) -> bool:
+        """Produce and synth will not enqueue anything else (the drain may still be in its end wait)."""
+        if not gen.tasks:
+            return True
+        producers = gen.tasks[:-1] if len(gen.tasks) > 1 else gen.tasks
+        if any(not t.done() for t in producers):
+            return False
+        return gen.outbox.empty() and gen.textq.empty()
+
+    def _unheard_sent_text(self, gen: _Generation) -> str:
+        """Words already sent (or sent after the pause snapshot) that clear() discarded.
+
+        Does not include text still in the synth/outbox: that pipeline keeps running. Does not
+        repeat the last sentence when the tracker says it was fully heard.
+        """
+        spoken = [s.strip() for s in gen.paused_spoken if s and s.strip()]
+        heard = (gen.paused_heard or "").strip()
+        joined = " ".join(spoken).strip()
+        if not heard:
+            rest = joined
+        elif joined.startswith(heard):
+            rest = joined[len(heard):].strip()
+        else:
+            h, w = heard.split(), joined.split()
+            rest = " ".join(w[len(h):]) if h and w[: len(h)] == h else ""
+        extra = [s.strip() for s in gen.spoken[gen.spoken_mark:] if s and s.strip()]
+        if extra:
+            rest = f"{rest} {' '.join(extra)}".strip() if rest else " ".join(extra)
+        return rest
+
+    async def _put_replay(self, gen: _Generation, text: str) -> None:
+        pcm, dur = await self._render(text)
+        gen.pending_ms += dur
+        await gen.outbox.put((text, pcm, True))
+
+    async def _prepend_replay_text(self, gen: _Generation, text: str) -> bool:
+        """Queue a replay in front of whatever synth still has. False when nothing was queued."""
+        chunker = SentenceChunker()
+        pieces = [p for p in (*chunker.push(text), *chunker.flush()) if p.strip()]
+        built = []
+        for piece in pieces:
+            if gen.cancelled:
+                return False
+            pcm, dur = await self._render(piece)
+            built.append((piece, pcm, dur))
+        if gen.cancelled or not built:
+            return False
+        rest = []
+        while True:
+            try:
+                rest.append(gen.outbox.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        for piece, pcm, dur in built:
+            gen.pending_ms += dur
+            gen.outbox.put_nowait((piece, pcm, True))
+        for item in rest:
+            gen.outbox.put_nowait(item)
+        return True
+
+    def _drain_alive(self, gen: _Generation) -> bool:
+        return bool(gen.tasks) and not gen.tasks[-1].done()
+
+    def _replace_drain(self, gen: _Generation) -> None:
+        """Previous drain has exited. Keep producers; start a player that reads the outbox."""
+        drain = asyncio.create_task(self._drain(gen))
+        if gen.tasks:
+            gen.tasks = [*gen.tasks[:-1], drain]
+        else:
+            gen.tasks = [drain]
+
+    def _start_tail_playback(self, gen: _Generation, text: str) -> None:
+        """The reply already left the outbox. Speak the cleared tail without a second history turn."""
+        # A keypad turn can cancel or replace this generation while the idle drain is shutting down.
+        # Clearing cancelled here would revive a player close() no longer owns.
+        if gen.cancelled or self._gen is not gen:
+            return
+        gen.produce_done = False
+
+        async def produce() -> None:
+            queued = False
+            try:
+                chunker = SentenceChunker()
+                for piece in [*chunker.push(text), *chunker.flush()]:
+                    if gen.cancelled:
+                        return
+                    if not piece.strip():
+                        continue
+                    await self._put_replay(gen, piece)
+                    queued = True
+                # Only once the audio is on a live drain. A failed synth must not look like playout.
+                if queued and not gen.cancelled and self._drain_alive(gen):
+                    self._emit("barge_aborted", text=text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                self._emit("error", where="tts", error=repr(e))
+            finally:
+                gen.produce_done = True
+                if not gen.cancelled and queued:
+                    gen.outbox.put_nowait(None)
+                elif not gen.cancelled:
+                    # Nothing queued: do not hand the drain a finished-reply sentinel. That runs
+                    # gen.after and hangs up before the cleared tail was ever spoken.
+                    drain = gen.tasks[-1] if gen.tasks else None
+                    if drain is not None and not drain.done() and drain is not asyncio.current_task():
+                        drain.cancel()
+                        drain.add_done_callback(lambda t: t.cancelled() or t.exception())
+
+        gen.tasks = [asyncio.create_task(produce()),
+                     asyncio.create_task(self._drain(gen))]
+
+    async def _resume_idle(self, gen: _Generation, tail: str) -> bool:
+        """Drain has finished, or is only waiting to run a deferred hang-up.
+
+        A tail is spoken in the background; barge_aborted is emitted there once it is queued.
+        """
+        drain = gen.tasks[-1] if gen.tasks else None
+        if drain is not None and not drain.done():
+            drain.cancel()
+            await self._without_turn_lock(asyncio.gather(drain, return_exceptions=True))
+        # inject_text can run on that await. Do not commit_heard, replay, or hang up on a
+        # generation it cancelled or replaced.
+        if gen.cancelled or self._gen is not gen:
+            return False
+        self.tracker.commit_heard(gen.paused_heard)
+        if tail:
+            self._start_tail_playback(gen, tail)
+            return False
+        # Nothing left to say. Drop the hold first or _finish_action waits on it forever.
+        gen.holding = False
+        if gen.after is not None:
+            await self._finish_action(gen)
+        return True
+
+    async def _resume_dead_drain(self, gen: _Generation, tail: str) -> bool:
+        """The player died (send_audio failed). Prepend the tail onto a new drain; keep synth."""
+        self.tracker.commit_heard(gen.paused_heard)
+        self._replace_drain(gen)
+        if tail and not await self._prepend_replay_text(gen, tail):
+            return False
+        return self._drain_alive(gen)
+
+    async def _resume_after_barge(self, gen: _Generation) -> None:
+        """A cough: do not trim history. Re-speak whatever clear() cut off, then continue the reply."""
+        if gen.cancelled or not gen.holding:
+            return
+        tail = self._unheard_sent_text(gen)
+        accepted = False
+        try:
+            if self._outgoing_idle(gen):
+                accepted = await self._resume_idle(gen, tail)
+            elif not self._drain_alive(gen):
+                accepted = await self._resume_dead_drain(gen, tail)
+            else:
+                self.tracker.commit_heard(gen.paused_heard)
+                accepted = await self._prepend_replay_text(gen, tail) if tail else True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._emit("error", where="tts", error=repr(e))
+            accepted = False
+        finally:
+            # A replay error must not stick the pause or escape the read loop.
+            gen.holding = False
+            gen.barge_paused = False
+        if accepted and not gen.cancelled:
+            self._emit("barge_aborted", text=tail)
+
     async def _interrupt(self, gen: _Generation) -> None:
         self._overlapped = True
         self._overlap_unscored += 1
+        # After a pause the transport buffer is already gone, so the clock must not advance "heard".
+        paused_barge = gen.barge_paused
+        if paused_barge:
+            heard, cut = gen.paused_heard, gen.paused_cut
         await self.clear_audio()          # stop the far end first: that is what the caller hears
         if gen.cancelled:
             # Another caller cancelled this generation while clear_audio waited on the socket.
@@ -959,7 +1250,9 @@ class Session:
         if self.recorder is not None:
             self.recorder.clear()
         await self._cancel(gen)           # sets gen.cancelled before it yields, so the other caller loses
-        heard, cut = self.tracker.heard()
+        gen.holding = False
+        if not paused_barge:
+            heard, cut = self.tracker.heard()
         a, gen.after = gen.after, None
         if a is not None and a.strict:
             self._spawn_action(a)         # strict: the caller talking over the goodbye does not keep the call alive

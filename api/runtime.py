@@ -215,7 +215,16 @@ class Runtime:
         ctx.turn_fn = lambda: sess.stats["turns"]      # lets confirm-before-acting tools tell turns apart
 
         def last_assistant_text() -> str:
-            for message in reversed(sess.history):
+            history = sess.history
+            end = len(history)
+            gen = sess._gen
+            # Drain copies this generation's sentence into history[-1] before the next tool
+            # round. That text is the proposal still in progress, not a finished read-back.
+            if (gen is not None and gen.committed and not gen.cancelled and end
+                    and history[-1].get("role") == "assistant"
+                    and any(not t.done() for t in gen.tasks)):
+                end -= 1
+            for message in reversed(history[:end]):
                 if message.get("role") == "assistant" and str(message.get("content") or "").strip():
                     return str(message["content"])
             return ""

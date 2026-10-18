@@ -423,3 +423,187 @@ async def test_runtime_readback_uses_the_assistant_history():
     sess.history.append({"role": "assistant", "content": "Tuesday at 11"})
     booked = await sess.tools["book_slot"]({"day": "tuesday", "time": "11"})
     assert booked["booked"] is True
+
+
+@pytest.mark.parametrize("said,value", [
+    ("9:10 am", "10 am"),
+    ("9:10:00", "10:00"),
+    ("9:10:30", "10:30"),
+    ("1:12:30", "12:30"),
+    ("100.50", "100"),
+    ("$20.99", "$20"),
+    ("1.000", "1,000"),
+    ("1,000", "1.000"),
+    ("$1.000", "$1,000"),
+    ("$1,000", "$1.000"),
+    ("1/10/2", "10/2"),
+    ("anne-marie", "anne"),
+    ("twenty-one", "twenty"),
+    ("two-thirty", "two"),
+])
+async def test_readback_does_not_match_a_different_slot_hidden_by_punctuation(said, value):
+    _, run = _guarded_booker(said)
+    out = await run({"day": "x", "time": value})
+    assert out["executed"] is False and out["next_step"] == toolmod._READBACK_STEP
+
+
+async def test_clock_time_with_a_trailing_period_still_passes_the_guard():
+    _, run = _guarded_booker("Tuesday at 11:00.")
+    first = await run({"day": "tuesday", "time": "11:00"})
+    assert first["executed"] is False and "read these details back" in first["next_step"].lower()
+
+
+async def test_slot_guard_covers_named_state_changes_but_not_reads_or_hangup(allow_private):
+    sent = []
+
+    def handler(req):
+        sent.append(str(req.url))
+        return httpx.Response(200, json={"ok": 1})
+
+    def spec(name):
+        return {"name": name, "description": "Change a record.",
+                "parameters": {"type": "object", "properties": {"item": {"type": "string"}}, "required": ["item"]},
+                "http": {"url": f"https://api.example.com/{name}", "method": "POST"}}
+
+    ctx = toolmod.CallContext()
+    ctx.guard_slots = True
+    ctx.last_assistant_text = ""
+    specs = [spec(name) for name in ("create_order", "update_order", "delete_order", "purchase_order")]
+    specs.append({"builtin": "transfer", "targets": {"billing": "+15551234567"}})
+    specs += ["hangUp", "check_availability"]
+    _, fns = toolmod.build(specs, ctx, client(handler))
+    for name in ("create_order", "update_order", "delete_order", "purchase_order"):
+        out = await fns[name]({"item": "abc-1"})
+        assert out == {"executed": False, "next_step": toolmod._READBACK_STEP, "details": {"item": "abc-1"}}
+    transferred = await fns["transfer"]({"to": "billing"})
+    assert transferred["executed"] is False and transferred["next_step"] == toolmod._READBACK_STEP
+    assert sent == []
+    hung = await fns["hangUp"]({"reason": "caller-done"})
+    assert isinstance(hung, ToolResult) and hung.content["ok"] is True
+    assert await fns["check_availability"]({"day": "tuesday"}) == {"day": "tuesday", "free": ["11:00"]}
+
+
+async def test_same_turn_retry_cannot_use_the_proposal_as_its_own_read_back():
+    """The proposal being spoken is not a prior read-back; the next caller turn may use it once it has finished."""
+    import asyncio
+
+    import numpy as np
+
+    from api.runtime import Runtime
+    from api.store import Store
+    from core.session import ToolCall
+    from tests.unit.test_api import FakeVAD
+
+    book = {"day": "tuesday", "time": "11:00"}
+    refusal = {"executed": False, "next_step": toolmod._READBACK_STEP, "details": dict(book)}
+
+    class LLM:
+        def __init__(self):
+            self.sess = None
+            self.n = 0
+
+        async def transcribe(self, audio):
+            return "tuesday at eleven"
+
+        async def stream(self, history, audio, followups, tools):
+            n = self.n
+            self.n += 1
+            if n == 0:
+                await asyncio.sleep(0)
+                yield "Booking Tuesday at 11:00. "
+                yield ToolCall("b1", "book_slot", dict(book))
+            elif n == 1:
+                await self._until(self._proposal_visible)
+                yield ToolCall("b2", "book_slot", dict(book))
+            elif n == 2:
+                await asyncio.sleep(0)
+                yield "I have noted that."
+            elif n == 3:
+                await asyncio.sleep(0)
+                yield "Okay. "
+                await self._until(self._okay_visible)
+                yield ToolCall("b3", "book_slot", dict(book))
+            elif n == 4:
+                await asyncio.sleep(0)
+                yield "Done."
+            else:
+                raise AssertionError(f"unexpected model call {n}")
+
+        def _proposal_visible(self):
+            text = str(self.sess.history[-1].get("content") or "")
+            return "Tuesday" in text and "11:00" in text
+
+        def _okay_visible(self):
+            return str(self.sess.history[-1].get("content") or "").startswith("Okay")
+
+        async def _until(self, pred):
+            for _ in range(2000):
+                if self.sess is not None and pred():
+                    return
+                await asyncio.sleep(0)
+            raise AssertionError(self.sess.history if self.sess else None)
+
+    class TTS:
+        sample_rate = 8000
+
+        async def synthesize(self, text):
+            await asyncio.sleep(0)
+            yield np.zeros(0, dtype=np.int16)
+
+    class T:
+        out_rate = 8000
+
+        async def send_audio(self, pcm, rate=8000):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            return None
+
+    store = Store()
+    llm = LLM()
+    rt = Runtime(llm, lambda v: TTS(), FakeVAD, store)
+    tid = store.create_tenant("t")
+    call = store.create_call(tid, None, "webSocket",
+                             {"systemPrompt": "Be brief.", "confirmSlots": True, "tools": ["book_slot"]}, {})
+    sess = rt.build_session(call, T())
+    llm.sess = sess
+    seen = []
+    inner = sess.tools["book_slot"]
+
+    async def spy(args):
+        out = await inner(args)
+        seen.append(out)
+        return out
+
+    sess.tools["book_slot"] = spy
+    speech = np.full(512, 5000, dtype=np.int16)
+    silence = np.zeros(512, dtype=np.int16)
+
+    async def one_turn():
+        for _ in range(15):
+            await sess.feed(speech)
+            await asyncio.sleep(0)
+        for _ in range(25):
+            await sess.feed(silence)
+            await asyncio.sleep(0)
+
+    async def finished(n_seen):
+        for _ in range(2000):
+            gen = sess._gen
+            if len(seen) >= n_seen and gen is not None and gen.tasks and all(t.done() for t in gen.tasks):
+                return
+            await asyncio.sleep(0)
+        raise AssertionError({"seen": seen, "turns": sess.stats["turns"], "history": sess.history})
+
+    await one_turn()
+    await finished(2)
+    assert sess.stats["turns"] == 1
+    assert seen == [refusal, refusal]
+    await one_turn()
+    await finished(3)
+    assert sess.stats["turns"] == 2
+    assert seen[2] == {"booked": True, "day": "tuesday", "time": "11:00"}
+    await sess.close()

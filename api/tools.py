@@ -75,8 +75,6 @@ READBACK_INSTRUCTION = ("Critical slots (names, dates, times, numbers, amounts) 
                         "in the agent's own words before a tool that changes state.")
 _SLOT_MARKS = ("book", "create", "update", "delete", "transfer", "purchase")
 _READBACK_STEP = "Read these values back to the caller before calling the tool."
-# Punctuation becomes a gap so "2 pm" is not found inside "12 pm", and "9:00" is not found inside "19:00".
-_SLOT_GAP = re.compile(r"[^\w']+", re.UNICODE)
 
 
 def needs_slot_guard(specs: list) -> bool:
@@ -102,19 +100,32 @@ def _assistant_text(ctx) -> str:
     return "" if raw is None else str(raw)
 
 
-def _fold_slot(text: str) -> str:
-    """Lowercase and pad so a slot matches only as its own token, not as part of a longer one."""
-    return " " + re.sub(r"\s+", " ", _SLOT_GAP.sub(" ", str(text).lower())).strip() + " "
+def _slot_tokens(text: str) -> list[str]:
+    """Whitespace tokens; only edge punctuation is stripped, so 9:10 and 100.50 stay atomic."""
+    tokens: list[str] = []
+    for raw in str(text).lower().split():
+        i, j = 0, len(raw)
+        while i < j and not raw[i].isalnum():
+            i += 1
+        while j > i and not raw[j - 1].isalnum():
+            j -= 1
+        if i < j:
+            tokens.append(raw[i:j])
+    return tokens
 
 
 def _slot_was_said(value: str, said: str) -> bool:
     raw = value.strip()
     if len(raw) < 3:
         return True
-    needle = _fold_slot(raw).strip()
+    needle = _slot_tokens(raw)
     if not needle:
         return False
-    return f" {needle} " in _fold_slot(said)
+    hay = _slot_tokens(said)
+    n = len(needle)
+    if len(hay) < n:
+        return False
+    return any(hay[i:i + n] == needle for i in range(len(hay) - n + 1))
 
 
 def slot_guard(fn, ctx):

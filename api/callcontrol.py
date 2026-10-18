@@ -80,8 +80,9 @@ def _channel_segment(call_sid: str) -> str:
 
 class AsteriskCallControl:
     """ARI. `originate` enters Stasis app `vox` (this process does not run that app). `appArgs` of
-    `amd,<call id>` tells it to POST AnsweredBy to /sip/amd/<call id>. `transfer` is a blind redirect;
-    `mode` is accepted so the tool can pass warm/cold and is not sent to ARI."""
+    `amd,<call id>` tells it to POST AnsweredBy to /sip/amd/<call id>. Cold `transfer` is a blind
+    redirect of the Asterisk channel id, not the AudioSocket UUID. Warm mode is refused: ARI has no
+    whisper-and-return dial, and a successful redirect would tell the model the warm transfer started."""
 
     def __init__(self, client: Any, ari_url: str, user: str = "", password: str = ""):
         self.client = client
@@ -101,7 +102,9 @@ class AsteriskCallControl:
         return f"{self.ari_url}/ari/channels/{_channel_segment(call_sid)}"
 
     async def transfer(self, call_sid: str, to: str, mode: str = "cold", *, call_id: str = "", target: str = "") -> None:
-        del mode, call_id, target
+        del call_id, target
+        if mode == "warm":
+            raise RuntimeError("warm transfer is not available on SIP calls")
         r = await self.client.post(
             self._channel_url(call_sid) + "/redirect",
             params={"endpoint": f"PJSIP/{to}"}, auth=self._auth(), timeout=10)

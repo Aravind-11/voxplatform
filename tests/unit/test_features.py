@@ -722,6 +722,275 @@ def test_sip_outbound_without_ari_is_503_and_stores_nothing(monkeypatch):
     assert store4.list_calls(tid4)[0]["end_reason"] == "asterisk_rejected"
 
 
+def test_call_metadata_merge_keeps_both_keys():
+    """Two writers must not replace the document. callSid and answeredBy both stay, with the keys already stored."""
+    import threading
+    from api.store import Store
+    store = Store()
+    tid = store.create_tenant("t")
+    call = store.create_call(tid, None, "sip", {}, {"deal": "42", "voicemail": "hi", "direction": "outbound"})
+
+    def write_sid():
+        for _ in range(40):
+            store.merge_call_metadata(call["id"], {"callSid": "chan-9"})
+
+    def write_amd():
+        for _ in range(40):
+            store.merge_call_metadata(call["id"], {"answeredBy": "machine_end_beep"})
+
+    threads = [threading.Thread(target=write_sid), threading.Thread(target=write_amd)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    meta = store.get_call_any(call["id"])["metadata"]
+    assert meta["callSid"] == "chan-9" and meta["answeredBy"] == "machine_end_beep"
+    assert meta["deal"] == "42" and meta["voicemail"] == "hi" and meta["direction"] == "outbound"
+    assert store.find_sip_call(call_sid="chan-9")["id"] == call["id"]
+
+
+def test_sip_answered_by_survives_call_sid_and_hangs_up_when_not_live(monkeypatch):
+    """AnsweredBy posted during originate must still be there after callSid is saved, and a machine with no
+    session must DELETE that ARI channel. A live session is spoken to and the channel is not deleted."""
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    app_box = {}
+    deleted = []
+    race = {"during": True}
+
+    async def handler(req: httpx.Request):
+        if req.method == "DELETE":
+            deleted.append(str(req.url))
+            return httpx.Response(204)
+        args = req.url.params.get("appArgs", "")
+        cid = args.split(",", 1)[1] if str(args).startswith("amd,") else ""
+        if cid and race["during"]:
+            transport = httpx.ASGITransport(app=app_box["app"])
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                res = await client.post(f"/sip/amd/{cid}", data={"AnsweredBy": "machine_end_beep"},
+                                        headers={"X-Vox-Sip-Token": "s3cret"})
+                assert res.status_code == 200, res.text
+                race["amd"] = res.json()
+                during = app_box["store"].get_call_any(cid)["metadata"]
+                assert during["answeredBy"] == "machine_end_beep" and "callSid" not in during
+        return httpx.Response(200, json={"id": race["sid"]})
+
+    race["sid"] = "chan-9"
+    c, store, rt = make_outbound(handler, sip_token="s3cret")
+    app_box["app"] = c.app
+    app_box["store"] = store
+    k, _ = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                           "voicemailMessage": "leave this", "metadata": {"deal": "42"}}, headers=H(k))
+    assert r.status_code == 200, r.text
+    cid = r.json()["id"]
+    meta = store.get_call_any(cid)["metadata"]
+    assert meta["answeredBy"] == "machine_end_beep" and meta["callSid"] == "chan-9"
+    assert meta["deal"] == "42" and meta["voicemail"] == "leave this"
+    assert meta["from"] == "+15550001111" and meta["to"] == "+15552223333" and meta["direction"] == "outbound"
+    assert race["amd"]["action"] == "none"
+    assert deleted == ["http://asterisk:8088/ari/channels/chan-9"]
+    assert store.get_call_any(cid)["status"] == "ended"
+    assert cid not in rt.live
+
+    # The other order: callSid is already stored, the call is not live, machine_end still deletes that channel.
+    race["during"] = False
+    race["sid"] = "chan-2"
+    r2 = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552224444", "channel": "sip",
+                                            "voicemailMessage": "leave this", "metadata": {"deal": "7"}}, headers=H(k))
+    assert r2.status_code == 200, r2.text
+    cid2 = r2.json()["id"]
+    assert store.get_call_any(cid2)["metadata"]["callSid"] == "chan-2"
+    assert "answeredBy" not in store.get_call_any(cid2)["metadata"]
+    n = len(deleted)
+    human = c.post(f"/sip/amd/{cid2}", json={"AnsweredBy": "human"}, headers={"X-Vox-Sip-Token": "s3cret"})
+    assert human.json()["action"] == "none"
+    assert store.get_call_any(cid2)["metadata"]["callSid"] == "chan-2"
+    assert store.get_call_any(cid2)["metadata"]["answeredBy"] == "human"
+    assert store.get_call_any(cid2)["status"] == "created" and len(deleted) == n
+    machine = c.post(f"/sip/amd/{cid2}", data={"AnsweredBy": "machine_end_beep"}, headers={"X-Vox-Sip-Token": "s3cret"})
+    assert machine.json()["action"] == "hangup"
+    assert deleted[n:] == ["http://asterisk:8088/ari/channels/chan-2"]
+    meta2 = store.get_call_any(cid2)["metadata"]
+    assert meta2["callSid"] == "chan-2" and meta2["answeredBy"] == "machine_end_beep" and meta2["deal"] == "7"
+    assert store.get_call_any(cid2)["status"] == "ended"
+
+    # A live session is spoken to and hung up on the transport. The ARI channel id is not deleted.
+    race["sid"] = "chan-3"
+    r3 = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552225555", "channel": "sip",
+                                            "voicemailMessage": "leave this"}, headers=H(k))
+    cid3 = r3.json()["id"]
+    spoke = []
+
+    class S:
+        async def say_and_wait(self, m):
+            spoke.append(m)
+
+    class Tr:
+        async def end(self):
+            spoke.append("END")
+    rt.live[cid3] = (S(), Tr())
+    n = len(deleted)
+    res = c.post(f"/sip/amd/{cid3}", json={"AnsweredBy": "machine_end_beep"}, headers={"X-Vox-Sip-Token": "s3cret"})
+    assert res.json()["action"] == "voicemail"
+    deadline = time.time() + 2
+    while spoke != ["leave this", "END"] and time.time() < deadline:
+        time.sleep(0.05)
+    assert spoke == ["leave this", "END"] and deleted[n:] == []
+    assert store.get_call_any(cid3)["metadata"]["callSid"] == "chan-3"
+    assert store.get_call_any(cid3)["status"] == "created"
+
+
+def test_audiosocket_adopts_outbound_row_and_binds_the_ari_channel(monkeypatch):
+    """The AudioSocket UUID is merged onto the outbound row. Transfer sees the ARI id, not the UUID.
+    A bind before any row creates the call with that channel id. An unbound UUID is not stored as callSid."""
+    import socket
+    import uuid
+    from api import security
+    from api.app import Settings, create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from starlette.testclient import TestClient
+    from test_api import FakeLLM, FakeTTS, FakeVAD
+    from transports import audiosocket as A
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append((req.method, str(req.url)))
+        if req.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(200, json={"id": "chan-9"})
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store, http=http)
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                        twilio_account_sid="ACtest", twilio_number="+15550001111", sip_token="s3cret",
+                        audiosocket_port=port, audiosocket_agent="pending")
+    app = create_app(store, rt, security.ConcurrencyLimiter(4), None, settings)
+    audio = "33333333-3333-3333-3333-333333333333"
+    fresh = "44444444-4444-4444-4444-444444444444"
+    unbound = "55555555-5555-5555-5555-555555555555"
+    token = {"X-Vox-Sip-Token": "s3cret"}
+
+    def closed_context(fn):
+        for cell in fn.__closure__ or ():
+            try:
+                val = cell.cell_contents
+            except ValueError:
+                continue
+            if type(val).__name__ == "CallContext":
+                return val
+        raise AssertionError("transfer did not close over the call")
+
+    def wait_live(cid):
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            cur = store.get_call_any(cid)
+            if cur and cur["status"] == "active" and cid in rt.live:
+                return cur
+            time.sleep(0.05)
+        raise AssertionError(store.get_call_any(cid))
+
+    def wait_row(pred):
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            for row in store.list_calls(tid):
+                if pred(row) and row["status"] == "active" and row["id"] in rt.live:
+                    return row
+            time.sleep(0.05)
+        raise AssertionError([row["metadata"] for row in store.list_calls(tid)])
+
+    def open_uuid(u):
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.settimeout(5)
+        sock.sendall(A.pack(A.KIND_UUID, uuid.UUID(u).bytes))
+        return sock
+
+    def hang(sock):
+        try:
+            sock.sendall(A.pack(A.KIND_HANGUP))
+        except OSError:
+            pass
+        sock.close()
+
+    with TestClient(app) as c:
+        k, _ = tenant(c)
+        a = c.post("/v1/agents", json={"name": "a", "tools": [
+            {"builtin": "transfer", "targets": {"billing": "+15551230001"}}]}, headers=H(k)).json()
+        settings.audiosocket_agent = a["id"]
+        assert c.post("/sip/bind", data={"uuid": audio, "channelId": "chan-9"}).status_code == 403
+        assert c.post("/sip/bind", data={"uuid": "not-a-uuid", "channelId": "chan-9"}, headers=token).status_code == 422
+        r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                               "voicemailMessage": "leave this", "metadata": {"deal": "42"}},
+                   headers=H(k))
+        assert r.status_code == 200, r.text
+        cid = r.json()["id"]
+        bound = c.post("/sip/bind", data={"uuid": audio, "channelId": "chan-9"}, headers=token)
+        assert bound.status_code == 200 and bound.json()["channelId"] == "chan-9"
+        meta = store.get_call_any(cid)["metadata"]
+        assert meta["audioSocketUuid"] == audio and meta["callSid"] == "chan-9" and meta["voicemail"] == "leave this"
+        assert meta["deal"] == "42" and meta["from"] == "+15550001111" and meta["to"] == "+15552223333"
+        tid = store.get_call_any(cid)["tenant_id"]
+        assert len(store.list_calls(tid)) == 1
+        sock = open_uuid(audio)
+        try:
+            active = wait_live(cid)
+            meta = active["metadata"]
+            assert meta["callSid"] == "chan-9" and meta["audioSocketUuid"] == audio
+            assert meta["voicemail"] == "leave this" and meta["deal"] == "42" and meta["to"] == "+15552223333"
+            assert [row["id"] for row in store.list_calls(tid)] == [cid]
+            sess, _tr = rt.live[cid]
+            assert closed_context(sess.tools["transfer"]).call_sid == "chan-9"
+        finally:
+            hang(sock)
+        ended = None
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            ended = store.get_call_any(cid)
+            if ended and ended["status"] == "ended":
+                break
+            time.sleep(0.05)
+        assert ended["status"] == "ended"
+
+        pre = c.post("/sip/bind", data={"uuid": fresh, "channelId": "1730000000.42"}, headers=token)
+        assert pre.status_code == 200
+        sock2 = open_uuid(fresh)
+        try:
+            created = wait_row(lambda row: row["metadata"].get("audioSocketUuid") == fresh)
+            assert created["id"] != cid
+            assert created["metadata"]["callSid"] == "1730000000.42"
+            assert created["metadata"].get("voicemail") is None
+            sess2, _ = rt.live[created["id"]]
+            assert closed_context(sess2.tools["transfer"]).call_sid == "1730000000.42"
+        finally:
+            hang(sock2)
+
+        sock3 = open_uuid(unbound)
+        try:
+            extra = wait_row(lambda row: row["metadata"].get("audioSocketUuid") == unbound)
+            assert extra["metadata"].get("callSid", "") == ""
+            sess3, _ = rt.live[extra["id"]]
+            assert closed_context(sess3.tools["transfer"]).call_sid == ""
+        finally:
+            hang(sock3)
+        assert all(method == "POST" and "/redirect" not in url for method, url in seen)
+        assert all(audio not in url and fresh not in url and unbound not in url for _method, url in seen)
+
+    c2, *_ = make_outbound(lambda req: httpx.Response(500))
+    assert c2.post("/sip/bind", data={"uuid": audio, "channelId": "chan-9"},
+                   headers={"X-Vox-Sip-Token": "s3cret"}).status_code == 404
+
+
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)
 def test_drain_stops_new_calls_but_reports_readiness():
     from test_api import speech, silence

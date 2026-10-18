@@ -21,7 +21,7 @@
   VOX_NO_ESPEAK=1          run Kokoro without the GPL espeak-ng fallback (English only; Spanish/French/Italian/Portuguese/Hindi need espeak)
   VOX_PRELOAD_LANGS        Kokoro language codes to load at start-up, default a (a,b English; e,f,h,i,p,j,z others; see docs/LANGUAGES.md)
   VOX_AUDIOSOCKET_PORT / VOX_AUDIOSOCKET_AGENT / VOX_AUDIOSOCKET_HOST   SIP path: TCP port Asterisk streams call audio to, and the agent id that answers (docs/SIP.md)
-  VOX_SIP_TOKEN            shared secret for POST /sip/amd (empty disables that route)
+  VOX_SIP_TOKEN            shared secret for POST /sip/amd and POST /sip/bind (empty disables those routes)
   ASTERISK_ARI_URL         e.g. http://asterisk:8088 — SIP transfer and sip outbound use ARI; unset keeps Twilio
   ASTERISK_ARI_USER / ASTERISK_ARI_PASSWORD   ARI basic auth
   VOX_ALLOW_UNSIGNED_TWILIO=1   development only

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+import uuid as uuidlib
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 from xml.sax.saxutils import quoteattr
@@ -45,7 +46,7 @@ class Settings:
     audiosocket_port: int = 0          # >0: listen for Asterisk AudioSocket connections (the SIP path) on this TCP port
     audiosocket_agent: str = ""        # agent id that answers calls arriving on that port
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
-    sip_token: str = ""                  # shared secret for POST /sip/amd; empty disables that route (404)
+    sip_token: str = ""                  # shared secret for POST /sip/amd and POST /sip/bind; empty disables those routes (404)
 
 
 class AgentIn(BaseModel):
@@ -310,6 +311,9 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                              {"type": type_, "t": time.time(), "call": public_call(call), **extra})
 
     app.state.draining = False
+    app.state.sip_by_uuid = {}       # AudioSocket UUID -> Asterisk channel uniqueid (POST /sip/bind)
+    app.state.sip_by_channel = {}    # Asterisk channel uniqueid -> call id
+    app.state.sip_machine_done = {}  # call id -> "voicemail" | "hangup" once a machine result is acted on
 
     @app.get("/healthz")
     async def healthz():
@@ -849,29 +853,64 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
 
     async def audiosocket_call(reader, writer) -> None:
-        """One SIP call arriving from Asterisk over AudioSocket: create the call, admit it, run the agent."""
+        """One SIP call arriving from Asterisk over AudioSocket: adopt the outbound row or create one, then run the agent."""
         from transports.audiosocket import AudioSocketTransport
         agent = store.get_agent_any(settings.audiosocket_agent)
         if not agent or app.state.draining:
             writer.close()
             return
-        call = store.create_call(agent["tenant_id"], agent["id"], "sip", agent["config"], {})
         state: dict = {}
 
         async def factory(tr, custom):
-            store.update_call(call["id"], metadata={"callSid": custom.get("uuid", ""), "channel": "sip"})
+            # custom["uuid"] is the AudioSocket id. The ARI channel id was posted to /sip/bind before this connection.
+            audio_uuid = str(custom.get("uuid") or "")
+            ari_id = app.state.sip_by_uuid.get(audio_uuid, "")
+            call = None
+            if ari_id:
+                cid = app.state.sip_by_channel.get(ari_id)
+                if cid:
+                    found = store.get_call_any(cid)
+                    if found and found.get("medium") == "sip" and found.get("status") == "created":
+                        call = found
+                if call is None:
+                    call = store.find_sip_call(call_sid=ari_id)
+            if call is None and audio_uuid:
+                call = store.find_sip_call(audio_uuid=audio_uuid)
+            if call is None:
+                meta = {"channel": "sip", "audioSocketUuid": audio_uuid}
+                if ari_id:
+                    meta["callSid"] = ari_id
+                call = store.create_call(agent["tenant_id"], agent["id"], "sip", agent["config"], meta)
+            else:
+                # Merge. Replacing the document would drop voicemail, from, to, and the ARI id on an outbound row.
+                patch = {"channel": "sip", "audioSocketUuid": audio_uuid}
+                if ari_id:
+                    patch["callSid"] = ari_id
+                store.merge_call_metadata(call["id"], patch)
+                call = store.get_call_any(call["id"])
+            bound = str((call.get("metadata") or {}).get("callSid") or "")
+            if bound:
+                app.state.sip_by_channel[bound] = call["id"]
+            tr.call_sid = bound  # never the AudioSocket UUID: transfer and ARI hangup both read this
+            state["call"] = call
             state["t"] = admit(call)
             return runtime.build_session(call, tr)
 
         tr = AudioSocketTransport(reader, writer, factory)
-        tr.before_end = lambda: store.update_call(call["id"], end_reason="agent_hangup")
+
+        def mark_hangup() -> None:
+            adopted = state.get("call")
+            if adopted:
+                store.update_call(adopted["id"], end_reason="agent_hangup")
+
+        tr.before_end = mark_hangup
         try:
             await tr.run()
         except _Reject:
             writer.close()
         finally:
             if "t" in state:
-                finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+                finish(state["call"], state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
 
     @app.on_event("startup")
     async def _start_audiosocket():
@@ -929,6 +968,80 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             raise HTTPException(404, "not found")
         if not hmac.compare_digest(got, settings.sip_token):
             raise HTTPException(403, "bad sip token")
+
+    async def sip_fields(request: Request) -> dict:
+        """JSON or form body. Asterisk CURL posts urlencoded fields and may omit a content type."""
+        ctype = (request.headers.get("content-type") or "").lower()
+        if "json" in ctype:
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            return body if isinstance(body, dict) else {}
+        try:
+            form = {k: str(v) for k, v in (await request.form()).items()}
+        except Exception:  # noqa: BLE001
+            form = {}
+        if form:
+            return form
+        from urllib.parse import parse_qs
+        raw = (await request.body()).decode("utf-8", "ignore")
+        parsed = {k: v[-1] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+        return parsed or {k: v for k, v in request.query_params.items()}
+
+    def clean_channel_id(value: object) -> str:
+        channel_id = str(value or "").strip()
+        if not channel_id or len(channel_id) > 200 or any(ord(c) < 32 or ord(c) == 127 for c in channel_id):
+            raise HTTPException(422, "channelId is required")
+        return channel_id
+
+    async def sip_machine(call_id: str) -> str:
+        """Act on a stored machine_end result once. A live session is spoken to and hung up; otherwise the ARI
+        channel (metadata callSid, never the AudioSocket UUID) is deleted so the originated call does not stay up."""
+        done = app.state.sip_machine_done.get(call_id)
+        if done:
+            return done
+        cur = store.get_call_any(call_id)
+        if not cur:
+            return ""
+        meta = cur.get("metadata") or {}
+        answered = str(meta.get("answeredBy") or "")
+        if not answered.startswith("machine_end"):
+            return ""
+        msg = meta.get("voicemail")
+        live = runtime.live.get(call_id)
+        if live and msg:
+            app.state.sip_machine_done[call_id] = "voicemail"
+            sess, transport = live
+
+            async def go():
+                try:
+                    await sess.say_and_wait(msg)
+                finally:
+                    # A TTS failure must still drop the line; otherwise the machine stays connected.
+                    await transport.end()
+
+            import asyncio
+            asyncio.get_running_loop().create_task(go())
+            return "voicemail"
+        if live or cur["status"] != "created":
+            return ""
+        channel = str(meta.get("callSid") or "")
+        if not channel or runtime.http is None:
+            return ""
+        ctl = control_from_env(runtime.http, settings.public_base_url, "sip")
+        if not isinstance(ctl, AsteriskCallControl):
+            return ""
+        # Mark ended before the DELETE await so a concurrent AudioSocket cannot adopt this row.
+        app.state.sip_machine_done[call_id] = "hangup"
+        store.update_call(call_id, status="ended", ended=time.time(), end_reason=answered[:80])
+        try:
+            await ctl.hangup(channel)
+        except RuntimeError as e:
+            app.state.sip_machine_done.pop(call_id, None)
+            store.update_call(call_id, status="created", ended=None, end_reason=None)
+            raise HTTPException(502, str(e)) from e
+        return "hangup"
 
     @app.post("/v1/calls/outbound")
     async def outbound(body: OutboundIn, t: dict = Depends(tenant_write)):
@@ -991,9 +1104,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                     msg = ""
                 raise HTTPException(502, f"Asterisk refused the call (HTTP {r.status_code}): {msg}")
             try:
-                sid = r.json().get("id", "")
+                sid = r.json().get("id", "") or ""
             except ValueError:
                 sid = ""
+            if not isinstance(sid, str):
+                sid = str(sid)
         else:
             twiml = stream_twiml(call)
             data = {"To": body.to, "From": caller_id, "Twiml": twiml,
@@ -1015,7 +1130,14 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                     msg = ""
                 raise HTTPException(502, f"Twilio refused the call (HTTP {r.status_code}): {msg}")
             sid = r.json().get("sid", "")
-        store.update_call(call["id"], metadata={**meta, "callSid": sid})
+        if channel == "sip":
+            # Merge only callSid. AnsweredBy may already have been stored while originate was in flight.
+            if sid:
+                store.merge_call_metadata(call["id"], {"callSid": sid})
+                app.state.sip_by_channel[sid] = call["id"]
+                await sip_machine(call["id"])
+        else:
+            store.update_call(call["id"], metadata={**meta, "callSid": sid})
         log(t, "call.outbound", call["id"], to=body.to)
         return {**public_call(store.get_call_any(call["id"])), "callSid": sid}
 
@@ -1091,38 +1213,40 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     @app.post("/sip/amd/{call_id}")
     async def sip_amd(call_id: str, request: Request, x_vox_sip_token: str = Header(default="")):
-        """Asterisk (or the Stasis app) posts AnsweredBy here. Same voicemail action as /twilio/amd, local live calls only."""
+        """Asterisk (or the Stasis app) posts AnsweredBy here. Same voicemail action as /twilio/amd when the call
+        is live. A machine result with no session deletes the originated ARI channel instead of leaving it up."""
         require_sip_token(x_vox_sip_token)
-        call = store.get_call_any(call_id)
-        if not call:
+        if not store.get_call_any(call_id):
             raise HTTPException(404, "call not found")
-        ctype = request.headers.get("content-type", "")
-        if "json" in ctype:
-            try:
-                body = await request.json()
-            except Exception:  # noqa: BLE001
-                body = {}
-            answered = str((body or {}).get("AnsweredBy") or (body or {}).get("answeredBy") or "") if isinstance(body, dict) else ""
-        else:
-            form = {k: str(v) for k, v in (await request.form()).items()}
-            answered = form.get("AnsweredBy", "")
-        meta = call["metadata"] if isinstance(call["metadata"], dict) else json.loads(call["metadata"] or "{}")
-        store.update_call(call_id, metadata={**meta, "answeredBy": answered})
-        msg = meta.get("voicemail")
-        live = runtime.live.get(call_id)
+        fields = await sip_fields(request)
+        answered = str(fields.get("AnsweredBy") or fields.get("answeredBy") or "")
+        # Merge only answeredBy so a callSid stored while this request was in flight is not dropped.
+        if store.merge_call_metadata(call_id, {"answeredBy": answered}) is None:
+            raise HTTPException(404, "call not found")
         METRICS.inc("vox_amd_total", answered_by=answered or "unknown")
-        if msg and live and answered.startswith("machine_end"):
-            sess, transport = live
-
-            async def go():
-                try:
-                    await sess.say_and_wait(msg)
-                finally:
-                    # A TTS failure must still drop the line; otherwise the machine stays connected.
-                    await transport.end()
-            import asyncio
-            asyncio.get_running_loop().create_task(go())
-            return {"action": "voicemail"}
+        if answered.startswith("machine_end"):
+            action = await sip_machine(call_id)
+            if action:
+                return {"action": action, "answeredBy": answered}
         return {"action": "none", "answeredBy": answered}
+
+    @app.post("/sip/bind")
+    async def sip_bind(request: Request, x_vox_sip_token: str = Header(default="")):
+        """Dialplan posts CHANNEL(uniqueid) and the AudioSocket UUID before AudioSocket() opens. Transfer uses that
+        uniqueid. The AudioSocket UUID is not an ARI channel and must not be redirected or deleted."""
+        require_sip_token(x_vox_sip_token)
+        fields = await sip_fields(request)
+        try:
+            audio_uuid = str(uuidlib.UUID(str(fields.get("uuid") or fields.get("audioSocketUuid") or "")))
+        except ValueError:
+            raise HTTPException(422, "uuid must be a UUID") from None
+        channel_id = clean_channel_id(fields.get("channelId") or fields.get("uniqueid") or "")
+        app.state.sip_by_uuid[audio_uuid] = channel_id
+        found = store.find_sip_call(call_sid=channel_id)
+        if found:
+            store.merge_call_metadata(found["id"],
+                                     {"audioSocketUuid": audio_uuid, "callSid": channel_id, "channel": "sip"})
+            app.state.sip_by_channel[channel_id] = found["id"]
+        return {"ok": True, "uuid": audio_uuid, "channelId": channel_id}
 
     return app

@@ -131,8 +131,13 @@ class Runtime:
             import json
             meta = json.loads(meta or "{}")
         sid, token = os.environ.get("TWILIO_ACCOUNT_SID", ""), os.environ.get("TWILIO_AUTH_TOKEN", "")
+        # On SIP, transport.call_sid is the AudioSocket UUID. ARI will not redirect or delete that id.
+        if str(call.get("medium") or "") == "sip":
+            channel_sid = str(meta.get("callSid") or "")
+        else:
+            channel_sid = getattr(transport, "call_sid", "") or str(meta.get("callSid") or "")
         ctx = toolmod.CallContext(call_id=call["id"], caller=str(meta.get("from", "")), callee=str(meta.get("to", "")),
-                                  call_sid=getattr(transport, "call_sid", "") or str(meta.get("callSid", "")),
+                                  call_sid=channel_sid,
                                   end=transport.end, twilio={"sid": sid, "token": token} if sid and token else None,
                                   medium=str(call.get("medium") or ""))
         tid = call["tenant_id"]

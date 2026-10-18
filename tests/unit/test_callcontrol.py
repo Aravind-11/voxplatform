@@ -197,3 +197,78 @@ async def test_sip_call_does_not_transfer_through_twilio_or_asterisk_on_a_browse
     browser = {"id": "c2", "tenant_id": "t1", "medium": "webSocket", "metadata": {}, "config": _spec()}
     err = await rt.build_session(browser, _NoChannel()).tools["transfer"]({"to": "billing"})
     assert isinstance(err, dict) and "error" in err and seen == []
+
+
+def _sip_phone(audio_uuid: str):
+    class T:
+        out_rate = 8000
+        call_sid = audio_uuid
+
+        async def end(self):
+            return None
+
+        async def send_audio(self, *a):
+            return None
+
+        def clear(self):
+            return None
+    return T()
+
+
+def _ari_runtime(monkeypatch):
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACx")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "t")
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append(str(req.url))
+        return httpx.Response(204)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, Store(), http=http, public_url="https://vox.example.com")
+    return rt, seen
+
+
+async def test_sip_transfer_uses_the_ari_channel_not_the_audiosocket_uuid(monkeypatch):
+    """The AudioSocket UUID is not an ARI channel. Redirect the bound uniqueid, or return an error and post nothing."""
+    from urllib.parse import parse_qs, urlsplit
+    audio = "11111111-1111-1111-1111-111111111111"
+    rt, seen = _ari_runtime(monkeypatch)
+    cold = {"id": "c1", "tenant_id": "t1", "medium": "sip", "metadata": {"callSid": "1730000000.42",
+            "audioSocketUuid": audio}, "config": _spec()}
+    result = await rt.build_session(cold, _sip_phone(audio)).tools["transfer"]({"to": "billing"})
+    assert seen == []
+    await result.after()
+    assert len(seen) == 1 and "1730000000.42" in seen[0] and audio not in seen[0]
+    assert "api.twilio.com" not in seen[0]
+    q = parse_qs(urlsplit(seen[0]).query)
+    assert q["endpoint"] == ["PJSIP/+15551230001"] and "@voxsun" not in q["endpoint"][0]
+
+    seen.clear()
+    missing = {"id": "c2", "tenant_id": "t1", "medium": "sip", "metadata": {"audioSocketUuid": audio}, "config": _spec()}
+    err = await rt.build_session(missing, _sip_phone(audio)).tools["transfer"]({"to": "billing"})
+    if not isinstance(err, dict):
+        await err.after()
+    assert isinstance(err, dict) and "error" in err and seen == []
+
+
+async def test_sip_warm_transfer_does_not_redirect(monkeypatch):
+    audio = "22222222-2222-2222-2222-222222222222"
+    rt, seen = _ari_runtime(monkeypatch)
+    call = {"id": "c1", "tenant_id": "t1", "medium": "sip", "metadata": {"callSid": "1730000000.42"},
+            "config": {"systemPrompt": "hi", "tools": [
+                {"builtin": "transfer", "mode": "warm", "targets": {"billing": "+15551230001"}}]}}
+    result = await rt.build_session(call, _sip_phone(audio)).tools["transfer"]({"to": "billing"})
+    if not isinstance(result, dict):
+        await result.after()
+    assert isinstance(result, dict) and "warm" in result["error"] and seen == []
+    client = _Rec()
+    ctl = AsteriskCallControl(client, "http://asterisk:8088", "ari", "s")
+    try:
+        await ctl.transfer("1730000000.42", "+15551230001", mode="warm")
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised and client.seen == []

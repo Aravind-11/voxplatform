@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from core.session import ToolResult
-from .callcontrol import TwilioCallControl
+from .callcontrol import AsteriskCallControl, TwilioCallControl
 from .http_tools import NAME_RE, ToolConfigError
 
 E164 = re.compile(r"^\+[1-9]\d{6,14}$")
@@ -173,6 +173,9 @@ def make(defn: dict, ctx, client):
             control = TwilioCallControl(client, ctx.twilio["sid"], ctx.twilio["token"], base_url)
         elif isinstance(control, TwilioCallControl) and mode == "warm" and (not control.base_url or not getattr(ctx, "call_id", "")):
             return {"error": "warm transfer needs the public URL configured"}
+        if isinstance(control, AsteriskCallControl) and mode == "warm":
+            # Blind redirect is not a whisper-and-return. Reporting success would make the model hang up on the caller.
+            return {"error": "warm transfer is not available on SIP calls"}
         if not ctx.call_sid:
             # A controller from the environment used to skip this check and report success with no channel.
             return {"error": "transfer is only available on a live phone call"}

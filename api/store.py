@@ -369,6 +369,50 @@ class Store:
             cols = ", ".join(f"{k}=?" for k in fields)
             self._x(f"UPDATE calls SET {cols} WHERE id=?", (*fields.values(), call_id))
 
+    def merge_call_metadata(self, call_id: str, patch: dict) -> Optional[dict]:
+        """Merge keys into metadata. The compare-and-swap retries so one writer cannot drop the other's keys."""
+        if not isinstance(patch, dict) or not patch:
+            raise ValueError("metadata patch must be a non-empty dict")
+        for _ in range(8):
+            with self.lock:
+                row = self._run("SELECT metadata FROM calls WHERE id=?", (call_id,)).fetchone()
+                if row is None:
+                    return None
+                raw = dict(row)["metadata"]
+                meta = json.loads(raw or "{}")
+                meta.update(patch)
+                new = json.dumps(meta)
+                if raw is not None and new == raw:
+                    return meta
+                if raw is None:
+                    n = self._run("UPDATE calls SET metadata=? WHERE id=? AND metadata IS NULL",
+                                  (new, call_id)).rowcount
+                else:
+                    n = self._run("UPDATE calls SET metadata=? WHERE id=? AND metadata=?",
+                                  (new, call_id, raw)).rowcount
+                if n:
+                    return meta
+        raise RuntimeError(f"could not merge metadata for {call_id}")
+
+    def find_sip_call(self, *, call_sid: str = "", audio_uuid: str = "") -> Optional[dict]:
+        """Newest not-yet-joined sip call with this ARI channel id or AudioSocket UUID."""
+        if call_sid:
+            field, value = "callSid", call_sid
+        elif audio_uuid:
+            field, value = "audioSocketUuid", audio_uuid
+        else:
+            return None
+        if self.pg:
+            sql = ("SELECT * FROM calls WHERE medium=? AND status=? AND metadata::json->>? = ? "
+                   "ORDER BY created DESC LIMIT 1")
+            args = ("sip", "created", field, value)
+        else:
+            sql = ("SELECT * FROM calls WHERE medium=? AND status=? AND json_extract(metadata, ?) = ? "
+                   "ORDER BY created DESC LIMIT 1")
+            args = ("sip", "created", f"$.{field}", value)
+        r = self._one(sql, args)
+        return self._call(r) if r else None
+
     # ---- usage
     def usage(self, tenant_id: str, days: int = 30) -> dict:
         """Totals plus per-day and per-agent breakdowns (UTC days) over the last `days` days."""

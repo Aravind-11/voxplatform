@@ -277,17 +277,23 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     def call_variables(cfg: dict, supplied, *, strict: bool) -> dict:
         """Validated call-supplied variables. With strict=True (an API-created call) a placeholder that nothing fills is
-        a 422, so a typo never reaches a live conversation."""
+        a 422, so a typo never reaches a live conversation. Every variant system prompt counts, not only the agent prompt."""
         try:
             given = varmod.validate(supplied)
             varmod.validate(cfg.get("variables") or {})
         except varmod.VariableError as e:
             raise HTTPException(422, str(e)) from e
         if strict:
-            gone = varmod.missing([cfg.get("systemPrompt", ""), cfg.get("greeting", "")], {**(cfg.get("variables") or {}), **given})
+            texts = [cfg.get("systemPrompt", ""), cfg.get("greeting", "")]
+            exp = cfg.get("experiment")
+            if isinstance(exp, dict):
+                for variant in exp.get("variants") or []:
+                    if isinstance(variant, dict) and isinstance(variant.get("systemPrompt"), str):
+                        texts.append(variant["systemPrompt"])
+            gone = varmod.missing(texts, {**(cfg.get("variables") or {}), **given})
             if gone:
-                raise HTTPException(422, f"the agent's prompt or greeting uses {{{{{gone[0]}}}}} (and {len(gone) - 1} more) "
-                                         f"but no value was given: missing {gone}")
+                raise HTTPException(422, f"the agent's prompt, greeting, or a variant uses {{{{{gone[0]}}}}} "
+                                         f"(and {len(gone) - 1} more) but no value was given: missing {gone}")
         return given
 
     def pick_voice(cur_voice, cur_lang, new_voice, new_lang, voice_given: bool):
@@ -1066,10 +1072,12 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if app.state.draining:
             return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we cannot take your call right now.</Say><Hangup/></Response>', media_type="text/xml")
         who = re.sub(r"[^\w -]", "", to)[:40] or "that person"
+        # Kept on metadata as well as the prompt: a variant system prompt replaces cfg["systemPrompt"] in build_session.
+        note = f"\nThe caller asked to be transferred to {who}, who did not answer. Offer to help or to take a message."
         cfg = dict(call["config"])
         cfg["greeting"] = f"Sorry, {who} is not available right now. Is there anything else I can help you with?"
-        cfg["systemPrompt"] = (cfg.get("systemPrompt") or "") + f"\nThe caller asked to be transferred to {who}, who did not answer. Offer to help or to take a message."
-        meta = {**call["metadata"], "resumedFrom": call_id}
+        cfg["systemPrompt"] = (cfg.get("systemPrompt") or "") + note
+        meta = {**call["metadata"], "resumedFrom": call_id, "promptSuffix": note}
         resumed = store.create_call(call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
         return Response(stream_twiml(resumed), media_type="text/xml")
 

@@ -13,8 +13,36 @@ class ExperimentError(ValueError):
     pass
 
 
+def _positive_weight(weight: Any) -> float:
+    """A finite float above zero. An int that does not fit in float64 raises ExperimentError, not OverflowError."""
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+        raise ExperimentError("variant weight must be a positive number")
+    try:
+        value = float(weight)
+    except OverflowError as e:
+        raise ExperimentError("variant weight must be a positive number") from e
+    if not math.isfinite(value) or value <= 0:
+        raise ExperimentError("variant weight must be a positive number")
+    return value
+
+
+def _shareable_weights(weights: list[float]) -> float:
+    """Sum of the line the bucket point lands on. A weight that does not move the sum has a zero-width bucket."""
+    try:
+        total = math.fsum(weights)
+    except OverflowError as e:
+        raise ExperimentError("variant weights must sum to a finite number") from e
+    if not math.isfinite(total) or total <= 0:
+        raise ExperimentError("variant weights must sum to a finite number")
+    for weight in weights:
+        rest = total - weight
+        if not math.isfinite(rest) or rest >= total:
+            raise ExperimentError("variant weights must sum to a finite number")
+    return total
+
+
 def validate_experiment(experiment: Any) -> dict:
-    """Weights must be positive, variant ids unique, at most 4 variants. Raises ExperimentError."""
+    """Weights must be positive and share a finite sum, variant ids unique, at most 4 variants. Raises ExperimentError."""
     if not isinstance(experiment, dict):
         raise ExperimentError("experiment must be an object")
     extra = set(experiment) - {"id", "variants"}
@@ -44,9 +72,8 @@ def validate_experiment(experiment: Any) -> dict:
         seen.append(vid)
         weight = raw.get("weight")
         # bool is a subclass of int; True would otherwise pass as weight 1.
-        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0:
-            raise ExperimentError("variant weight must be a positive number")
-        item: dict[str, Any] = {"id": vid, "weight": weight if isinstance(weight, int) else float(weight)}
+        value = _positive_weight(weight)
+        item: dict[str, Any] = {"id": vid, "weight": weight if isinstance(weight, int) else value}
         for key in ("voice", "systemPrompt", "model"):
             if key not in raw or raw[key] is None:
                 continue
@@ -55,6 +82,7 @@ def validate_experiment(experiment: Any) -> dict:
             if raw[key].strip():
                 item[key] = raw[key]
         cleaned.append(item)
+    _shareable_weights([_positive_weight(item["weight"]) for item in cleaned])
     return {"id": eid.strip(), "variants": cleaned}
 
 
@@ -63,13 +91,8 @@ def choose_variant(experiment: dict, call_id: str) -> dict:
     variants = list(experiment.get("variants") or [])
     if not variants:
         raise ExperimentError("experiment has no variants")
-    weights: list[float] = []
-    for variant in variants:
-        weight = variant.get("weight", 0)
-        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight <= 0:
-            raise ExperimentError("variant weight must be a positive number")
-        weights.append(float(weight))
-    total = sum(weights)
+    weights = [_positive_weight(variant.get("weight", 0)) for variant in variants]
+    total = _shareable_weights(weights)
     slot = int.from_bytes(hashlib.sha256(call_id.encode("utf-8")).digest()[:8], "big")
     point = (slot / float(2**64)) * total
     acc = 0.0

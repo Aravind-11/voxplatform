@@ -111,6 +111,52 @@ class Runtime:
             out += self.store.messages(cid)
         return out[-keep:]
 
+    def _assigned_variant(self, call: dict, experiment: dict) -> dict:
+        """Variant for this call.
+
+        A resume or a failed transfer is a new call row. Walk `resumedFrom` (same tenant, at most 4 rows, the same
+        cap as `_earlier_messages`) and bucket off that root id so the conversation keeps one variant. Reuse an
+        ancestor's recorded variant id only when it still belongs to this experiment. This call's own metadata
+        `variant` is not an assignment: `POST /v1/calls` copies client metadata onto the row.
+        """
+        variants = [v for v in (experiment.get("variants") or []) if isinstance(v, dict)]
+        by_id = {v.get("id"): v for v in variants if isinstance(v.get("id"), str)}
+        chain: list[dict] = []
+        seen: set[str] = set()
+        cur_id = str(call.get("id") or "")
+        tid = call.get("tenant_id")
+        pending: Optional[dict] = call
+        while cur_id and cur_id not in seen and len(chain) < 4:
+            seen.add(cur_id)
+            if pending is not None and str(pending.get("id") or "") == cur_id:
+                row = pending
+            else:
+                row = self.store.get_call_any(cur_id)
+            pending = None
+            if not row or row.get("tenant_id") != tid:
+                break
+            chain.append(row)
+            raw = row.get("metadata") or {}
+            if isinstance(raw, str):
+                raw = json.loads(raw or "{}")
+            nxt = raw.get("resumedFrom") if isinstance(raw, dict) else None
+            if not isinstance(nxt, str) or not nxt:
+                break
+            cur_id = nxt
+        for row in chain[1:]:
+            raw = row.get("metadata") or {}
+            if isinstance(raw, str):
+                raw = json.loads(raw or "{}")
+            if not isinstance(raw, dict):
+                continue
+            vid = raw.get("variant")
+            # Own metadata.variant is ignored above: a client can set it on POST /v1/calls. An ancestor's
+            # recorded id is the assignment only while this experiment still has that id.
+            if isinstance(vid, str) and vid in by_id:
+                return dict(by_id[vid])
+        root_id = str(chain[-1]["id"]) if chain else str(call.get("id") or "")
+        return choose_variant(experiment, root_id)
+
     @staticmethod
     def _eot_mode() -> str:
         return os.environ.get("VOX_EOT", "")
@@ -137,7 +183,7 @@ class Runtime:
         variant = None
         experiment = cfg.get("experiment")
         if isinstance(experiment, dict) and experiment.get("variants"):
-            variant = choose_variant(experiment, str(call["id"]))
+            variant = self._assigned_variant(call, experiment)
             # The call dict can be older than the row: SIP writes the channel id after this object was loaded.
             stored = (self.store.get_call_any(call["id"]) or {}).get("metadata") or {}
             if isinstance(stored, str):
@@ -180,9 +226,16 @@ class Runtime:
                   **{k: str(v) for k, v in (meta.get("variables") or {}).items()},
                   "caller": str(meta.get("from", "")), "callee": str(meta.get("to", "")), "callId": call["id"]}
         prompt_src = cfg.get("systemPrompt") or SessionConfig.system_prompt
-        if variant and str(variant.get("systemPrompt") or "").strip():
+        variant_prompt = str(variant.get("systemPrompt") or "").strip() if variant else ""
+        if variant_prompt:
             prompt_src = str(variant["systemPrompt"])   # non-empty variant prompt replaces the agent prompt
         prompt = varmod.render(prompt_src, values)
+        # The failed-transfer addendum lives in cfg["systemPrompt"] and in metadata promptSuffix. Append the
+        # suffix only when the variant prompt replaced that field; a voice-only variant already has it inline.
+        if variant_prompt:
+            suffix = meta.get("promptSuffix") if isinstance(meta, dict) else None
+            if isinstance(suffix, str) and suffix.strip():
+                prompt += varmod.render(suffix, values)
         resumed = bool(meta.get("resumedFrom"))
         from core.tts import LANG_NAME
         if cfg.get("language") in LANG_NAME:

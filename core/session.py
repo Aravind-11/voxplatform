@@ -320,8 +320,12 @@ class Session:
     async def _produce(self, gen: _Generation) -> None:
         followups: list[dict] = []
         try:
-            if self._transcript_task and not self._transcript_task.done():
-                await self._transcript_task  # previous turn's transcript must be in history
+            # Previous turn's transcript must be in history before this reply sees it. Shield the
+            # task: this generation is often cancelled (the caller resumes), and cancelling it
+            # would also cancel the transcript it is awaiting, sticking that line on "[caller audio]".
+            prior = self._transcript_task
+            if prior is not None and not prior.done():
+                await asyncio.shield(prior)
                 gen.base_history = list(self.history[: len(gen.base_history)])
             for _round in range(self.cfg.max_tool_rounds + 1):
                 chunker = SentenceChunker()
@@ -346,8 +350,11 @@ class Session:
                 await gen.commit.wait()  # never run side effects for an uncommitted reply
                 # The confirming turn's transcript is what with_confirmation reads. Wait for it, or the
                 # latest user line is still the "[caller audio]" placeholder and a real "yes" never counts.
-                if self._transcript_task is not None:
-                    await self._transcript_task
+                # Shield it: cancelling this generation (the caller spoke again) also cancels whatever
+                # task it is awaiting, which would drop the line and leave the placeholder behind.
+                transcript_task = self._transcript_task
+                if transcript_task is not None and not transcript_task.done():
+                    await asyncio.shield(transcript_task)
                 followups.append({"role": "assistant", "content": "".join(text_parts) or None,
                                   "tool_calls": [{"id": c.id, "type": "function",
                                                   "function": {"name": c.name,

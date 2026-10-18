@@ -9,6 +9,8 @@ import json
 import logging
 import secrets
 import threading
+import time
+from contextlib import contextmanager
 from typing import Awaitable, Callable, Mapping, Optional
 
 log = logging.getLogger(__name__)
@@ -259,6 +261,126 @@ return 1
                 await asyncio.get_running_loop().run_in_executor(None, self.refresh)
             except Exception:  # noqa: BLE001  (Redis blip: try again next tick)
                 pass
+
+
+class _OutboundLease:
+    """True only while this holder's token is still the Redis mutex. A flush or a fired TTL makes it false."""
+
+    def __init__(self, cap: "OutboundCap", tenant_id: str, token: str):
+        self._cap, self._tenant_id, self._token = cap, tenant_id, token
+
+    def __bool__(self) -> bool:
+        return self._cap._owns(self._tenant_id, self._token)
+
+
+class OutboundCap:
+    """Rolling 24 hour outbound cap. The count is always SQL, so a Redis flush is not a new day.
+
+    Redis is only a per-tenant mutex around ``hold`` (the caller inserts before the block ends).
+    The mutex TTL is short because this Redis is not durable and a dead holder must not pin the cap
+    shut. A live holder refreshes that lease well inside the TTL so a slow count or insert is not
+    stolen. If the lock cannot be taken, or this holder's token is gone before the insert, the
+    attempt is refused. Without Redis, ``store.lock`` covers the same section inside one process.
+    A call placed exactly 24 hours ago still counts (``created >= now - 24h``).
+    """
+
+    WINDOW_S = 24 * 60 * 60
+    LOCK_TTL_S = 10
+    LOCK_WAIT_S = 12
+    _POLL_S = 0.02
+    # Delete only our token. A late release after TTL must not drop the next holder's lock.
+    _RELEASE = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
+    # Extend only our token (ARGV[2] is milliseconds). A late refresh must not keep the next lease.
+    _REFRESH = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) end return 0"
+
+    def __init__(self, limiter, store):
+        self.store = store
+        self._redis = limiter.r if isinstance(limiter, RedisLimiter) else None
+
+    def _lock_key(self, tenant_id: str) -> str:
+        return f"vox:outbound-lock:{tenant_id}"
+
+    def allow(self, tenant_id: str, per_day: int) -> bool:
+        """True if this tenant may place another outbound call inside the rolling 24 hour window."""
+        since = time.time() - self.WINDOW_S
+        return self.store.count_outbound(tenant_id, since) < int(per_day)
+
+    def _refresh_interval(self) -> float:
+        # ttl/3, same cadence as the active-call heartbeat, so a live holder is not stolen at LOCK_TTL_S.
+        return max(float(self.LOCK_TTL_S) / 3.0, 0.01)
+
+    def _acquire_lock(self, tenant_id: str) -> Optional[str]:
+        token = secrets.token_hex(16)
+        key = self._lock_key(tenant_id)
+        deadline = time.monotonic() + self.LOCK_WAIT_S
+        while True:
+            try:
+                acquired = self._redis.set(key, token, nx=True, ex=self.LOCK_TTL_S)
+            except Exception:  # noqa: BLE001  (Redis down: fail closed, never admit on an empty key)
+                return None
+            if acquired:
+                return token
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(self._POLL_S)  # caller must not run this wait on the event loop
+
+    def _owns(self, tenant_id: str, token: str) -> bool:
+        try:
+            return self._redis.get(self._lock_key(tenant_id)) == token
+        except Exception:  # noqa: BLE001  (Redis down: do not insert without the mutex)
+            return False
+
+    def _refresh_lock(self, tenant_id: str, token: str) -> bool:
+        """Extend our lease. False when the key is no longer this token (gone, expired, or stolen)."""
+        ms = str(max(1, int(round(float(self.LOCK_TTL_S) * 1000))))
+        try:
+            renewed = self._redis.eval(self._REFRESH, 1, self._lock_key(tenant_id), token, ms)
+        except Exception:  # noqa: BLE001  (blip: try again next tick; the insert still checks the token)
+            return True
+        return int(renewed or 0) == 1
+
+    def _keep_lock(self, tenant_id: str, token: str, stop: threading.Event) -> None:
+        while not stop.is_set():
+            if not self._refresh_lock(tenant_id, token):
+                return
+            if stop.wait(self._refresh_interval()):
+                return
+
+    def _release_lock(self, tenant_id: str, token: str) -> None:
+        try:
+            self._redis.eval(self._RELEASE, 1, self._lock_key(tenant_id), token)
+        except Exception:  # noqa: BLE001  (TTL drops a lock we could not release)
+            return
+
+    @contextmanager
+    def hold(self, tenant_id: str, per_day: int):
+        """Yield whether one more outbound row may be inserted.
+
+        On Redis the value stays true only while this holder's token is still the lock. Check it
+        again immediately before insert: a restart that drops the key, or a TTL that fires, must
+        not write the row. Insert before the block ends, or the slot is not taken.
+        """
+        if self._redis is None:
+            with self.store.lock:
+                yield self.allow(tenant_id, per_day)
+            return
+        token = self._acquire_lock(tenant_id)
+        if token is None:
+            yield False
+            return
+        stop = threading.Event()
+        refresher = threading.Thread(
+            target=self._keep_lock, args=(tenant_id, token, stop), name="outbound-lock-refresh", daemon=True)
+        refresher.start()
+        try:
+            if self.allow(tenant_id, per_day):
+                yield _OutboundLease(self, tenant_id, token)
+            else:
+                yield False
+        finally:
+            stop.set()
+            refresher.join(timeout=1.0)
+            self._release_lock(tenant_id, token)
 
 
 # ------------------------------------------------------- Twilio signatures

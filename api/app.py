@@ -257,6 +257,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     if getattr(runtime, "bus", None) is None:
         runtime.bus = make_bus(os.environ.get("VOX_REDIS_URL", ""))   # tests leave the env unset -> local
     app.state.store, app.state.limiter, app.state.runtime = store, limiter, runtime
+    outbound_cap = security.OutboundCap(limiter, store)
     METRICS.gauge("vox_active_calls", limiter.local_active)            # this node's calls
     METRICS.gauge("vox_active_calls_cluster", limiter.total_active)   # every node's calls (Redis scan)
 
@@ -1737,15 +1738,6 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         agent = await to_thread(store.get_agent, t["id"], body.agentId)
         if not agent:
             raise HTTPException(404, "agent not found")
-        day_ago = time.time() - 86400
-
-        def _recent() -> int:
-            return sum(1 for c in store.list_calls(t["id"], limit=10_000)
-                       if c["created"] >= day_ago and c["metadata"].get("direction") == "outbound")
-
-        recent = await to_thread(_recent)
-        if recent >= settings.outbound_per_day:
-            raise HTTPException(429, f"outbound limit reached ({settings.outbound_per_day} per 24 h)")
         cfg = dict(agent["config"])
         if body.record is not None:
             cfg["record"] = body.record
@@ -1758,11 +1750,30 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             meta["variables"] = given_vars
         if body.voicemailMessage:
             meta["voicemail"] = body.voicemailMessage
-        # Reserve before dialing. A full node must not place a call Twilio will connect to a 1013.
-        cid, decision = reserve_slot(t["id"])
-        if decision != "ok":
-            raise HTTPException(503, "node full" if decision == "node" else "concurrency limit")
-        call = await to_thread(create_reserved, cid, t["id"], body.agentId, "twilio", cfg, meta)
+        tenant_id = t["id"]
+        node_draining = object()
+
+        def _admit():
+            # hold() sleeps while another node inserts; that wait must not block this event loop.
+            # Drain can flip during the wait, and the lease can disappear. Re-check both before the insert.
+            # Reserve before dialing. A full node must not place a call Twilio will connect to a 1013.
+            with outbound_cap.hold(tenant_id, settings.outbound_per_day) as allowed:
+                if not allowed:                        # over the cap, or this holder's lease is gone
+                    return None
+                if app.state.draining:                 # preStop waits on active_calls, which does not include this dial
+                    return node_draining
+                cid, decision = reserve_slot(tenant_id)
+                if decision != "ok":
+                    return decision                    # "node" or "tenant"; no row, cap not consumed
+                return create_reserved(cid, tenant_id, body.agentId, "twilio", cfg, meta)
+
+        call = await to_thread(_admit)
+        if call is node_draining:
+            raise HTTPException(503, "node is draining")
+        if call is None:
+            raise HTTPException(429, f"outbound limit reached ({settings.outbound_per_day} per 24 h)")
+        if call in ("node", "tenant"):
+            raise HTTPException(503, "node full" if call == "node" else "concurrency limit")
         twiml = stream_twiml(call)
         data = {"To": body.to, "From": caller_id, "Twiml": twiml,
                 "StatusCallback": f"{settings.public_base_url}/twilio/status/{call['id']}",

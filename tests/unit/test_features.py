@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import threading
 import time
 import wave
 
@@ -740,6 +741,702 @@ def test_outbound_non_json_success_releases_the_slot_and_ends_the_row():
     row2 = store2.list_calls(tid2)[0]
     assert row2["status"] == "created" and not row2["end_reason"]
     store2.update_call = orig
+
+
+def test_count_outbound_is_not_limited_by_list_calls_page_size():
+    from api.store import Store
+    store = Store()
+    tid = store.create_tenant("acme")
+    since = time.time() - 60
+    for i in range(5):
+        store.create_call(tid, None, "twilio", {}, {"direction": "outbound", "n": i})
+    store.create_call(tid, None, "webSocket", {}, {"from": "+15550001"})  # not outbound
+    old = store.create_call(tid, None, "twilio", {}, {"direction": "outbound", "n": "old"})
+    store._x("UPDATE calls SET created=? WHERE id=?", (since - 86400, old["id"]))
+    assert len(store.list_calls(tid, limit=1)) == 1
+    assert store.count_outbound(tid, since) == 5
+    # the route must not go back to scanning a short page
+
+    def ok(req):
+        return httpx.Response(201, json={"sid": "CA9"})
+    c, store2, _ = make_outbound(ok, outbound_per_day=5)
+    k, tid2 = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    for i in range(5):
+        store2.create_call(tid2, a["id"], "twilio", {}, {"direction": "outbound", "n": i})
+    assert len(store2.list_calls(tid2, limit=1)) == 1
+    assert store2.count_outbound(tid2, time.time() - 86400) == 5
+    store2.list_calls = lambda tenant_id, limit=50: []  # a truncated scan would under-count and allow the call
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551230000"}, headers=H(k))
+    assert r.status_code == 429
+
+
+class _OutboundRedis:
+    """Lock commands, plus the old sorted-set script.
+
+    That script still admits when the set is empty. The cap is the SQL count; a regression that trusts
+    this set fails the tests below. ``eval`` follows the release script it is given: compare-and-delete
+    only when the script reads the token, so an unconditional DEL is observable.
+    """
+
+    def __init__(self):
+        self._mu = threading.Lock()
+        self.z, self.expire, self.scripts = {}, {}, []
+        self.kv = {}          # key -> (value, expiry or None)
+        self.sets = []
+
+    def register_script(self, script):
+        self.scripts.append(script)
+
+        def call(keys=None, args=None, client=None):
+            key = keys[0]
+            # Current node-admission script: now, expiry, member, cap.
+            # The older daily-cap script passed cap as args[2], the member as args[3], and a cutoff in args[4].
+            # Either form still admits into an empty set, so a regression that trusts this set is visible.
+            if len(args) >= 5:
+                now, window, cap, member = float(args[0]), float(args[1]), int(args[2]), args[3]
+                cutoff = float(str(args[4])[1:])
+                score = now
+            else:
+                cutoff, score, member, cap = float(args[0]), float(args[1]), args[2], int(args[3])
+                window = score
+            with self._mu:
+                bucket = self.z.setdefault(key, {})
+                for m, old in list(bucket.items()):
+                    if old < cutoff:
+                        del bucket[m]
+                self.expire[key] = window
+                if len(args) < 5 and member in bucket:
+                    bucket[member] = score
+                    return 1
+                if len(bucket) >= cap:
+                    return 0
+                bucket[member] = score
+                return 1
+
+        return call
+
+    def _purge_unlocked(self) -> None:
+        now = time.time()
+        for k, (_val, exp) in list(self.kv.items()):
+            if exp is not None and exp <= now:
+                del self.kv[k]
+
+    def set(self, name, value, ex=None, nx=False, **kwargs):
+        with self._mu:
+            self._purge_unlocked()
+            ex_n = None if ex is None else float(ex)
+            self.sets.append({"name": name, "ex": ex_n, "nx": bool(nx)})
+            if nx and name in self.kv:
+                return None
+            exp = None if ex_n is None else time.time() + ex_n
+            self.kv[name] = (value, exp)
+            return True
+
+    def get(self, name):
+        with self._mu:
+            self._purge_unlocked()
+            item = self.kv.get(name)
+            return None if item is None else item[0]
+
+    def eval(self, script, numkeys, *keys_and_args):
+        key = keys_and_args[0]
+        token = keys_and_args[1] if len(keys_and_args) > 1 else None
+        with self._mu:
+            self._purge_unlocked()
+            if "get" in script and "ARGV[1]" in script:
+                cur = self.kv.get(key)
+                if cur is None or cur[0] != token:
+                    return 0
+                if "pexpire" in script or "expire" in script:
+                    raw = float(keys_and_args[2])
+                    ttl = raw / 1000.0 if "pexpire" in script else raw
+                    self.kv[key] = (cur[0], None if ttl <= 0 else time.time() + ttl)
+                    return 1
+                if "del" in script:
+                    del self.kv[key]
+                    return 1
+                return 0
+            if "del" in script:
+                self.kv.pop(key, None)
+                return 1
+            raise AssertionError(script)
+
+
+def test_fresh_redis_does_not_ignore_stored_outbound_calls():
+    """An empty Redis must not admit another full cap over rows SQL already has, or keep a member."""
+    from api import security
+    from api.store import Store
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    per_day = 2
+    for i in range(per_day):
+        store.create_call(tid, None, "twilio", {}, {"direction": "outbound", "n": i})
+    store.create_call(tid, None, "webSocket", {}, {"from": "+15550001"})  # not outbound, must not count
+    fake = _OutboundRedis()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), store)
+    assert cap.allow(tid, per_day) is False
+    assert cap.allow(tid, per_day + 1) is True
+    assert fake.z == {}                                            # no member added on the empty key
+    before = store.count_outbound(tid, time.time() - 86400)
+    with cap.hold(tid, per_day) as allowed:
+        assert allowed is False
+        if allowed:                                                # a fall-open would consume a slot
+            store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+    assert store.count_outbound(tid, time.time() - 86400) == before == per_day
+    assert fake.z == {} and fake.kv == {}
+    assert fake.sets and all(s["name"] == f"vox:outbound-lock:{tid}" for s in fake.sets)
+    assert all(s["ex"] is not None and s["ex"] <= 30 for s in fake.sets)
+    other = store.create_tenant("other")
+    assert cap.allow(other, per_day) is True                       # full tenant does not block another
+
+
+def test_redis_outbound_cap_does_not_reset_at_utc_midnight():
+    """The window is the SQL rolling 24h. A new UTC date, or an empty Redis, must not open another cap."""
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+    from api import security
+    from api.store import Store
+
+    t0 = datetime(2026, 10, 17, 23, 50, tzinfo=timezone.utc).timestamp()
+    store = Store()
+    tid = store.create_tenant("acme")
+    current = store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+    edge = store.create_call(tid, None, "twilio", {}, {"direction": "outbound", "edge": True})
+    older = store.create_call(tid, None, "twilio", {}, {"direction": "outbound", "old": True})
+    store._x("UPDATE calls SET created=? WHERE id=?", (t0, current["id"]))
+    store._x("UPDATE calls SET created=? WHERE id=?", (t0 - 86400, edge["id"]))             # exactly 24h before t0
+    store._x("UPDATE calls SET created=? WHERE id=?", (t0 - 86400 - 1, older["id"]))
+    fake = _OutboundRedis()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), store)
+    now = {"t": t0}
+    midnight = datetime(2026, 10, 18, 0, 10, tzinfo=timezone.utc).timestamp()
+    with patch("api.security.time.time", lambda: now["t"]):
+        assert cap.allow(tid, 2) is False                          # edge still counts; the older row does not
+        assert cap.allow(tid, 3) is True
+        now["t"] = midnight
+        assert cap.allow(tid, 1) is False                          # past UTC midnight, the t0 row is still inside 24h
+        now["t"] = t0 + 86400
+        assert cap.allow(tid, 1) is False                          # a call placed exactly 24h ago still counts
+        now["t"] = t0 + 86400 + 1
+        assert cap.allow(tid, 1) is True
+    assert fake.z == {}                                            # Redis never became a second counter
+
+
+def test_two_nodes_share_sql_outbound_cap_when_redis_is_empty(tmp_path):
+    """Two stores, one Redis. Preloaded rows plus an empty key must still stop at the cap."""
+    from api import security
+    from api.store import Store
+
+    path = str(tmp_path / "calls.db")
+    store_a, store_b = Store(path), Store(path)
+    for s in (store_a, store_b):
+        s.db.execute("PRAGMA busy_timeout=5000")
+    tid = store_a.create_tenant("acme")
+    for i in range(4):
+        store_a.create_call(tid, None, "twilio", {}, {"direction": "outbound", "n": i})
+    fake = _OutboundRedis()
+    caps = (
+        (security.OutboundCap(security.RedisLimiter(client=fake), store_a), store_a),
+        (security.OutboundCap(security.RedisLimiter(client=fake), store_b), store_b),
+    )
+    n, limit = 20, 5
+    bar = threading.Barrier(n)
+    wins, errors = [], []
+
+    def worker(i):
+        cap, store = caps[i % 2]
+        try:
+            bar.wait(timeout=5)
+            with cap.hold(tid, limit) as allowed:
+                if not allowed:
+                    return
+                time.sleep(0.02)                                   # widen the gap a missing mutex would lose
+                store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+                wins.append(i)
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not errors and all(not t.is_alive() for t in threads)
+    since = time.time() - 86400
+    assert len(wins) == 1
+    assert store_a.count_outbound(tid, since) == limit
+    assert store_b.count_outbound(tid, since) == limit
+    assert fake.z == {} and fake.kv == {}                          # no leftover member and no stuck lock
+    store_a.close()
+    store_b.close()
+
+
+def test_redis_outage_fails_outbound_attempt_closed():
+    from api import security
+    from api.store import Store
+
+    class Down(_OutboundRedis):
+        def set(self, *a, **k):
+            raise ConnectionError("redis down")
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    cap = security.OutboundCap(security.RedisLimiter(client=Down()), store)
+    with cap.hold(tid, 5) as allowed:
+        assert allowed is False
+        if allowed:
+            store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+    assert store.count_outbound(tid, time.time() - 86400) == 0
+
+
+def test_expired_outbound_lock_does_not_stick_the_cap_shut():
+    from api import security
+    from api.store import Store
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    fake = _OutboundRedis()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), store)
+    assert cap.LOCK_TTL_S <= 30 and cap.LOCK_WAIT_S >= cap.LOCK_TTL_S
+    cap.LOCK_TTL_S = 0.25
+    token = cap._acquire_lock(tid)
+    assert token and fake.get(cap._lock_key(tid)) == token
+    time.sleep(0.5)                                                # dead holder: TTL, not an explicit release
+    assert fake.get(cap._lock_key(tid)) is None
+    started = time.monotonic()
+    with cap.hold(tid, 1) as allowed:
+        assert allowed                                   # lease object: truth is ownership, not `is True`
+        store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+    assert time.monotonic() - started < 1.0
+    assert store.count_outbound(tid, time.time() - 86400) == 1
+    fresh = cap._acquire_lock(tid)                                 # late release of the dead token must not drop this
+    cap._release_lock(tid, token)
+    assert fake.get(cap._lock_key(tid)) == fresh
+    cap._release_lock(tid, fresh)
+    assert fake.get(cap._lock_key(tid)) is None
+
+
+def test_inprocess_outbound_hold_admits_exactly_the_cap():
+    """Without Redis, store.lock has to cover the count and the insert. Cap 5 admits 5, not 6."""
+    from api import security
+    from api.store import Store
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    cap = security.OutboundCap(security.ConcurrencyLimiter(10), store)
+    n, limit = 30, 5
+    bar = threading.Barrier(n)
+    wins, errors = [], []
+
+    def worker():
+        try:
+            bar.wait(timeout=5)
+            with cap.hold(tid, limit) as allowed:
+                if not allowed:
+                    return
+                time.sleep(0.01)
+                store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+                wins.append(1)
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not errors and all(not t.is_alive() for t in threads)
+    assert len(wins) == limit
+    assert store.count_outbound(tid, time.time() - 86400) == limit
+
+
+@pytest.mark.parametrize("how", ["delete", "expire"])
+def test_outbound_lock_lost_before_insert_admits_one_row(how):
+    """Cap 1 stays one row when the key is deleted or the TTL fires between allow() and create_call.
+
+    The holder already inside hold must not insert. The next holder, who takes the new lease, may.
+    """
+    from api import security
+    from api.store import Store
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    fake = _OutboundRedis()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), store)
+    cap.LOCK_TTL_S = 30
+    cap.LOCK_WAIT_S = 3
+    cap._refresh_interval = lambda: 60.0          # parked refresher must not put the lost key back
+    key = cap._lock_key(tid)
+    inside, opened = threading.Event(), threading.Event()
+    errors, inserted = [], []
+
+    def holder():
+        try:
+            with cap.hold(tid, 1) as allowed:
+                assert allowed
+                inside.set()
+                assert opened.wait(timeout=5)
+                if allowed:                        # re-read after the lease is gone; a stale True inserts
+                    store.create_call(tid, None, "twilio", {}, {"direction": "outbound", "who": "holder"})
+                    inserted.append("holder")
+        except Exception as e:  # noqa: BLE001
+            errors.append(("holder", repr(e)))
+
+    def other():
+        try:
+            assert opened.wait(timeout=5)
+            with cap.hold(tid, 1) as allowed:
+                if allowed:
+                    store.create_call(tid, None, "twilio", {}, {"direction": "outbound", "who": "other"})
+                    inserted.append("other")
+        except Exception as e:  # noqa: BLE001
+            errors.append(("other", repr(e)))
+
+    first, second = threading.Thread(target=holder), threading.Thread(target=other)
+    first.start()
+    assert inside.wait(timeout=5)
+    with fake._mu:
+        cur = fake.kv.get(key)
+        assert cur is not None
+        if how == "delete":
+            fake.kv.pop(key, None)                 # Redis restart: --save "" and no volume
+        else:
+            fake.kv[key] = (cur[0], time.time() - 1)  # TTL fired under the live holder
+    second.start()
+    opened.set()
+    first.join(timeout=8)
+    second.join(timeout=8)
+    assert not errors, errors
+    assert not first.is_alive() and not second.is_alive()
+    assert inserted == ["other"], (how, inserted)
+    assert store.count_outbound(tid, time.time() - 86400) == 1
+
+
+def test_outbound_hold_refreshes_its_lease():
+    """A live holder extends the mutex well inside LOCK_TTL_S and does not renew someone else's token."""
+    from api import security
+    from api.store import Store
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    fake = _OutboundRedis()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), store)
+    assert cap._refresh_interval() * 2 < cap.LOCK_TTL_S
+    cap.LOCK_TTL_S = 8
+    assert cap._refresh_interval() * 2 < cap.LOCK_TTL_S
+    cap._refresh_interval = lambda: 0.05
+    key = cap._lock_key(tid)
+    with cap.hold(tid, 1) as allowed:
+        assert allowed
+        token = fake.get(key)
+        assert token
+        with fake._mu:
+            fake.kv[key] = (token, time.time() + 1000)  # sentinel a refresh has to overwrite
+        deadline = time.monotonic() + 2
+        renewed = False
+        while time.monotonic() < deadline:
+            with fake._mu:
+                item = fake.kv.get(key)
+            if item and item[0] == token and item[1] is not None and item[1] < time.time() + 30:
+                renewed = True
+                break
+            time.sleep(0.01)
+        assert renewed
+        assert allowed
+        store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+    assert store.count_outbound(tid, time.time() - 86400) == 1
+    token = cap._acquire_lock(tid)
+    assert token
+    soon = time.time() + 30
+    with fake._mu:
+        fake.kv[key] = (token, soon)
+    assert cap._refresh_lock(tid, "other-token") is False
+    with fake._mu:
+        assert fake.kv.get(key) == (token, soon)
+    assert cap._refresh_lock(tid, token) is True
+    with fake._mu:
+        item = fake.kv.get(key)
+    assert item is not None and item[0] == token and item[1] > time.time() + 4
+    with fake._mu:
+        fake.kv.pop(key, None)
+    assert cap._refresh_lock(tid, token) is False   # a deleted key is not recreated
+    assert fake.get(key) is None
+    cap._release_lock(tid, token)
+    assert fake.get(key) is None
+
+
+def test_outbound_get_error_after_lock_does_not_insert():
+    """SET took the mutex, then GET raises. The lease is falsy, so cap 1 does not insert; a later GET still may."""
+    from api import security
+    from api.store import Store
+
+    class GetDown(_OutboundRedis):
+        def __init__(self):
+            super().__init__()
+            self.fail_get = True
+
+        def get(self, name):
+            if self.fail_get:
+                raise ConnectionError("get failed")
+            return super().get(name)
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    fake = GetDown()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), store)
+    cap.LOCK_WAIT_S = 2
+    key = cap._lock_key(tid)
+    with cap.hold(tid, 1) as allowed:
+        with fake._mu:
+            assert key in fake.kv                         # SET succeeded; only the ownership GET fails
+        assert bool(allowed) is False                    # not `is False`: the yield is a lease, not a bool
+        if allowed:
+            store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+    assert store.count_outbound(tid, time.time() - 86400) == 0
+    fake.fail_get = False
+    with cap.hold(tid, 1) as allowed:
+        assert bool(allowed) is True
+        if allowed:
+            store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+    assert store.count_outbound(tid, time.time() - 86400) == 1
+
+
+def test_outbound_refresh_retries_after_eval_error():
+    """A refresh EVAL blip is retried. The next success replaces the sentinel. A blip does not recreate a missing key."""
+    from api import security
+    from api.store import Store
+
+    class FlakyEval(_OutboundRedis):
+        def __init__(self):
+            super().__init__()
+            self.refresh_raises_left = 1
+            self.refresh_attempts = 0
+            self.refresh_errors = 0
+
+        def eval(self, script, numkeys, *keys_and_args):
+            if "pexpire" in script:
+                self.refresh_attempts += 1
+                if self.refresh_raises_left > 0:
+                    self.refresh_raises_left -= 1
+                    self.refresh_errors += 1
+                    raise ConnectionError("eval blip")
+            return super().eval(script, numkeys, *keys_and_args)
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    fake = FlakyEval()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), store)
+    cap.LOCK_TTL_S = 8
+    cap._refresh_interval = lambda: 0.05
+    key = cap._lock_key(tid)
+    with cap.hold(tid, 1) as allowed:
+        assert bool(allowed) is True
+        token = fake.get(key)
+        assert token
+        with fake._mu:
+            fake.kv[key] = (token, time.time() + 1000)   # sentinel the retry has to overwrite
+        deadline = time.monotonic() + 2
+        renewed = False
+        while time.monotonic() < deadline:
+            with fake._mu:
+                item = fake.kv.get(key)
+            if item and item[0] == token and item[1] is not None:
+                remaining = item[1] - time.time()
+                if 1 < remaining <= cap.LOCK_TTL_S + 0.25:
+                    renewed = True
+                    break
+            time.sleep(0.01)
+        assert renewed
+        assert fake.refresh_errors >= 1
+        assert fake.refresh_attempts >= fake.refresh_errors + 1
+    with fake._mu:
+        fake.kv.pop(key, None)
+    fake.refresh_raises_left = 1
+    assert cap._refresh_lock(tid, token) is True         # blip retries; it must not SET the key back
+    assert fake.get(key) is None
+
+
+def test_outbound_route_does_not_dial_when_the_lock_disappears_before_insert():
+    """The handler must skip create_call and Twilio when the lease vanishes after the count."""
+    from api import security
+    from api.app import create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from starlette.testclient import TestClient
+    from test_api import FakeLLM as L, FakeTTS as T, FakeVAD
+
+    posts = []
+
+    def handler(req):
+        posts.append(str(req.url))
+        return httpx.Response(201, json={"sid": "CA1"})
+
+    store = Store()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = Runtime(L(), lambda v: T(), FakeVAD, store, http=http)
+    fake = _OutboundRedis()
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                        twilio_account_sid="ACtest", twilio_number="+15550001111", outbound_per_day=1)
+    c = TestClient(create_app(store, rt, security.RedisLimiter(client=fake), None, settings))
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    entered, release = threading.Event(), threading.Event()
+    orig = store.count_outbound
+    state = {"block": True}
+
+    def wrapped(tenant_id, since):
+        if state["block"]:
+            state["block"] = False
+            entered.set()
+            assert release.wait(timeout=5)
+            with fake._mu:
+                fake.kv.clear()                    # gone after allow()'s count, before create_call
+        return orig(tenant_id, since)
+
+    store.count_outbound = wrapped
+    box = {}
+
+    def go():
+        box["r"] = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551230000"}, headers=H(k))
+
+    t = threading.Thread(target=go)
+    t.start()
+    assert entered.wait(timeout=5)
+    release.set()
+    t.join(timeout=10)
+    assert not t.is_alive()
+    assert box["r"].status_code == 429 and "outbound limit" in box["r"].text
+    assert posts == [] and orig(tid, time.time() - 86400) == 0
+    r2 = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551230001"}, headers=H(k))
+    assert r2.status_code == 200 and r2.json()["callSid"] == "CA1"
+    assert len(posts) == 1 and orig(tid, time.time() - 86400) == 1
+
+
+def test_drain_during_outbound_admit_places_nothing():
+    """Drain that lands after the handler's first check and before insert is 503, with no row and no dial."""
+    posts = []
+
+    def handler(req):
+        posts.append(str(req.url))
+        return httpx.Response(201, json={"sid": "CA1"})
+
+    c, store, _ = make_outbound(handler, outbound_per_day=5)
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    entered, release = threading.Event(), threading.Event()
+    orig = store.count_outbound
+
+    def wrapped(tenant_id, since):
+        entered.set()
+        assert release.wait(timeout=5)
+        return orig(tenant_id, since)
+
+    store.count_outbound = wrapped
+    box = {}
+
+    def go():
+        box["r"] = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551230000"}, headers=H(k))
+
+    t = threading.Thread(target=go)
+    t.start()
+    assert entered.wait(timeout=5)
+    assert c.app.state.draining is False           # the check above run_in_executor already passed
+    c.app.state.draining = True
+    release.set()
+    t.join(timeout=10)
+    assert not t.is_alive(), box
+    r = box["r"]
+    assert r.status_code == 503 and "node is draining" in r.text
+    assert posts == []
+    assert orig(tid, time.time() - 86400) == 0
+    assert store.list_calls(tid) == []
+
+
+async def test_outbound_lock_wait_does_not_block_the_event_loop():
+    """/healthz must return while /v1/calls/outbound is still polling a held cap lock.
+
+    The poll sleeps. Running that sleep on the event loop keeps healthz from starting until the wait ends.
+    """
+    from api import security
+    from api.app import create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from test_api import FakeLLM as L, FakeTTS as T, FakeVAD
+
+    class HeldLock(_OutboundRedis):
+        def __init__(self):
+            super().__init__()
+            self.rejected_nx = 0
+
+        def set(self, name, value, ex=None, nx=False, **kwargs):
+            result = super().set(name, value, ex=ex, nx=nx, **kwargs)
+            if nx and result is None:
+                self.rejected_nx += 1
+            return result
+
+        def ping(self):
+            return True
+
+    def handler(req):
+        return httpx.Response(201, json={"sid": "CA1"})
+
+    store = Store()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = Runtime(L(), lambda v: T(), FakeVAD, store, http=http)
+    fake = HeldLock()
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                        twilio_account_sid="ACtest", twilio_number="+15550001111", outbound_per_day=5)
+    app = create_app(store, rt, security.RedisLimiter(client=fake), None, settings)
+    old_wait = security.OutboundCap.LOCK_WAIT_S
+    security.OutboundCap.LOCK_WAIT_S = 3          # inline sleep would block the loop for this long
+    outbound_task = None
+    key = ""
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = await client.post("/admin/tenants", json={"name": "acme"}, headers={"X-Admin-Key": "adm"})
+            assert created.status_code == 200
+            key_api, tid = created.json()["apiKey"], created.json()["tenantId"]
+            agent = await client.post("/v1/agents", json={"name": "a"}, headers={"X-API-Key": key_api})
+            assert agent.status_code == 200
+            key = f"vox:outbound-lock:{tid}"
+            with fake._mu:
+                fake.kv[key] = ("other-holder", time.time() + 60)
+            outbound_task = asyncio.create_task(client.post(
+                "/v1/calls/outbound", json={"agentId": agent.json()["id"], "to": "+15551230000"},
+                headers={"X-API-Key": key_api}))
+
+            async def until_polling():
+                while fake.rejected_nx < 1:
+                    await asyncio.sleep(0.01)
+
+            try:
+                await asyncio.wait_for(until_polling(), timeout=2)
+            except TimeoutError:
+                raise AssertionError("outbound lock poll never yielded; the wait is on the event loop") from None
+            assert not outbound_task.done()               # still inside the lock poll
+            started = time.monotonic()
+            health = await client.get("/healthz")
+            elapsed = time.monotonic() - started
+            assert health.status_code == 200 and health.json()["ok"] is True
+            assert elapsed < 0.5                           # not stuck behind LOCK_WAIT_S
+            assert not outbound_task.done()
+            assert fake.rejected_nx >= 1
+            with fake._mu:
+                assert key in fake.kv                     # the other holder still owns it
+                fake.kv.pop(key, None)                    # let the poll acquire and finish
+            resp = await outbound_task
+            outbound_task = None
+            assert resp.status_code == 200 and resp.json()["callSid"] == "CA1"
+    finally:
+        security.OutboundCap.LOCK_WAIT_S = old_wait
+        if key:
+            with fake._mu:
+                fake.kv.pop(key, None)
+        if outbound_task is not None and not outbound_task.done():
+            await outbound_task
 
 
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)

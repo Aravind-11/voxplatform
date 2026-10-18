@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS calls(
   id TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT, medium TEXT, status TEXT, config TEXT,
   join_token TEXT, metadata TEXT, created {REAL}, joined {REAL}, ended {REAL}, end_reason TEXT);
 CREATE INDEX IF NOT EXISTS calls_tenant ON calls(tenant_id, created);
+CREATE INDEX IF NOT EXISTS calls_tenant_created ON calls(tenant_id, created);
 CREATE TABLE IF NOT EXISTS messages(
   id {SERIAL}, call_id TEXT, role TEXT, text TEXT, t {REAL});
 CREATE INDEX IF NOT EXISTS messages_call ON messages(call_id, id);
@@ -129,6 +130,7 @@ class Store:
             for table, col, typ in MIGRATIONS:
                 self._add_column(table, col, typ.format(REAL=real))
             self._run("CREATE UNIQUE INDEX IF NOT EXISTS tenants_email ON tenants(email)")    # after the email column exists
+            self._run("CREATE INDEX IF NOT EXISTS calls_tenant_created ON calls(tenant_id, created)")  # existing DBs predate the index
             self._x("UPDATE api_keys SET role='admin' WHERE role IS NULL")      # keys from before roles existed keep full rights
             for r in self._all("SELECT key_hash FROM api_keys WHERE id IS NULL"):
                 self._x("UPDATE api_keys SET id=? WHERE key_hash=?", (new_id("key"), r["key_hash"]))
@@ -533,6 +535,12 @@ class Store:
     def list_calls(self, tenant_id: str, limit: int = 50) -> list[dict]:
         return [self._call(r) for r in self._all(
             "SELECT * FROM calls WHERE tenant_id=? ORDER BY created DESC LIMIT ?", (tenant_id, limit))]
+
+    def count_outbound(self, tenant_id: str, since: float) -> int:
+        """Outbound calls created at or after `since`. Matches json.dumps' space after the colon."""
+        row = self._one("SELECT COUNT(*) AS n FROM calls WHERE tenant_id=? AND created>=? AND metadata LIKE ?",
+                        (tenant_id, since, '%"direction": "outbound"%'))
+        return int(row["n"]) if row else 0
 
     def update_call(self, call_id: str, **fields: Any) -> None:
         allowed = {"status", "joined", "ended", "end_reason", "metadata"}

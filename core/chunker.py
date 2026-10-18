@@ -57,6 +57,19 @@ class SentenceChunker:
             return [rest]
         return []
 
+    def flush_finished(self) -> list[str]:
+        """Like flush(), but only when the held tail already ends a sentence.
+
+        push() will not emit ".!?…" until another character arrives, and it also holds a
+        final newline. flush() would speak an unfinished fragment; a model error must not."""
+        visible = _THINK.sub("", self._buf).split("<think>", 1)[0]
+        text = clean(visible)
+        if text and text[-1] in ".!?…":
+            return self.flush()
+        if visible.rstrip(" \t").endswith("\n"):
+            return self.flush()
+        return []
+
     def _find_boundary(self, s: str) -> int | None:
         for i, ch in enumerate(s[:-1]):  # need a following char to confirm the boundary
             nxt = s[i + 1]

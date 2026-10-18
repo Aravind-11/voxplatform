@@ -326,6 +326,9 @@ class Session:
 
     async def _produce(self, gen: _Generation) -> None:
         followups: list[dict] = []
+        # Replaced each round so the short first-clause split stays per round. The name
+        # lives outside the loop so a model error can flush the round that failed.
+        chunker = SentenceChunker()
         try:
             if self._transcript_task and not self._transcript_task.done():
                 await self._transcript_task  # previous turn's transcript must be in history
@@ -368,6 +371,11 @@ class Session:
             raise
         except Exception as e:  # noqa: BLE001
             self._emit("error", where="produce", error=repr(e))
+            # push() holds a finished sentence until one more character arrives. A clean
+            # finish flushes it; an error must too. A fragment with no sentence ending stays dropped.
+            for piece in chunker.flush_finished():
+                gen.sentences.append(piece)
+                gen.textq.put_nowait(piece)
             # Only a committed reply owes the caller an apology. A speculative reply that is
             # cancelled, or that fails before the turn commits, must stay silent.
             if gen.committed and not gen.cancelled and not gen.fallback_used:
@@ -442,7 +450,8 @@ class Session:
         A failure before commit must not end this task. Drain would take the terminal outbox
         mark, and a model error after commit would queue an apology nobody reads. On cancel,
         stay silent. On commit, speak a queued apology once and drop ordinary sentences: a
-        successful reply whose speculative TTS died stays silent.
+        successful reply whose speculative TTS died stays silent, unless a deferred hang-up
+        or transfer would otherwise run against that silence.
         """
         if is_fallback:
             self._emit("error", where="tts_fallback", error=repr(e))
@@ -464,6 +473,10 @@ class Session:
         while not gen.cancelled:
             item = await gen.textq.get()
             if item is None:
+                # textq closes from produce's finally, which is after a tool may have set
+                # `after`. With nothing sent, drain would hang up or transfer on dead air.
+                if gen.after is not None and not gen.spoken:
+                    await self._speak_fallback(gen)
                 return
             if item is _FALLBACK:
                 await self._speak_fallback(gen)

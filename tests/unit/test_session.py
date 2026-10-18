@@ -254,6 +254,67 @@ async def test_model_error_after_commit_speaks_an_apology():
     assert any(e["type"] == "error" and e["where"] == "produce" for e in r.events)
 
 
+async def test_model_error_after_commit_keeps_a_finished_sentence_then_apologizes():
+    """A sentence that ends on .!? is held until another character arrives. The success
+    path flushes it; a model error must too, then apologize once, not instead."""
+
+    class LLM:
+        def __init__(self, sentence):
+            self.sentence = sentence
+            self.release = asyncio.Event()
+
+        async def stream(self, history, audio, followups, tools):
+            yield self.sentence
+            await self.release.wait()
+            raise RuntimeError("model down")
+
+        async def transcribe(self, audio):
+            return "hello"
+
+    llm = LLM("You are booked.")
+    r = Rig(llm)
+    phrase = r.s.cfg.error_phrase
+    await r.frames("s", 15)
+    await r.frames("q", 8)
+    await r.settle()
+    assert r.tts.texts == []          # no trailing character yet, so nothing is spoken
+    await r.frames("q", 15)           # commit while the model is still held
+    await r.settle()
+    llm.release.set()
+    await r.settle()
+    assert r.tts.texts == ["You are booked.", phrase]
+    assert r.tts.texts.count(phrase) == 1
+    assert r.s.history[-1] == {"role": "assistant", "content": f"You are booked. {phrase}"}
+
+
+async def test_model_error_after_commit_drops_an_unfinished_fragment():
+    """The error path must not flush a mid-sentence tail the way a clean finish would."""
+
+    class LLM:
+        def __init__(self):
+            self.release = asyncio.Event()
+
+        async def stream(self, history, audio, followups, tools):
+            yield "on Tuesday"
+            await self.release.wait()
+            raise RuntimeError("model down")
+
+        async def transcribe(self, audio):
+            return "hello"
+
+    llm = LLM()
+    r = Rig(llm)
+    phrase = r.s.cfg.error_phrase
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    llm.release.set()
+    await r.settle()
+    assert r.tts.texts == [phrase]
+    assert "on Tuesday" not in " ".join(r.tts.texts)
+    assert r.s.history[-1] == {"role": "assistant", "content": phrase}
+
+
 async def test_queued_apology_is_spoken_when_earlier_tts_fails():
     """The model path queues the apology and marks it used. A TTS error on the partial
     must not drop that phrase, and must not speak it twice."""
@@ -718,6 +779,54 @@ async def test_hangup_runs_only_after_the_goodbye_has_finished_playing():
     await asyncio.sleep(0.2)
     assert ended == [1]
     assert "call_action_done" in r.types() and "tool_result" in r.types()
+
+
+async def test_speculative_tts_failure_speaks_apology_before_deferred_hangup():
+    """TTS dying before commit used to let a tool hang-up run against dead air. The apology
+    is spoken once, ordinary sentences stay dropped, and the hang-up waits out that playback."""
+    ended = []
+
+    async def hang(args):
+        async def after():
+            ended.append(1)
+        return ToolResult({"ok": True}, after=after, strict=True)
+
+    class TTS:
+        sample_rate = 24000
+
+        def __init__(self):
+            self.texts = []
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            if text != "Sorry, could you say that again?":
+                raise RuntimeError("tts down")
+            n = len(text.split()) * 400 * 24   # 400 ms per word, long enough to still be playing
+            yield np.zeros(n, dtype=np.int16)
+
+    tts = TTS()
+    llm = FakeLLM([["Goodbye ", "now. ", ToolCall("h", "hang", {})], ["Bye ", "then."]])
+    r = Rig(llm, tts=tts, tools={"hang": hang})
+    phrase = r.s.cfg.error_phrase
+    await r.frames("s", 15)
+    await r.frames("q", 8)             # speculate: TTS fails before the turn commits
+    await r.settle()
+    assert tts.texts == ["Goodbye now."] and r.sent == [] and ended == []
+    await r.frames("q", 15)            # commit; the tool sets a deferred hang-up
+    await r.settle()
+    assert tts.texts == ["Goodbye now.", phrase]
+    assert "Bye then." not in tts.texts
+    assert len(r.sent) == 1 and ended == []
+    t_sent, n, rate = r.sent[0]
+    dur = 1000.0 * n / rate
+    assert dur > 0 and r.clk.t < t_sent + dur
+    r.clk.t = t_sent + dur - 1         # apology is still playing: the line must stay up
+    await asyncio.sleep(0.2)
+    assert ended == []
+    r.clk.t = t_sent + dur + 1         # playback clock passes the apology
+    await asyncio.sleep(0.2)
+    assert ended == [1]
+    assert [e["text"] for e in r.events if e["type"] == "agent_speech"] == [phrase]
 
 
 async def test_strict_hangup_still_happens_if_caller_talks_over_the_goodbye():

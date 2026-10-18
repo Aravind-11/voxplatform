@@ -26,8 +26,12 @@ class _Client:
     def __init__(self, body, status=200):
         self.body, self.status, self.posts = body, status, []
 
-    async def post(self, url, files=None, data=None):
-        self.posts.append({"url": url, "files": files, "data": data})
+    async def post(self, url, files=None, data=None, timeout=None):
+        self.posts.append({"url": url, "files": files, "data": data, "timeout": timeout})
+        # The process-wide client reads for 5s. Omitting timeout, or setting it under 60s,
+        # aborts a slow transcript and the session stores [inaudible].
+        if not isinstance(timeout, (int, float)) or float(timeout) < 60:
+            raise RuntimeError(f"ASR timeout {timeout!r} is missing or below 60s")
         return _Resp(self.body, self.status)
 
 
@@ -72,6 +76,7 @@ async def test_http_asr_posts_wav_and_returns_text():
     assert post["data"] == {"model": "whisper-test"}
     name, payload, mime = post["files"]["file"]
     assert name == "audio.wav" and mime == "audio/wav"
+    assert post["timeout"] == 60
     assert np.array_equal(_pcm(payload), audio)
     assert await HttpASR("http://asr.local/v1", _Client({"nope": 1})).transcribe(audio) == ""
     assert await HttpASR("http://asr.local/v1", _Client("nope")).transcribe(audio) == ""
@@ -108,6 +113,7 @@ async def test_runtime_prefers_asr_only_when_url_and_client_are_set(monkeypatch)
     assert inner.transcripts == 0
     assert client.posts[0]["url"] == "http://asr.local/v1/audio/transcriptions"
     assert client.posts[0]["data"] == {"model": "whisper-test"}
+    assert client.posts[0]["timeout"] == 60
     assert [x async for x in sess.llm.stream([], audio, [], [])] == ["hello"] and inner.streams == 1
     assert rt.llm is inner and await rt._eot_async()(audio, []) == 0.4
 

@@ -20,10 +20,13 @@ class HttpASR:
         self.model = model or "whisper-1"
 
     async def transcribe(self, audio) -> str:
+        # The pooled client reads for 5s. A slower transcript must not become
+        # [inaudible], and timeout=None would stall the next turn that awaits it.
         response = await self.client.post(
             f"{self.base_url}/audio/transcriptions",
             files={"file": ("audio.wav", _wav_bytes(audio), "audio/wav")},
-            data={"model": self.model})
+            data={"model": self.model},
+            timeout=60)
         if hasattr(response, "raise_for_status"):
             response.raise_for_status()
         body = response.json()

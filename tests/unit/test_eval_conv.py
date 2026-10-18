@@ -113,6 +113,106 @@ async def test_replay_waits_long_enough_for_the_sessions_end_of_turn():
     assert waited["task_success"] is True and waited["first_audio_ms"] >= 1000
 
 
+async def test_replay_finishes_a_slow_tool_and_the_first_audio_chunk():
+    """A tool and the synthesizer that are still awaiting used to be cancelled by close().
+    The tool_call was already emitted, so the case scored success with no audio."""
+    state = {"finished": False}
+
+    async def book(args):
+        await asyncio.sleep(0.2)
+        state["finished"] = True
+        return {"ok": True}
+
+    class SlowTTS:
+        sample_rate = 24000
+
+        async def synthesize(self, text):
+            await asyncio.sleep(0.05)
+            yield np.zeros(160, dtype=np.int16)
+
+    def make():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        return Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"})], ["All set."]]),
+                       tts=SlowTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools={"book": book, "cancel": _cancel},
+                       cfg=SessionConfig(tts_poll_s=0))
+
+    out = await replay(make, _case())
+    assert state["finished"] is True
+    assert out["first_audio_ms"] is not None
+    assert out["task_success"] is True
+    assert out["wrong_actions"] == []
+
+
+async def test_replay_keeps_silence_until_speculate_ms():
+    """END_OF_TURN cannot fire before speculation. speculate_ms=1500 used to keep the
+    patient_end tail (1000 ms), so the expected tool never ran."""
+    tools = {"book": _book, "cancel": _cancel}
+
+    def make():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        return Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"})], ["All set."]]),
+                       tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools=tools,
+                       cfg=SessionConfig(tts_poll_s=0, turn=TurnConfig(speculate_ms=1500)))
+
+    out = await replay(make, _case())
+    assert out["task_success"] is True
+    assert out["wrong_actions"] == []
+    assert out["first_audio_ms"] is not None
+
+
+async def test_replay_fails_when_expected_and_forbidden_tools_both_finish():
+    llm = FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"}),
+                    ToolCall("t2", "cancel", {})], ["All set."]])
+    out = await replay(factory(llm, {"book": _book, "cancel": _cancel}), _case())
+    assert out["task_success"] is False
+    assert out["wrong_actions"] == ["cancel"]
+
+
+async def test_replay_runs_a_forbidden_tool_queued_behind_a_slow_call():
+    """book's tool_call is emitted before its body returns. Closing there used to score
+    success and never start the cancel that was already in the committed turn."""
+    ran = {"book": False, "cancel": False}
+
+    async def book(args):
+        await asyncio.sleep(0.2)
+        ran["book"] = True
+        return {"ok": True}
+
+    async def cancel(args):
+        ran["cancel"] = True
+        return {"ok": True}
+
+    def make():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        return Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {}),
+                                     ToolCall("t2", "cancel", {})], ["All set."]]),
+                       tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools={"book": book, "cancel": cancel},
+                       cfg=SessionConfig(tts_poll_s=0))
+
+    out = await replay(make, _case())
+    assert ran["book"] is True and ran["cancel"] is True
+    assert out["task_success"] is False
+    assert out["wrong_actions"] == ["cancel"]
+
+
 async def test_replay_scores_expected_tool_and_rejects_a_forbidden_one():
     ok_llm = FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"})], ["All set."]])
     bad_llm = FakeLLM([["No. ", ToolCall("t1", "cancel", {})], ["Cancelled."]])
@@ -130,17 +230,23 @@ async def test_replay_scores_expected_tool_and_rejects_a_forbidden_one():
 
 def test_task_success_requires_expected_tools_and_the_interruption_budget():
     case = Case(audio=SPEECH, expect_tools=["book"], forbid_tools=["cancel"], max_interruptions=0)
-    over = _score(case, [{"type": "tool_call", "name": "book"}, {"type": "user_interrupted"},
+    over = _score(case, [{"type": "tool_result", "name": "book"}, {"type": "user_interrupted"},
                          {"type": "agent_first_audio", "latency_ms": 640}])
     assert over["task_success"] is False
     assert over["wrong_actions"] == []
     assert over["interruptions"] == 1
     assert over["first_audio_ms"] == 640
-    assert _score(case, [{"type": "tool_call", "name": "book"}])["task_success"] is True
+    assert _score(case, [{"type": "tool_result", "name": "book"}])["task_success"] is True
+    # Emitted before the body runs. A cancelled call must not pass the case.
+    assert _score(case, [{"type": "tool_call", "name": "book"}])["task_success"] is False
     assert _score(case, [])["task_success"] is False
     allowed = Case(audio=SPEECH, expect_tools=["book"], forbid_tools=[], max_interruptions=1)
-    assert _score(allowed, [{"type": "tool_call", "name": "book"},
+    assert _score(allowed, [{"type": "tool_result", "name": "book"},
                             {"type": "user_interrupted"}])["task_success"] is True
+    both = _score(case, [{"type": "tool_result", "name": "book"},
+                         {"type": "tool_result", "name": "cancel"}])
+    assert both["task_success"] is False
+    assert both["wrong_actions"] == ["cancel"]
 
 
 def test_compare_averages_task_success_and_first_audio():

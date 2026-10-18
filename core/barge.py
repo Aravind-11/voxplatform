@@ -46,6 +46,19 @@ class PlaybackTracker:
         self._chunks.clear()
         self._free_at = 0.0
 
+    def commit_heard(self, heard: str) -> None:
+        """Forget audio flushed by clear(). `heard` stays already-played; the next send starts now.
+
+        Leaving the cleared chunks scheduled made the resumed tail look like it played only after
+        audio the caller will never hear, so the next interrupt trimmed the wrong text.
+        """
+        now = self.clock()
+        self._chunks.clear()
+        self._free_at = now
+        if heard.strip():
+            # dur 0 at `now` is fully heard and adds no buffered time.
+            self._chunks.append(_Chunk(heard.strip(), 0.0, now))
+
     def heard(self) -> tuple[str, bool]:
         """Return (text the caller heard so far, whether the last chunk was cut mid-way)."""
         now = self.clock()

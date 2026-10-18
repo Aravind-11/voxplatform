@@ -191,6 +191,42 @@ async def test_short_barge_in_pauses_and_resumes_without_trimming():
     assert resumed
     new = " ".join(r.tts.texts[len(before):])
     assert new and resumed.split()[0] in new
+    # say() would open a second assistant turn, and the cleared buffer must not stay
+    # scheduled in front of the tail (that is what a later interrupt would call "heard").
+    assert len([m for m in r.s.history if m["role"] == "assistant"]) == 1
+    assert r.s.tracker.buffered_ms() < 2000
+    assert not r.s._gen.holding
+
+
+async def test_false_barge_keeps_the_unsent_sentence_and_does_not_restart():
+    """Pause while sentence 3 is still inside synth: a cough must play the cleared tail
+    and that sentence, not the words the caller already heard and not a second history row."""
+    reply = ["One ", "two ", "three ", "four ", "five. ", "Six ", "seven ", "eight ", "nine ", "ten. ",
+             "Eleven ", "twelve ", "thirteen ", "fourteen ", "fifteen."]
+    llm = FakeLLM([reply])
+    r = Rig(llm, tts=FakeTTS(word_ms=200))
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    await r.frames("s", 6)             # 192 ms: pause only
+    await r.settle()
+    before = list(r.tts.texts)
+    assert before and not any("Eleven" in t for t in before)
+    await r.frames("q", 8)             # silence: the burst was a cough
+    await r.settle()
+    assert "barge_aborted" in r.types() and "user_interrupted" not in r.types()
+    assert r.s.stats["interruptions"] == 0 and not r.s._gen.holding
+    for _ in range(80):
+        r.clk.t += 40
+        await r.settle(4)
+    new = r.tts.texts[len(before):]
+    assert any("two three four five" in t for t in new)
+    assert any("Eleven twelve" in t for t in new)
+    assert not any(t.startswith("One two") for t in new)
+    assistant = [m for m in r.s.history if m["role"] == "assistant"]
+    assert len(assistant) == 1
+    assert assistant[0]["content"].count("Eleven") == 1
+    assert "[interrupted]" not in assistant[0]["content"]
 
 
 async def test_no_barge_in_after_agent_finished_playing():

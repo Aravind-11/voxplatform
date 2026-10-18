@@ -688,7 +688,18 @@ async def test_voicemail_hangs_up_when_speech_fails_and_ignores_a_second_amd():
     from api import security
     from api.callbus import LocalCallBus
     from api.runtime import LimitedTTS, Runtime
+    from core.metrics import METRICS
     from test_session import EnergyVAD, FakeLLM, FakeTTS
+
+    def vm_errors() -> float:
+        return METRICS.counters.get(("vox_errors_total", (("where", "voicemail"),)), 0.0)
+
+    async def settle(target: float) -> None:
+        for _ in range(40):
+            if vm_errors() >= target:
+                return
+            await asyncio.sleep(0.05)
+        assert vm_errors() >= target
 
     bus = LocalCallBus()
     c, store, _rt = make_outbound(lambda r: httpx.Response(201, json={"sid": "CA1"}))
@@ -726,6 +737,7 @@ async def test_voicemail_hangs_up_when_speech_fails_and_ignores_a_second_amd():
             raise RuntimeError("tts down")
 
         sess.say_and_wait = say
+        bus_errors = vm_errors()
         assert bus.publish(o["id"], {"op": "voicemail", "text": "one"})
         assert bus.publish(o["id"], {"op": "voicemail", "text": "two"})
         await asyncio.wait_for(started.wait(), 1)
@@ -737,6 +749,9 @@ async def test_voicemail_hangs_up_when_speech_fails_and_ignores_a_second_amd():
                 break
             await asyncio.sleep(0.05)
         assert ended == ["END"]
+        # The ignored retry must not count a second failure; the speech error must count once.
+        await settle(bus_errors + 1)
+        assert vm_errors() == bus_errors + 1
     finally:
         LimitedTTS._sem = None
         release.set()
@@ -757,6 +772,7 @@ async def test_voicemail_hangs_up_when_speech_fails_and_ignores_a_second_amd():
     url = f"https://vox.example.com/twilio/amd/{o['id']}"
     machine = {"AnsweredBy": "machine_end_beep"}
     sig = {"X-Twilio-Signature": security.twilio_signature("tok", url, machine)}
+    direct_errors = vm_errors()
     assert c.post(f"/twilio/amd/{o['id']}", data=machine, headers=sig).json()["delivered"] is True
     again = c.post(f"/twilio/amd/{o['id']}", data=machine, headers=sig)
     assert again.json()["delivered"] is True
@@ -765,6 +781,9 @@ async def test_voicemail_hangs_up_when_speech_fails_and_ignores_a_second_amd():
             break
         time.sleep(0.05)
     assert spoke == ["please call back", "END"]
+    # Owning-node speech failure has to show up on the same counter as the bus path.
+    await settle(direct_errors + 1)
+    assert vm_errors() == direct_errors + 1
 
 
 async def test_owner_amd_and_a_bus_retry_do_not_both_speak():

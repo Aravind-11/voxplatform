@@ -1063,8 +1063,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                     if done.cancelled():
                         return
                     try:
-                        done.exception()
-                    except Exception:  # noqa: BLE001
+                        done.result()
+                    except Exception:  # noqa: BLE001  (retrieved so the failure is not logged as abandoned)
                         METRICS.inc("vox_errors_total", where="voicemail")
 
                 import asyncio

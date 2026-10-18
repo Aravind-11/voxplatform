@@ -6,14 +6,16 @@ paid service). It only averages those dicts.
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
 
 FRAME = 512          # Session.feed wants 32 ms at 16 kHz
 FRAME_MS = 32.0
-# Default TurnConfig.end_ms is 640, so 20 silent frames commit the turn. Two extra frames
-# cover an audio clip that already ends on a partial frame.
+# Minimum tail. The real length follows the session: end_ms is 640 by default (20 frames)
+# but patient_end_ms is 1000 when an end-of-turn score says the caller is not done.
+# Two extra frames cover a clip that already ends on a partial frame.
 SILENCE_TAIL_FRAMES = 22
 _SETTLE_YIELDS = 20
 
@@ -26,7 +28,25 @@ class Case:
     max_interruptions: int = 0
 
 
-def _frames(audio: np.ndarray) -> list[np.ndarray]:
+def _tail_frames(session) -> int:
+    """How many silent frames this session needs before its turn timer can commit.
+
+    A fixed 22-frame tail is 704 ms. That never reaches ``end_ms`` or ``patient_end_ms``
+    when either is 1000, so the reply stays speculative and the expected tool never runs.
+    """
+    turn = getattr(getattr(session, "cfg", None), "turn", None)
+    frame_ms = float(getattr(turn, "frame_ms", FRAME_MS) or FRAME_MS)
+    need = max(
+        float(getattr(turn, "end_ms", 640.0) or 0.0),
+        float(getattr(turn, "patient_end_ms", 0.0) or 0.0),
+        float(getattr(turn, "fast_end_ms", 0.0) or 0.0),
+    )
+    if need <= 0 or frame_ms <= 0:
+        return SILENCE_TAIL_FRAMES
+    return max(SILENCE_TAIL_FRAMES, int(math.ceil(need / frame_ms)) + 2)
+
+
+def _frames(audio: np.ndarray, tail: int = SILENCE_TAIL_FRAMES) -> list[np.ndarray]:
     pcm = np.asarray(audio, dtype=np.int16).reshape(-1)
     if len(pcm) == 0:
         chunks: list[np.ndarray] = []
@@ -36,7 +56,7 @@ def _frames(audio: np.ndarray) -> list[np.ndarray]:
             pcm = np.concatenate([pcm, np.zeros(pad, dtype=np.int16)])
         chunks = [pcm[i:i + FRAME] for i in range(0, len(pcm), FRAME)]
     silence = np.zeros(FRAME, dtype=np.int16)
-    chunks.extend(silence.copy() for _ in range(SILENCE_TAIL_FRAMES))
+    chunks.extend(silence.copy() for _ in range(tail))
     return chunks
 
 
@@ -49,7 +69,7 @@ def _advance_clock(session, ms: float) -> None:
 
 
 async def _drive(session, audio: np.ndarray) -> None:
-    for frame in _frames(audio):
+    for frame in _frames(audio, _tail_frames(session)):
         await session.feed(frame)
         for _ in range(_SETTLE_YIELDS):
             await asyncio.sleep(0)

@@ -4,7 +4,7 @@ import json
 
 import numpy as np
 
-from core.session import Session, SessionConfig, ToolCall
+from core.session import Session, SessionConfig, ToolCall, TurnConfig
 from harness.eval_conv import Case, _score, compare, replay
 from scripts.eval_compare import main as compare_main
 
@@ -74,6 +74,43 @@ def _case(**kw):
     base = dict(audio=SPEECH, expect_tools=["book"], forbid_tools=["cancel"], max_interruptions=0)
     base.update(kw)
     return Case(**base)
+
+
+async def test_replay_waits_long_enough_for_the_sessions_end_of_turn():
+    """22 silent frames are 704 ms. end_ms=1000, and patient_end_ms after a low end-of-turn
+    score, never fire, so the expected tool is not run and the case is scored a failure."""
+    tools = {"book": _book, "cancel": _cancel}
+
+    def slow_end():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        return Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"})], ["All set."]]),
+                       tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools=tools,
+                       cfg=SessionConfig(tts_poll_s=0, turn=TurnConfig(end_ms=1000)))
+
+    async def not_done(audio, history):
+        return 0.0
+
+    def patient():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        return Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"})], ["All set."]]),
+                       tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools=tools, cfg=SessionConfig(tts_poll_s=0), eot_async=not_done)
+
+    slow = await replay(slow_end, _case())
+    assert slow["task_success"] is True and slow["first_audio_ms"] >= 1000
+    waited = await replay(patient, _case())
+    assert waited["task_success"] is True and waited["first_audio_ms"] >= 1000
 
 
 async def test_replay_scores_expected_tool_and_rejects_a_forbidden_one():

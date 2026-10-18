@@ -242,6 +242,14 @@ def test_dialed_number_routes_to_the_mapped_agent_and_no_setup_uses_the_default(
         return sock
 
     with TestClient(app) as c:
+        # The call row is created only after a UUID frame. Closing first must not insert one.
+        early = socket.create_connection(("127.0.0.1", port), timeout=5)
+        early.close()
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            assert store.list_calls(tid) == []
+            time.sleep(0.05)
+
         assert c.post("/internal/sip/setup", data={"uuid": "x", "caller": "1", "exten": "+15551110000"}).status_code == 403
         assert c.post("/internal/sip/setup", data={"uuid": "x", "caller": "1", "exten": "+15551110000"},
                       headers={"X-Vox-Sip-Token": "nope"}).status_code == 403
@@ -272,6 +280,7 @@ def test_dialed_number_routes_to_the_mapped_agent_and_no_setup_uses_the_default(
         routed = wait_n(2)[0]
         assert routed["agent_id"] == ag_b["id"] and routed["medium"] == "sip"
         assert routed["metadata"]["callSid"] == str(u) and routed["metadata"]["channel"] == "sip"
+        assert routed["metadata"]["from"] == "+19998887777" and routed["metadata"]["to"] == "+15551110000"
         sock.sendall(A.pack(A.KIND_HANGUP))
         sock.close()
         wait_ended()
@@ -289,6 +298,16 @@ def test_dialed_number_routes_to_the_mapped_agent_and_no_setup_uses_the_default(
         assert ok.status_code == 200
         sock = connect(bare)
         assert wait_n(4)[0]["agent_id"] == ag_b["id"]           # digits-only EXTEN still selects the E.164 mapping
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        wait_ended()
+
+        unmapped = uuid.uuid4()
+        ok = c.post("/internal/sip/setup", data={"uuid": str(unmapped), "caller": "+19990000000", "exten": "+15559990000"},
+                    headers={"X-Vox-Sip-Token": "sip-secret"})
+        assert ok.status_code == 200
+        sock = connect(unmapped)
+        assert wait_n(5)[0]["agent_id"] == ag_a["id"]           # fresh setup, no numbers row: the default agent
         sock.sendall(A.pack(A.KIND_HANGUP))
         sock.close()
         wait_ended()
@@ -337,6 +356,12 @@ def test_dialplan_system_does_not_interpolate_raw_caller_or_extension():
     assert "FILTER(0-9+,${EXTEN})" in text
     assert "${SIP_CALLER}" in shell and "${SIP_EXTEN}" in shell
     assert "sip/sip_setup.py" in open("deploy/Dockerfile.asterisk", encoding="utf-8").read()
+    code = [_dialplan_code(raw) for raw in text.splitlines()]
+    audiosocket = [line for line in code if "AudioSocket(" in line]
+    setup = [line for line in code if "System(" in line and "sip_setup.py" in line]
+    assert len(audiosocket) == 1 and "${CALLUUID}" in audiosocket[0]
+    assert len(setup) == 1 and "${CALLUUID}" in setup[0]
+    assert "AudioSocket(${UUID()}" not in text
 
 
 def test_sip_setup_encodes_plus_and_refuses_shell_characters(monkeypatch):
@@ -440,3 +465,5 @@ def test_sip_doc_routes_by_number_and_passes_caller():
     assert "VOX_SIP_TOKEN" in doc
     assert "PUT /v1/numbers/{e164}" in doc
     assert "{{caller}}" in doc and "{{callee}}" in doc
+    assessment = open("docs/ASSESSMENT.md", encoding="utf-8").read()
+    assert "pass the caller number" not in assessment

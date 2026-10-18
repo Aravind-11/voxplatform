@@ -237,6 +237,10 @@ async def test_noise_burst_triggers_nothing():
     assert llm.calls == [] and r.sent == []
 
 
+def test_default_model_context_budget_is_6000_tokens():
+    assert SessionConfig().max_context_tokens == 6000
+
+
 async def test_long_history_is_fitted_for_the_model_but_stored_in_full():
     llm = FakeLLM([["Okay."]])
     cfg = SessionConfig(max_context_tokens=200, tts_poll_s=0,

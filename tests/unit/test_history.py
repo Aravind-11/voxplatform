@@ -59,13 +59,15 @@ def test_over_budget_summarizes_older_turns_and_keeps_the_last_user():
 
 
 def test_last_user_is_kept_even_when_it_falls_outside_the_tail_window():
+    latest = "LATEST-USER " + ("z" * 40)
     msgs = [{"role": "system", "content": "sys prompt here"}]
-    msgs.append({"role": "user", "content": "LATEST-USER " + ("z" * 40)})
+    msgs.append({"role": "user", "content": latest})
     for i in range(8):
         msgs.append({"role": "assistant", "content": f"later {i} " + ("q" * 80)})
     out = fit_history(msgs, 60, keep_tail=2)
     assert estimate_messages(out) <= 60
-    assert any("LATEST-USER" in m.get("content", "") for m in out)
+    # The text must survive as the user turn. A summary that quotes it is not that turn.
+    assert any(m.get("role") == "user" and m.get("content") == latest for m in out)
     assert out[0]["content"] == "sys prompt here"
 
 
@@ -91,7 +93,7 @@ def test_trimming_does_not_split_a_tool_call_from_its_result():
     assert estimate_messages(out) <= 70
     assert out[0]["content"] == "sys"
     assert any("LATEST" in (m.get("content") or "") for m in out)
-    # A tail window that would otherwise open on the tool result must not leave that result behind.
+    # keep_tail=3 opens on the tool result (the call sits one message earlier).
     window = [{"role": "system", "content": "sys"}]
     for i in range(6):
         window.append({"role": "user", "content": f"q{i} " + "abcd" * 30})
@@ -100,11 +102,38 @@ def test_trimming_does_not_split_a_tool_call_from_its_result():
     window.append({"role": "tool", "tool_call_id": "c9", "content": "result " + "z" * 40})
     window.append({"role": "assistant", "content": "after " + "q" * 40})
     window.append({"role": "user", "content": "LATEST"})
-    cut = fit_history(window, 200, keep_tail=4)
+    cut = fit_history(window, 200, keep_tail=3)
     assert _tool_pairs_intact(cut)
     assert estimate_messages(cut) <= 200
-    assert any(m.get("content") == "LATEST" for m in cut)
+    assert any(m.get("role") == "user" and m.get("content") == "LATEST" for m in cut)
     assert cut[0]["content"] == "sys"
+    call_at = next(i for i, m in enumerate(cut)
+                   if m.get("role") == "assistant"
+                   and any(c.get("id") == "c9" for c in (m.get("tool_calls") or [])))
+    result_at = next(i for i, m in enumerate(cut)
+                     if m.get("role") == "tool" and m.get("tool_call_id") == "c9")
+    assert call_at < result_at
+    assert all(m.get("role") == "tool" for m in cut[call_at + 1:result_at + 1])
+    for m in cut:
+        if "c9" not in json.dumps(m):
+            continue
+        is_call = m is cut[call_at]
+        is_result = m is cut[result_at]
+        assert is_call or is_result
+
+
+def test_system_prompt_is_kept_whole_when_it_exceeds_the_budget():
+    prompt = "S" * 500
+    assert estimate_messages([{"role": "system", "content": prompt}]) > 10
+    out = fit_history(
+        [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "old " + "a" * 80},
+        ],
+        10,
+    )
+    assert out[0]["content"] == prompt
 
 
 def test_tool_call_arguments_count_toward_the_budget():

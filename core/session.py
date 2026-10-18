@@ -623,8 +623,11 @@ class Session:
 
     def _start_tail_playback(self, gen: _Generation, text: str) -> None:
         """The reply already left the outbox. Speak the cleared tail without a second history turn."""
+        # A keypad turn can cancel or replace this generation while the idle drain is shutting down.
+        # Clearing cancelled here would revive a player close() no longer owns.
+        if gen.cancelled or self._gen is not gen:
+            return
         gen.produce_done = False
-        gen.cancelled = False
 
         async def produce() -> None:
             queued = False
@@ -668,6 +671,10 @@ class Session:
         if drain is not None and not drain.done():
             drain.cancel()
             await asyncio.gather(drain, return_exceptions=True)
+        # inject_text can run on that await. Do not commit_heard, replay, or hang up on a
+        # generation it cancelled or replaced.
+        if gen.cancelled or self._gen is not gen:
+            return False
         self.tracker.commit_heard(gen.paused_heard)
         if tail:
             self._start_tail_playback(gen, tail)

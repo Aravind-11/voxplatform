@@ -592,6 +592,73 @@ async def test_idle_replay_tts_error_does_not_hang_up_or_report_the_tail_played(
     assert any(e["type"] == "error" and e["where"] == "tts" and "tts blip" in e["error"] for e in r.events)
 
 
+async def _resume_silence_with_keypad(r, goodbye):
+    """Eight silence frames, with a keypad turn as soon as the idle drain finishes cancelling.
+
+    That is the DTMF flush: it runs on its own task and can enter inject_text at the gather
+    inside the idle resume. The hook runs it before resume continues, on the real await.
+    """
+    import core.session as session_mod
+    drain = goodbye.tasks[-1]
+    orig = session_mod.asyncio.gather
+    state = {"arm": True}
+
+    def gather(*aws, **kwargs):
+        if state["arm"] and any(a is drain for a in aws):
+            state["arm"] = False
+
+            async def run():
+                result = await orig(*aws, **kwargs)
+                await r.s.inject_text("[The caller pressed these keypad digits: 42]")
+                return result
+
+            return run()
+        return orig(*aws, **kwargs)
+
+    session_mod.asyncio.gather = gather
+    try:
+        await r.frames("q", 8)
+        await r.settle()
+    finally:
+        session_mod.asyncio.gather = orig
+    assert not state["arm"]
+
+
+async def test_keypad_during_playing_idle_resume_does_not_replay_the_goodbye():
+    """Buffer still playing: the keypad interrupt may hang up, but the cough must not resume."""
+    r, ended = _hangup_rig(strict=True)
+    g = await _park_hangup_tail(r)
+    await r.frames("s", 6)
+    assert g.holding and r.s._agent_active() and r.s._outgoing_idle(g)
+    spoken = list(r.tts.texts)
+    await _resume_silence_with_keypad(r, g)
+    assert "user_interrupted" in r.types() and ended == [1]
+    assert "barge_aborted" not in r.types()
+    assert "then." not in r.tts.texts[len(spoken):]
+    assert g.cancelled and r.s._gen is not g
+
+
+async def test_keypad_during_expired_idle_resume_does_not_leave_a_detached_drain():
+    """Buffer already elapsed: the keypad turn replaces the goodbye, and close must stop it."""
+    r, ended = _hangup_rig(strict=True)
+    g = await _park_hangup_tail(r)
+    await r.frames("s", 6)
+    await _elapse_playout_wait(r)
+    assert g.holding and g.after is not None and not r.s._agent_active()
+    spoken = list(r.tts.texts)
+    await _resume_silence_with_keypad(r, g)
+    assert ended == [] and "barge_aborted" not in r.types() and "user_interrupted" not in r.types()
+    assert "then." not in r.tts.texts[len(spoken):]
+    assert r.s._gen is not g and r.s._gen is not None
+    assert any(m.get("content") == "[The caller pressed these keypad digits: 42]" for m in r.s.history)
+    await r.s.close()
+    assert all(t.done() for t in g.tasks)
+    r.clk.t += 5000
+    await asyncio.sleep(0.2)
+    await r.settle()
+    assert ended == [] and g.after is not None
+
+
 async def test_send_failure_during_pause_replays_tail_on_a_new_drain():
     """An in-flight send_audio error kills the drain; the cough must still play the cleared tail."""
     reply = ["One ", "two ", "three ", "four ", "five. ", "Six ", "seven ", "eight ", "nine ", "ten. ",

@@ -513,6 +513,132 @@ async def test_non_strict_hangup_does_not_run_when_the_buffer_ends_before_confir
     assert "call_action_done" not in r.types()
 
 
+class _FailTTS(FakeTTS):
+    """Raises RuntimeError on the next `fail_remaining` synthesize calls."""
+
+    def __init__(self, word_ms=200):
+        super().__init__(word_ms=word_ms)
+        self.fail_remaining = 0
+
+    async def synthesize(self, text):
+        if self.fail_remaining > 0:
+            self.fail_remaining -= 1
+            raise RuntimeError("tts blip")
+        async for pcm in super().synthesize(text):
+            yield pcm
+
+
+async def test_replay_tts_error_unsticks_pause_and_still_sends_unsent_sentence():
+    """A cough while textq still has a sentence must not escape feed or stay paused if replay TTS raises."""
+    reply = ["One ", "two ", "three ", "four ", "five. ", "Six ", "seven ", "eight ", "nine ", "ten. ",
+             "Eleven ", "twelve ", "thirteen ", "fourteen ", "fifteen."]
+    tts = _FailTTS(word_ms=200)
+    r = Rig(FakeLLM([reply]), tts=tts)
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    g = r.s._gen
+    assert g is not None and not g.textq.empty() and not r.s._outgoing_idle(g)
+    await r.frames("s", 6)
+    assert g.holding and not g.tasks[-1].done() and not g.tasks[1].done()
+    drain = g.tasks[-1]
+    tts.fail_remaining = 1            # the replay of the cleared tail, not the unsent sentence
+    sent_before = len(r.sent)
+    await r.frames("q", 8)            # feed must return; the error used to propagate out of it
+    assert not g.holding and not g.barge_paused and not g.cancelled
+    assert g.tasks[-1] is drain       # the live pipeline stays; nothing was queued to replay
+    assert "barge_aborted" not in r.types()
+    assert any(e["type"] == "error" and e["where"] == "tts" and "tts blip" in e["error"] for e in r.events)
+    for _ in range(80):
+        r.clk.t += 40
+        await r.settle(4)
+    assert any("Eleven twelve" in t for t in tts.texts)
+    assert len(r.sent) > sent_before
+    assert "user_interrupted" not in r.types()
+
+
+async def test_idle_replay_tts_error_does_not_hang_up_or_report_the_tail_played():
+    """Idle goodbye: a failed replay must not finish the generation and run the strict hang-up."""
+    r, ended = _hangup_rig(strict=True)
+    fail = {"n": 0}
+    orig = r.tts.synthesize
+
+    async def synthesize(text):
+        if fail["n"] > 0:
+            fail["n"] -= 1
+            raise RuntimeError("tts blip")
+        async for pcm in orig(text):
+            yield pcm
+
+    r.tts.synthesize = synthesize
+    g = await _park_hangup_tail(r)
+    await r.frames("s", 6)
+    assert g.holding and r.s._outgoing_idle(g) and g.after is not None
+    fail["n"] = 1
+    await r.frames("q", 8)
+    await r.settle()
+    r.clk.t += 5000
+    await asyncio.sleep(0.2)
+    await r.settle()
+    assert ended == [] and "call_action_done" not in r.types()
+    assert g.after is not None
+    assert "barge_aborted" not in r.types()
+    assert any(e["type"] == "error" and e["where"] == "tts" and "tts blip" in e["error"] for e in r.events)
+
+
+async def test_send_failure_during_pause_replays_tail_on_a_new_drain():
+    """An in-flight send_audio error kills the drain; the cough must still play the cleared tail."""
+    reply = ["One ", "two ", "three ", "four ", "five. ", "Six ", "seven ", "eight ", "nine ", "ten. ",
+             "Eleven ", "twelve ", "thirteen ", "fourteen ", "fifteen."]
+    r = Rig(FakeLLM([reply]), tts=FakeTTS(word_ms=200))
+    state = {"n": 0, "release": asyncio.Event(), "started": asyncio.Event()}
+
+    async def send(pcm, rate):
+        i = state["n"]
+        state["n"] += 1
+        if i == 1:
+            state["started"].set()
+            await state["release"].wait()
+            raise RuntimeError("socket write failed")
+        r.sent.append((r.clk.t, len(pcm), rate))
+
+    r.s.send_audio = send
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    g = r.s._gen
+    assert g is not None and state["started"].is_set() and g.sending
+    assert not g.tasks[1].done() and not r.s._outgoing_idle(g)
+    old_drain = g.tasks[-1]
+    synth = g.tasks[1]
+    feeder = asyncio.create_task(r.frames("s", 6))
+    for _ in range(200):
+        if g.holding and g.sending:
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("pause did not observe the in-flight send")
+    state["release"].set()
+    await feeder
+    assert old_drain.done()
+    assert any(e["type"] == "error" and e["where"] == "send" and "socket write failed" in e["error"]
+               for e in r.events)
+    sent_before = len(r.sent)
+    await r.frames("q", 8)
+    await r.settle()
+    for _ in range(80):
+        r.clk.t += 40
+        await r.settle(4)
+    assert g.tasks[-1] is not old_drain
+    assert g.tasks[1] is synth          # the sentence still in synth is not orphaned
+    assert not g.holding
+    assert len(r.sent) > sent_before
+    assert any(n == 6400 for _, n, _ in r.sent[sent_before:])   # "two three four five." at 8 kHz
+    assert g.outbox.empty() or not g.tasks[-1].done()
+    assert any("two three four five" in t for t in r.tts.texts)
+    assert r.last("barge_aborted")["text"]
+
+
 # ---------------------------------------------------------------------------------- greeting
 async def test_greeting_is_spoken_first_without_a_model_call_and_enters_history():
     llm = FakeLLM([["Sure thing."]])

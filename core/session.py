@@ -508,7 +508,16 @@ class Session:
                            latency_ms=self.clock() - gen.speech_end_clock)
             gen.sending = True
             try:
-                await self.send_audio(pcm, self.cfg.out_rate)
+                try:
+                    await self.send_audio(pcm, self.cfg.out_rate)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    # Not sent, so it is not in spoken. This drain is done: a cough has to start
+                    # another player. Leaving the chunk here is what that player sends.
+                    self._emit("error", where="send", error=repr(e))
+                    self._requeue_front(gen, item)
+                    return
                 if self.recorder is not None:
                     self.recorder.agent(pcm, self.cfg.out_rate)
                 dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
@@ -576,17 +585,18 @@ class Session:
         gen.pending_ms += dur
         await gen.outbox.put((text, pcm, True))
 
-    async def _prepend_replay_text(self, gen: _Generation, text: str) -> None:
+    async def _prepend_replay_text(self, gen: _Generation, text: str) -> bool:
+        """Queue a replay in front of whatever synth still has. False when nothing was queued."""
         chunker = SentenceChunker()
         pieces = [p for p in (*chunker.push(text), *chunker.flush()) if p.strip()]
         built = []
         for piece in pieces:
             if gen.cancelled:
-                return
+                return False
             pcm, dur = await self._render(piece)
             built.append((piece, pcm, dur))
-        if gen.cancelled:
-            return
+        if gen.cancelled or not built:
+            return False
         rest = []
         while True:
             try:
@@ -598,6 +608,18 @@ class Session:
             gen.outbox.put_nowait((piece, pcm, True))
         for item in rest:
             gen.outbox.put_nowait(item)
+        return True
+
+    def _drain_alive(self, gen: _Generation) -> bool:
+        return bool(gen.tasks) and not gen.tasks[-1].done()
+
+    def _replace_drain(self, gen: _Generation) -> None:
+        """Previous drain has exited. Keep producers; start a player that reads the outbox."""
+        drain = asyncio.create_task(self._drain(gen))
+        if gen.tasks:
+            gen.tasks = [*gen.tasks[:-1], drain]
+        else:
+            gen.tasks = [drain]
 
     def _start_tail_playback(self, gen: _Generation, text: str) -> None:
         """The reply already left the outbox. Speak the cleared tail without a second history turn."""
@@ -605,45 +627,90 @@ class Session:
         gen.cancelled = False
 
         async def produce() -> None:
+            queued = False
             try:
                 chunker = SentenceChunker()
                 for piece in [*chunker.push(text), *chunker.flush()]:
                     if gen.cancelled:
                         return
+                    if not piece.strip():
+                        continue
                     await self._put_replay(gen, piece)
+                    queued = True
+                # Only once the audio is on a live drain. A failed synth must not look like playout.
+                if queued and not gen.cancelled and self._drain_alive(gen):
+                    self._emit("barge_aborted", text=text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                self._emit("error", where="tts", error=repr(e))
             finally:
                 gen.produce_done = True
-                if not gen.cancelled:
+                if not gen.cancelled and queued:
                     gen.outbox.put_nowait(None)
+                elif not gen.cancelled:
+                    # Nothing queued: do not hand the drain a finished-reply sentinel. That runs
+                    # gen.after and hangs up before the cleared tail was ever spoken.
+                    drain = gen.tasks[-1] if gen.tasks else None
+                    if drain is not None and not drain.done() and drain is not asyncio.current_task():
+                        drain.cancel()
+                        drain.add_done_callback(lambda t: t.cancelled() or t.exception())
 
         gen.tasks = [asyncio.create_task(produce()),
                      asyncio.create_task(self._drain(gen))]
+
+    async def _resume_idle(self, gen: _Generation, tail: str) -> bool:
+        """Drain has finished, or is only waiting to run a deferred hang-up.
+
+        A tail is spoken in the background; barge_aborted is emitted there once it is queued.
+        """
+        drain = gen.tasks[-1] if gen.tasks else None
+        if drain is not None and not drain.done():
+            drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+        self.tracker.commit_heard(gen.paused_heard)
+        if tail:
+            self._start_tail_playback(gen, tail)
+            return False
+        # Nothing left to say. Drop the hold first or _finish_action waits on it forever.
+        gen.holding = False
+        if gen.after is not None:
+            await self._finish_action(gen)
+        return True
+
+    async def _resume_dead_drain(self, gen: _Generation, tail: str) -> bool:
+        """The player died (send_audio failed). Prepend the tail onto a new drain; keep synth."""
+        self.tracker.commit_heard(gen.paused_heard)
+        self._replace_drain(gen)
+        if tail and not await self._prepend_replay_text(gen, tail):
+            return False
+        return self._drain_alive(gen)
 
     async def _resume_after_barge(self, gen: _Generation) -> None:
         """A cough: do not trim history. Re-speak whatever clear() cut off, then continue the reply."""
         if gen.cancelled or not gen.holding:
             return
         tail = self._unheard_sent_text(gen)
-        if self._outgoing_idle(gen):
-            # Drain has finished or is only waiting to run a deferred hang-up. Cancelling that wait
-            # keeps a strict hang-up from firing while the tail is still unheard; the new drain
-            # reaches _finish_action after the tail.
-            drain = gen.tasks[-1] if gen.tasks else None
-            if drain is not None and not drain.done():
-                drain.cancel()
-                await asyncio.gather(drain, return_exceptions=True)
-            self.tracker.commit_heard(gen.paused_heard)
-            if tail:
-                self._start_tail_playback(gen, tail)
-            elif gen.after is not None:
-                await self._finish_action(gen)
-        else:
-            self.tracker.commit_heard(gen.paused_heard)
-            if tail:
-                await self._prepend_replay_text(gen, tail)
-        gen.holding = False
-        gen.barge_paused = False
-        self._emit("barge_aborted", text=tail)
+        accepted = False
+        try:
+            if self._outgoing_idle(gen):
+                accepted = await self._resume_idle(gen, tail)
+            elif not self._drain_alive(gen):
+                accepted = await self._resume_dead_drain(gen, tail)
+            else:
+                self.tracker.commit_heard(gen.paused_heard)
+                accepted = await self._prepend_replay_text(gen, tail) if tail else True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._emit("error", where="tts", error=repr(e))
+            accepted = False
+        finally:
+            # A replay error must not stick the pause or escape the read loop.
+            gen.holding = False
+            gen.barge_paused = False
+        if accepted and not gen.cancelled:
+            self._emit("barge_aborted", text=tail)
 
     async def _interrupt(self, gen: _Generation) -> None:
         # After a pause the transport buffer is already gone, so the clock must not advance "heard".

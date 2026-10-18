@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import struct
 import time
 import wave
 
@@ -468,6 +469,161 @@ def test_streaming_recorder_writes_wav_before_save_and_bounds_memory(tmp_path):
     assert secs == pytest.approx(now / 16000)
     with wave.open(str(final)) as w:
         assert w.getnframes() == now and w.getnchannels() == 2
+
+
+def _wav_pcm(path):
+    """Stereo frames, but only if the RIFF sizes are exactly the bytes on disk."""
+    raw = path.read_bytes()
+    assert raw[:4] == b"RIFF" and raw[8:12] == b"WAVE"
+    data_bytes = int.from_bytes(raw[40:44], "little")
+    assert int.from_bytes(raw[4:8], "little") == 36 + data_bytes
+    assert len(raw) == 44 + data_bytes and data_bytes % 4 == 0
+    if not data_bytes:
+        return np.zeros((0, 2), dtype=np.int16)
+    return np.frombuffer(raw[44:], dtype="<i2").reshape(-1, 2).copy()
+
+
+def test_streaming_clear_retries_when_truncate_or_zero_patch_fails(tmp_path):
+    """clear must not move _agent_end until the file actually drops the unplayed tail."""
+    t = [0.0]
+    part = tmp_path / "trunc.part.wav"
+    rec = CallRecorder(clock=lambda: t[0], path=str(part))
+    for _ in range(5):
+        rec.mic(np.full(512, 1111, np.int16))
+        t[0] += 512 / 16000
+    rec.agent(np.full(80000, 2000, np.int16), 16000)
+    t[0] += 8000 / 16000
+    now = int(t[0] * 16000)
+    agent_end, n = rec._agent_end, rec._n
+    assert agent_end > now and n > now
+    orig = rec._fh.truncate
+
+    def fail_truncate(size, state={"n": 0}):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise OSError("truncate")
+        return orig(size)
+
+    rec._fh.truncate = fail_truncate
+    with pytest.raises(OSError):
+        rec.clear()
+    assert rec._agent_end == agent_end and rec._n == n
+    stuck = _wav_pcm(part)
+    assert len(stuck) == n and stuck[now, 1] == 2000
+    rec.clear()
+    pcm = _wav_pcm(part)
+    assert len(pcm) == now and rec._agent_end == now
+    assert pcm[:2560, 0].min() == 1111 and pcm[2560:, 0].max() == 0
+    assert pcm[:2560, 1].max() == 0 and pcm[2560:now, 1].min() == 2000
+
+    t2 = [0.0]
+    part2 = tmp_path / "patch.part.wav"
+    rec2 = CallRecorder(clock=lambda: t2[0], path=str(part2))
+    rec2.agent(np.full(30000, 2000, np.int16), 16000)
+    for _ in range(20):
+        rec2.mic(np.full(512, 1111, np.int16))
+    t2[0] = 2560 / 16000
+    now2 = int(t2[0] * 16000)
+    assert rec2._left_n > now2 and rec2._n > rec2._left_n
+    end2, n2 = rec2._agent_end, rec2._n
+    orig_patch = rec2._patch
+
+    def fail_patch(*_a, **_k):
+        raise OSError("patch")
+
+    rec2._patch = fail_patch
+    with pytest.raises(OSError):
+        rec2.clear()
+    assert rec2._agent_end == end2 and rec2._n == n2
+    mid = _wav_pcm(part2)
+    assert mid[now2, 0] == 1111 and mid[now2, 1] == 2000 and mid[-1, 1] == 2000
+    rec2._patch = orig_patch
+    rec2.clear()
+    pcm2 = _wav_pcm(part2)
+    assert len(pcm2) == rec2._left_n == 20 * 512
+    assert pcm2[:, 0].min() == 1111
+    assert pcm2[:now2, 1].min() == 2000 and pcm2[now2:, 1].max() == 0
+
+
+def test_streaming_write_error_stops_patching_and_save_matches_disk(tmp_path, monkeypatch):
+    import core.recorder as recmod
+
+    t = [0.0]
+    part = tmp_path / "c.part.wav"
+    rec = CallRecorder(clock=lambda: t[0], path=str(part))
+    rec.mic(np.full(512, 1000, np.int16))
+    t[0] += 512 / 16000
+    orig = rec._fh.write
+
+    def boom(data):
+        if len(data) != 44:
+            raise OSError("full")
+        return orig(data)
+
+    rec._fh.write = boom
+    with pytest.raises(OSError):
+        rec.mic(np.full(512, 2000, np.int16))
+    rec._fh.write = orig
+    rec.mic(np.full(512, 3000, np.int16))
+    rec.agent(np.full(800, 7, np.int16), 16000)
+    assert part.stat().st_size == 44 + 512 * 4
+    assert _wav_pcm(part)[0, 0] == 1000
+
+    part2 = tmp_path / "h.part.wav"
+    rec2 = CallRecorder(clock=lambda: 0.0, path=str(part2))
+    rec2.mic(np.full(512, 1000, np.int16))
+    real_header = recmod._wav_header
+    state = {"n": 0}
+
+    def flaky(nframes):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise struct.error("pack")
+        return real_header(nframes)
+
+    monkeypatch.setattr(recmod, "_wav_header", flaky)
+    with pytest.raises(struct.error):
+        rec2.mic(np.full(512, 2000, np.int16))
+    rec2.mic(np.full(512, 3000, np.int16))
+    final = tmp_path / "h.wav"
+    secs = rec2.save(str(final))
+    pcm = _wav_pcm(final)
+    assert len(pcm) == 1024 and pcm[0, 0] == 1000 and pcm[512, 0] == 2000
+    assert int(pcm[:, 0].max()) == 2000
+    assert secs == pytest.approx(1024 / 16000)
+
+    part3 = tmp_path / "p.part.wav"
+    rec3 = CallRecorder(clock=lambda: 0.0, path=str(part3))
+    rec3.mic(np.full(512, 1000, np.int16))
+    rec3._fh.seek(0, os.SEEK_END)
+    rec3._fh.write(b"abcde")
+    rec3._fh.flush()
+    out3 = tmp_path / "p.wav"
+    rec3.save(str(out3))
+    assert len(_wav_pcm(out3)) == 512 and _wav_pcm(out3)[0, 0] == 1000
+
+    part4 = tmp_path / "s.part.wav"
+    rec4 = CallRecorder(clock=lambda: 0.0, path=str(part4))
+    rec4.mic(np.full(512, 1000, np.int16))
+    rec4._fh.truncate(recmod._HEADER + 103)
+    rec4._fh.flush()
+    out4 = tmp_path / "s.wav"
+    rec4.save(str(out4))
+    short = _wav_pcm(out4)
+    assert len(short) == 25 and short[0, 0] == 1000
+
+    assert recmod._wav_header(recmod._MAX_WAV_FRAMES)
+    with pytest.raises(struct.error):
+        recmod._wav_header(recmod._MAX_WAV_FRAMES + 1)
+    assert recmod._MAX_WAV_FRAMES + 1 == 1073741815
+    part5 = tmp_path / "cap.part.wav"
+    rec5 = CallRecorder(clock=lambda: 0.0, path=str(part5))
+    rec5.mic(np.full(512, 1000, np.int16))
+    monkeypatch.setattr(recmod, "_MAX_WAV_FRAMES", 100)
+    out5 = tmp_path / "cap.wav"
+    assert rec5.save(str(out5)) == pytest.approx(100 / 16000)
+    capped = _wav_pcm(out5)
+    assert len(capped) == 100 and capped[0, 0] == 1000
 
 
 def test_recording_end_to_end_and_download(tmp_path, monkeypatch):

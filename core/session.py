@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Protocol
@@ -134,11 +135,18 @@ class Session:
         self._bg: set[asyncio.Task] = set()
         self.stats = {"turns": 0, "speculations": 0, "speculations_cancelled": 0, "interruptions": 0}
 
+    def _record(self, fn: Callable, *args: Any) -> None:
+        """Disk and header errors must not end the call or skip playback accounting."""
+        try:
+            fn(*args)
+        except (OSError, struct.error) as e:
+            self._emit("error", where="recorder", error=repr(e))
+
     # ------------------------------------------------------------------ input
     async def feed(self, frame: np.ndarray) -> None:
         """Feed one 512-sample 16 kHz int16 frame (32 ms)."""
         if self.recorder is not None:
-            self.recorder.mic(frame)
+            self._record(self.recorder.mic, frame)
         prob = self.vad.prob(frame)
         if prob >= self.cfg.turn.threshold:
             self._last_speech_clock = self.clock()
@@ -446,7 +454,7 @@ class Session:
                            latency_ms=self.clock() - gen.speech_end_clock)
             await self.send_audio(pcm, self.cfg.out_rate)
             if self.recorder is not None:
-                self.recorder.agent(pcm, self.cfg.out_rate)
+                self._record(self.recorder.agent, pcm, self.cfg.out_rate)
             dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
             self.tracker.on_sent(text, dur)
             gen.pending_ms -= dur
@@ -460,7 +468,7 @@ class Session:
         heard, cut = self.tracker.heard()
         await self.clear_audio()          # stop the far end first: that is what the caller hears
         if self.recorder is not None:
-            self.recorder.clear()
+            self._record(self.recorder.clear)
         await self._cancel(gen)
         a, gen.after = gen.after, None
         if a is not None and a.strict:

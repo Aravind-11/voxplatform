@@ -428,3 +428,49 @@ async def test_caller_can_talk_over_the_greeting_and_the_next_turn_proceeds():
     assert len(llm.calls) == 1 and r.tts.texts[-1] == "Booked."
     h = llm.calls[0]["history"][1]                                   # the greeting precedes the caller's first turn,
     assert h["role"] == "assistant" and h["content"].endswith("[interrupted]")   # trimmed to what was heard
+
+
+async def test_recorder_errors_do_not_drop_playback_or_the_call():
+    """OSError and struct.error from mic, agent, or clear stay inside the call."""
+    import struct
+
+    class Flaky:
+        def __init__(self):
+            self.mics = self.agents = self.clears = 0
+
+        def mic(self, frame):
+            self.mics += 1
+            raise struct.error("mic")
+
+        def agent(self, pcm, rate):
+            self.agents += 1
+            raise OSError("agent")
+
+        def clear(self):
+            self.clears += 1
+            raise struct.error("clear")
+
+    r = Rig(FakeLLM([["Hello there friend."]]), tts=FakeTTS(word_ms=200))
+    rec = Flaky()
+    r.s.recorder = rec
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    assert rec.mics > 0 and rec.agents == 1 and len(r.sent) == 1
+    t_sent, n, rate = r.sent[0]
+    dur = 1000.0 * n / rate
+    assert r.s.tracker.buffered_ms() == pytest.approx(max(0.0, t_sent + dur - r.clk.t))
+    gen = r.s._gen
+    assert gen is not None and gen.cancelled is False
+    for task in gen.tasks:
+        if task.done():
+            assert task.exception() is None
+    await r.s.feed(SILENCE)
+    await r.frames("s", 6)
+    await r.settle()
+    assert rec.clears == 1 and r.clears == 1
+    assert r.s.stats["interruptions"] == 1 and gen.cancelled is True
+    assert r.s.history[-1]["content"].endswith("[interrupted]")
+    assert any(e["type"] == "error" and e["where"] == "recorder" for e in r.events)
+    await r.s.feed(SILENCE)
+    assert rec.mics > 15

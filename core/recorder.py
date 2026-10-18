@@ -18,6 +18,8 @@ from .audio import resample
 
 RATE = 16000
 _HEADER = 44
+# RIFF and data sizes are uint32. 1073741815 stereo frames overflows the RIFF field.
+_MAX_WAV_FRAMES = (2**32 - 1 - 36) // 4
 
 
 def _wav_header(nframes: int) -> bytes:
@@ -40,6 +42,7 @@ class CallRecorder:
         self._path = path
         self._n = 0                         # stereo frames committed to the file
         self._fh = None
+        self._failed = False                # torn write: stop patching until save publishes a consistent file
         if path:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             self._fh = open(path, "w+b")
@@ -58,6 +61,18 @@ class CallRecorder:
         self._fh.seek(0)
         self._fh.write(_wav_header(self._n))
         self._fh.flush()
+
+    def _align_to_disk(self) -> None:
+        """Header names only whole frames that were committed and that still fit in a uint32 WAV."""
+        if self._fh is None:
+            return
+        self._fh.flush()
+        size = self._fh.seek(0, os.SEEK_END)
+        disk_frames = 0 if size <= _HEADER else (size - _HEADER) // 4
+        frames = min(self._n, disk_frames, _MAX_WAV_FRAMES)
+        self._fh.truncate(_HEADER + frames * 4)
+        self._n = frames
+        self._write_header()
 
     def _ensure(self, nframes: int) -> None:
         if nframes <= self._n:
@@ -93,18 +108,30 @@ class CallRecorder:
             self.left.append(x)
             self._left_n += len(x)
             return
-        self.left = [x]                    # the earlier caller audio is in the file, not this list
-        self._patch(0, self._left_n, x)
-        self._left_n += len(x)
-        self._write_header()               # every frame, so at least every 50, and a reader sees matching sizes
+        if self._failed:
+            return
+        try:
+            self.left = [x]                # the earlier caller audio is in the file, not this list
+            self._patch(0, self._left_n, x)
+            self._left_n += len(x)
+            self._write_header()           # every frame, so at least every 50, and a reader sees matching sizes
+        except (OSError, struct.error):
+            self._failed = True
+            raise
 
     def agent(self, pcm: np.ndarray, rate: int) -> None:
         x = resample(np.asarray(pcm, dtype=np.int16), rate, RATE) if rate != RATE else np.asarray(pcm, dtype=np.int16)
         start = max(self._agent_end, self._now())
         if self._streaming():
-            self._patch(1, start, x)
-            self._agent_end = start + len(x)
-            self._write_header()
+            if self._failed:
+                return
+            try:
+                self._patch(1, start, x)
+                self._agent_end = start + len(x)
+                self._write_header()
+            except (OSError, struct.error):
+                self._failed = True
+                raise
             return
         if len(self.right) < start:
             self.right = np.concatenate([self.right, np.zeros(start - len(self.right), np.int16)])
@@ -120,7 +147,6 @@ class CallRecorder:
                 self._agent_end = now
             return
         if self._agent_end > now:
-            self._agent_end = now
             new_len = max(self._left_n, now)
             if now < new_len and now < self._n:
                 # Caller samples past `now` stay; agent samples that never played do not.
@@ -128,6 +154,8 @@ class CallRecorder:
             if new_len < self._n:
                 self._fh.truncate(_HEADER + new_len * 4)
                 self._n = new_len
+            # After the file drop. A failed truncate or zero-patch must leave _agent_end so another clear retries.
+            self._agent_end = now
         self._write_header()
 
     def stereo(self) -> np.ndarray:
@@ -162,10 +190,12 @@ class CallRecorder:
                 w.writeframes(data.astype("<i2").tobytes())
             os.replace(tmp, path)
             return len(data) / RATE
-        self._write_header()
-        if self._fh is not None:
-            self._fh.close()
-            self._fh = None
+        try:
+            self._align_to_disk()
+        finally:
+            if self._fh is not None:
+                self._fh.close()
+                self._fh = None
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         if os.path.abspath(path) != os.path.abspath(self._path or path):
             os.replace(self._path, path)

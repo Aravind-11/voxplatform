@@ -115,6 +115,33 @@ async def test_build_session_records_the_variant_and_does_not_mutate_the_shared_
     assert c.get("/v1/experiments/exp1", headers={"X-API-Key": other}).status_code == 404
 
 
+def test_variant_write_keeps_caller_identity_stored_after_the_call_object_was_loaded():
+    """SIP (and outbound) write from/to/callSid onto the row after the in-memory call was loaded.
+    Choosing a variant must not replace that metadata with only the experiment fields."""
+    c, store, _ = make()
+    key, tid = tenant(c)
+    h = {"X-API-Key": key}
+    exp = {"id": "exp1", "variants": [{"id": "A", "weight": 50, "voice": "af_heart"},
+                                      {"id": "B", "weight": 50, "voice": "af_bella"}]}
+    agent = c.post("/v1/agents", json={"name": "n", "systemPrompt": "Caller {{caller}} dialled {{callee}}.",
+                                       "experiment": exp}, headers=h)
+    assert agent.status_code == 200
+    created = c.post("/v1/calls", json={"agentId": agent.json()["id"]}, headers=h).json()
+    call = store.get_call_any(created["id"])
+    assert call["metadata"] == {}
+    store.update_call(call["id"], metadata={"from": "+15551110000", "to": "+15552220000", "callSid": "CA123"})
+    assert call["metadata"] == {}
+    rt = Runtime(SharedLLM(), lambda voice: FakeTTS(), FakeVAD, store)
+    sess = rt.build_session(call, T())
+    stored = store.get_call(tid, call["id"])["metadata"]
+    assert stored["from"] == "+15551110000"
+    assert stored["to"] == "+15552220000"
+    assert stored["callSid"] == "CA123"
+    assert stored["experiment"] == "exp1"
+    assert stored["variant"] in ("A", "B")
+    assert sess.history[0]["content"] == "Caller +15551110000 dialled +15552220000."
+
+
 def test_turn_metric_labels_the_variant_without_dropping_the_unlabeled_series():
     _count({"type": "user_end_of_turn"})
     _count({"type": "user_end_of_turn"}, "A")

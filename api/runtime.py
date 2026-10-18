@@ -138,7 +138,13 @@ class Runtime:
         experiment = cfg.get("experiment")
         if isinstance(experiment, dict) and experiment.get("variants"):
             variant = choose_variant(experiment, str(call["id"]))
-            meta = {**meta, "experiment": experiment.get("id"), "variant": variant.get("id")}
+            # The call dict can be older than the row: SIP writes the channel id after this object was loaded.
+            stored = (self.store.get_call_any(call["id"]) or {}).get("metadata") or {}
+            if isinstance(stored, str):
+                stored = json.loads(stored or "{}")
+            if not isinstance(stored, dict):
+                stored = {}
+            meta = {**stored, **meta, "experiment": experiment.get("id"), "variant": variant.get("id")}
             call["metadata"] = meta
             self.store.update_call(call["id"], metadata=meta)
         sid, token = os.environ.get("TWILIO_ACCOUNT_SID", ""), os.environ.get("TWILIO_AUTH_TOKEN", "")

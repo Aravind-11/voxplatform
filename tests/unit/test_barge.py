@@ -168,6 +168,38 @@ async def test_hangup_runs_when_a_playback_mark_never_arrives():
     assert ended == [1]
 
 
+async def test_say_and_wait_holds_for_marks_after_the_clock_is_past():
+    """Voicemail plays with say_and_wait and then hangs up. Before the first ack, buffered_ms
+    follows the local clock, so that hang-up must not run while the mark is still pending."""
+    r = Rig(FakeLLM([["x."]]), tts=FakeTTS(word_ms=100),
+            cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500))
+    _mark_sending(r)
+    task = asyncio.create_task(r.s.say_and_wait("Please call us back."))
+    await r.settle()
+    assert r.s.tracker.pending_marks
+    r.clk.t = r.s.tracker.ends_at() + 100
+    await asyncio.sleep(0.25)
+    assert r.s.tracker.buffered_ms() == 0 and not task.done()
+    for name in list(r.s.tracker.pending_marks):
+        r.s.tracker.note_mark(name)
+    await asyncio.sleep(0.25)
+    assert task.done() and not task.cancelled()
+    await task
+
+
+async def test_say_and_wait_returns_when_the_mark_never_arrives():
+    r = Rig(FakeLLM([["x."]]), tts=FakeTTS(word_ms=100),
+            cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500))
+    _mark_sending(r)
+    task = asyncio.create_task(r.s.say_and_wait("Please call us back."))
+    await r.settle()
+    assert r.s.tracker.pending_marks
+    r.clk.t = r.s.tracker.ends_at() + r.s.cfg.mark_timeout_ms + 1
+    await asyncio.sleep(0.25)
+    assert task.done() and not task.cancelled()
+    await task
+
+
 def test_twilio_session_waits_on_marks_and_a_browser_session_does_not():
     store = Store()
     rt = Runtime(ApiLLM(), lambda v: ApiTTS(), FakeVAD, store)

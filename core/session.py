@@ -179,7 +179,16 @@ class Session:
         assert gen is not None
         deadline = self.clock() + timeout_s * 1000.0
         await asyncio.wait({gen.tasks[-1]}, timeout=timeout_s)         # the drain task: every sentence sent
-        while not gen.cancelled and self.tracker.buffered_ms() > 0 and self.clock() < deadline:
+        # Until the first ack, buffered_ms follows the local clock and can hit zero while Twilio
+        # still has the audio. Voicemail hangs up when this returns, so pending marks hold it
+        # open until they are acked or mark_timeout_ms after the clock estimate.
+        mark_deadline = self.tracker.ends_at() + self.cfg.mark_timeout_ms
+        while not gen.cancelled and self.clock() < deadline:
+            if self.tracker.pending_marks:
+                if self.clock() >= mark_deadline:
+                    break
+            elif self.tracker.buffered_ms() <= 0:
+                break
             await asyncio.sleep(0.05)
 
     def seed_history(self, messages: list[dict]) -> None:

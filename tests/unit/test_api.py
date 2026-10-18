@@ -228,6 +228,25 @@ async def test_timing_insert_failure_keeps_the_tool_result_and_the_audio():
     assert not {"tts_done", "tool_result", "agent_first_audio"} & set(stages)
 
 
+def test_dashboard_waterfall_is_text_bars_in_show_call():
+    """The call view fetches timings after the transcript and draws stage bars with h(), not innerHTML."""
+    from pathlib import Path
+    html = (Path(__file__).resolve().parents[2] / "api" / "static" / "dashboard.html").read_text()
+    start = html.index("async function showCall")
+    body = html[start:html.index('\n$("login")', start)]
+    assert body.index("/messages") < body.index("/timings")
+    assert 'api("/v1/calls/" + c.id + "/timings")' in body
+    water = body[body.index("/timings"):body.index("/recording")]
+    for piece in ('llm_first_token: "llm"', 'tts_done: "tts"',
+                  'agent_first_audio: "first audio"', 'tool_result: "tool"'):
+        assert piece in water
+    assert "t.turn === r.turn" in water
+    assert 'h("div", { class: "barrow"' in water
+    assert 'h("span", {}, labels[r.stage]' in water
+    assert 'h("div", { class: "bar"' in water
+    assert "innerHTML" not in water
+
+
 def test_tenant_isolation():
     c, *_ = make()
     ka, _ = tenant(c, "a")

@@ -654,15 +654,21 @@ def test_delete_call_removes_record_transcript_and_recording(tmp_path, monkeypat
     kb, _ = tenant(c, "b")
     call = store.create_call(ta, None, "webSocket", {})
     store.add_message(call["id"], "user", "secret words", 1.0)
+    store.add_timing(call["id"], 1, "llm_first_token", 40, 1.0)
+    store.add_timing(call["id"], 1, "tool_result", 7, 2.0)
+    kept = [(1, "llm_first_token", 40.0), (1, "tool_result", 7.0)]
     (tmp_path / f"{call['id']}.wav").write_bytes(b"RIFF....")
     (tmp_path / "utterances").mkdir()
     (tmp_path / "utterances" / f"{call['id']}-001.wav").write_bytes(b"x")
     store.update_call(call["id"], status="active")
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(ka)).status_code == 409           # not while live
+    assert [(r["turn"], r["stage"], r["ms"]) for r in store.timings(call["id"])] == kept
     store.update_call(call["id"], status="ended")
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(kb)).status_code == 404           # other tenant
+    assert [(r["turn"], r["stage"], r["ms"]) for r in store.timings(call["id"])] == kept
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(ka)).status_code == 200
     assert store.get_call_any(call["id"]) is None and store.messages(call["id"]) == []
+    assert store.timings(call["id"]) == []
     assert not (tmp_path / f"{call['id']}.wav").exists() and not list((tmp_path / "utterances").iterdir())
     assert c.get("/v1/audit", headers=H(ka)).json()[0]["action"] == "call.delete"
 

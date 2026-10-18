@@ -685,17 +685,26 @@ def test_delete_call_removes_record_transcript_and_recording(tmp_path, monkeypat
     ka, ta = tenant(c, "a")
     kb, _ = tenant(c, "b")
     call = store.create_call(ta, None, "webSocket", {})
+    kept = store.create_call(ta, None, "webSocket", {})
     store.add_message(call["id"], "user", "secret words", 1.0)
     (tmp_path / f"{call['id']}.wav").write_bytes(b"RIFF....")
+    (tmp_path / f"{call['id']}.part.wav").write_bytes(b"PART")       # crash leftover beside the finished wav
+    (tmp_path / f"{kept['id']}.wav").write_bytes(b"KEEP")
+    (tmp_path / f"{kept['id']}.part.wav").write_bytes(b"KEEPPART")
     (tmp_path / "utterances").mkdir()
     (tmp_path / "utterances" / f"{call['id']}-001.wav").write_bytes(b"x")
     store.update_call(call["id"], status="active")
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(ka)).status_code == 409           # not while live
+    assert (tmp_path / f"{call['id']}.part.wav").exists()                                  # a refused delete must not erase audio
     store.update_call(call["id"], status="ended")
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(kb)).status_code == 404           # other tenant
+    assert (tmp_path / f"{call['id']}.part.wav").exists()
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(ka)).status_code == 200
     assert store.get_call_any(call["id"]) is None and store.messages(call["id"]) == []
-    assert not (tmp_path / f"{call['id']}.wav").exists() and not list((tmp_path / "utterances").iterdir())
+    assert not (tmp_path / f"{call['id']}.wav").exists() and not (tmp_path / f"{call['id']}.part.wav").exists()
+    assert not list((tmp_path / "utterances").iterdir())
+    assert (tmp_path / f"{kept['id']}.wav").read_bytes() == b"KEEP"                        # a call that was not erased keeps its files
+    assert (tmp_path / f"{kept['id']}.part.wav").read_bytes() == b"KEEPPART"
     assert c.get("/v1/audit", headers=H(ka)).json()[0]["action"] == "call.delete"
 
 
@@ -798,6 +807,7 @@ def test_retention_purges_old_ended_calls_files_and_leaves_the_rest(tmp_path):
         store.update_call(call["id"], status=status, joined=now - age_days * day - 60, ended=now - age_days * day)
         store.add_message(call["id"], "user", "hi", 1.0)
         (tmp_path / f"{call['id']}.wav").write_bytes(b"RIFF")
+        (tmp_path / f"{call['id']}.part.wav").write_bytes(b"PART")   # unfinished stream left by a crash
         (tmp_path / "utterances").mkdir(exist_ok=True)
         (tmp_path / "utterances" / f"{call['id']}-001.wav").write_bytes(b"x")
         return call["id"]
@@ -806,12 +816,16 @@ def test_retention_purges_old_ended_calls_files_and_leaves_the_rest(tmp_path):
     out = retention.purge_expired(store, str(tmp_path))
     assert out == {ta: 1}
     assert store.get_call_any(old_a) is None and store.messages(old_a) == []
-    assert not (tmp_path / f"{old_a}.wav").exists() and not (tmp_path / "utterances" / f"{old_a}-001.wav").exists()
+    assert not (tmp_path / f"{old_a}.wav").exists() and not (tmp_path / f"{old_a}.part.wav").exists()
+    assert not (tmp_path / "utterances" / f"{old_a}-001.wav").exists()
     for kept in (new_a, live_old_a, old_b):                          # recent, still-live and no-retention-tenant calls survive
         assert store.get_call_any(kept) is not None and (tmp_path / f"{kept}.wav").exists()
+        assert (tmp_path / f"{kept}.part.wav").read_bytes() == b"PART"
     assert store.list_audit(ta)[0]["action"] == "retention.purge"
     assert retention.purge_expired(store, str(tmp_path), default_days=10) == {tb: 1}      # b has no limit of its own: the default applies; a keeps its 30
     assert store.get_call_any(old_b) is None and store.get_call_any(new_a) is not None      # server default (10 d) now applies to b
+    assert not (tmp_path / f"{old_b}.part.wav").exists() and not (tmp_path / f"{old_b}.wav").exists()
+    assert (tmp_path / f"{new_a}.part.wav").exists() and (tmp_path / f"{live_old_a}.part.wav").exists()
     assert store.get_call_any(live_old_a) is not None
 
 

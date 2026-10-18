@@ -11,6 +11,10 @@ name: voxplatform
 
 x-api: &api
   build: { context: .., dockerfile: deploy/Dockerfile.api }
+  # One process per container. Horizontal scale is more api containers, not workers inside one
+  # container, because a WebSocket must stay on the process that accepted it. VOX_PROCS is NOT
+  # used to set uvicorn workers > 1 inside one container (it only drives scripts/deploy.sh).
+  command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--proxy-headers"]
   depends_on: { vllm: { condition: service_healthy }, postgres: { condition: service_healthy }, redis: { condition: service_started } }
   environment: &api-env
     VOX_VLLM_URL: http://vllm:8000/v1
@@ -24,6 +28,7 @@ x-api: &api
     VOX_TWILIO_NUMBER: ${VOX_TWILIO_NUMBER:-}
     VOX_RECORD_DIR: /data/recordings
     VOX_DEFAULT_CONCURRENCY: ${VOX_DEFAULT_CONCURRENCY:-64}
+    VOX_PROCS: "1"                                         # not a worker count; see the command comment above
     VOX_EOT: model
     VOX_EOT_THRESHOLD: "0.9"
     VOX_NO_ESPEAK: ${VOX_NO_ESPEAK:-1}

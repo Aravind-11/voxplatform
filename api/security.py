@@ -8,7 +8,7 @@ import hmac
 import json
 import secrets
 import threading
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Mapping, Optional
 
 import httpx
 
@@ -23,23 +23,68 @@ def hash_key(key: str) -> str:
 
 
 # ------------------------------------------------------------ concurrency
+def process_call_ceiling(env: Mapping[str, str]) -> Optional[int]:
+    """Local ceiling already stored in VOX_NODE_MAX_CALLS.
+
+    deploy.sh sets that variable to this process's share and leaves VOX_PROCS as the host
+    count. Dividing by VOX_PROCS again would shrink the share (8 with VOX_PROCS=4 becomes 2).
+    Missing means no extra ceiling. 0 admits nobody. A negative or non-integer value fails startup.
+    """
+    if env is None or "VOX_NODE_MAX_CALLS" not in env:
+        return None
+    raw = env["VOX_NODE_MAX_CALLS"]
+    if not isinstance(raw, str):
+        raise ValueError(f"VOX_NODE_MAX_CALLS must be an integer >= 0, got {raw!r}")
+    text = raw.strip()
+    digits = text[1:] if text.startswith(("+", "-")) else text
+    if not digits.isascii() or not digits.isdigit():
+        raise ValueError(f"VOX_NODE_MAX_CALLS must be an integer >= 0, got {raw!r}")
+    value = int(text)
+    if value < 0:
+        raise ValueError(f"VOX_NODE_MAX_CALLS must be an integer >= 0, got {raw!r}")
+    return value
+
+
+def _checked_ceiling(process_ceiling: Optional[int]) -> Optional[int]:
+    if process_ceiling is None:
+        return None
+    if isinstance(process_ceiling, bool) or not isinstance(process_ceiling, int) or process_ceiling < 0:
+        raise ValueError(f"process call ceiling must be an integer >= 0, got {process_ceiling!r}")
+    return process_ceiling
+
+
+def make_limiter(env: Mapping[str, str], default_concurrency: int, *, redis_client=None):
+    """One process's limiter. The ceiling stays on this process; the tenant cap may be shared via Redis."""
+    ceiling = process_call_ceiling(env)
+    redis_url = env.get("VOX_REDIS_URL", "") if env else ""
+    if redis_url:
+        return RedisLimiter(redis_url, default_concurrency, client=redis_client, process_ceiling=ceiling)
+    return ConcurrencyLimiter(default_concurrency, process_ceiling=ceiling)
+
+
 class ConcurrencyLimiter:
     """In-process per-tenant active-call cap (single node). A multi-node deployment would back
     this with Redis (INCR/DECR with expiry); only this in-process version is implemented."""
 
-    def __init__(self, default_limit: int = 10):
+    def __init__(self, default_limit: int = 10, process_ceiling: Optional[int] = None):
         self.default_limit = default_limit
+        self.process_ceiling = _checked_ceiling(process_ceiling)
         self._active: dict[str, set[str]] = {}
         self._lock = threading.Lock()
 
     def acquire(self, tenant_id: str, call_id: str, limit: Optional[int] = None) -> bool:
         cap = limit if limit is not None else self.default_limit
         with self._lock:
-            calls = self._active.setdefault(tenant_id, set())
-            if call_id in calls:
+            calls = self._active.get(tenant_id)
+            if calls is not None and call_id in calls:
                 return True
-            if len(calls) >= cap:
+            # Across tenants, before a tenant slot is taken. 0 admits nobody; None adds no ceiling.
+            if self.process_ceiling is not None and sum(len(v) for v in self._active.values()) >= self.process_ceiling:
                 return False
+            if (len(calls) if calls is not None else 0) >= cap:
+                return False
+            if calls is None:
+                calls = self._active[tenant_id] = set()
             calls.add(call_id)
             return True
 
@@ -73,11 +118,13 @@ redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
 return 1
 """
 
-    def __init__(self, url: str = "", default_limit: int = 10, ttl_s: float = 90.0, client=None, prefix: str = "vox:active:"):
+    def __init__(self, url: str = "", default_limit: int = 10, ttl_s: float = 90.0, client=None, prefix: str = "vox:active:",
+                 process_ceiling: Optional[int] = None):
         if client is None:
             import redis
             client = redis.Redis.from_url(url, decode_responses=True)
         self.r, self.default_limit, self.ttl_s, self.prefix = client, default_limit, ttl_s, prefix
+        self.process_ceiling = _checked_ceiling(process_ceiling)
         self._script = self.r.register_script(self.LUA)
         self._held: dict[str, set[str]] = {}
         self._lock = threading.Lock()
@@ -92,16 +139,24 @@ return 1
         import time
         now = time.time()
         cap = limit if limit is not None else self.default_limit
-        ok = self._script(keys=[self._key(tenant_id)], args=[now, now + self.ttl_s, call_id, cap]) == 1
-        if ok:
-            with self._lock:
+        with self._lock:
+            # Local sets only: a shared Redis key would turn this share into a cluster cap.
+            already = call_id in self._held.get(tenant_id, ())
+            if (not already and self.process_ceiling is not None
+                    and sum(len(v) for v in self._held.values()) >= self.process_ceiling):
+                return False
+            ok = self._script(keys=[self._key(tenant_id)], args=[now, now + self.ttl_s, call_id, cap]) == 1
+            if ok:
                 self._held.setdefault(tenant_id, set()).add(call_id)
-        return ok
+            return ok
 
     def release(self, tenant_id: str, call_id: str) -> None:
-        self.r.zrem(self._key(tenant_id), call_id)
-        with self._lock:
-            self._held.get(tenant_id, set()).discard(call_id)
+        try:
+            self.r.zrem(self._key(tenant_id), call_id)
+        finally:
+            # A failed ZREM must not stick this process's ceiling. The member expires via ttl_s.
+            with self._lock:
+                self._held.get(tenant_id, set()).discard(call_id)
 
     def active(self, tenant_id: str) -> int:
         import time

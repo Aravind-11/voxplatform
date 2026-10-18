@@ -61,6 +61,7 @@ start-confirmation window, i.e. platform overhead is small and the thresholds do
 
 ## Real-stack load test (1x H100, all callers speak at the same instant = worst case)
 Response = caller speech end -> first agent audio, measured by the client.
+The published "v2, 4 procs" numbers require `VOX_PROCS=4` and `VOX_NODE_MAX_CALLS` split across those processes (`VOX_NODE_MAX_CALLS // VOX_PROCS` per process). The sum of those per-process caps does not exceed the node cap; a positive cap smaller than the process count is rejected rather than rounded up to 1 each. That is four separate uvicorn processes on ports 8080–8083, not `--workers 4`: a WebSocket sticks to the process that accepted it, and in-process state (live calls, VAD) is per process. Those processes need a Postgres `VOX_DB` (`postgres://` or `postgresql://`); the default SQLite file raises `database is locked`.
 
 | Calls | v1 (eager TTS) p50 / p95 | v2 just-in-time TTS, 1 proc | v2, 4 procs | completed (v2, 4 procs) |
 |---|---|---|---|---|

@@ -131,6 +131,9 @@ class Session:
         self._gen: Optional[_Generation] = None
         self._last_speech_clock = 0.0
         self._transcript_task: Optional[asyncio.Task] = None
+        # Strong refs until each transcript finishes. The loop only keeps a weak set, and `_commit`
+        # replaces `_transcript_task`, so a cancelled waiter would otherwise drop the caller line.
+        self._transcript_tasks: set[asyncio.Task] = set()
         self._bg: set[asyncio.Task] = set()
         self.stats = {"turns": 0, "speculations": 0, "speculations_cancelled": 0, "interruptions": 0}
 
@@ -212,8 +215,30 @@ class Session:
         self._cancel_eot()
         if self._gen:
             await self._cancel(self._gen)
-        if self._transcript_task:
-            await asyncio.gather(self._transcript_task, return_exceptions=True)
+        # The generation cancel must not cancel transcription. Hang-up waits so the caller line is
+        # stored before close returns.
+        try:
+            await self._shield_transcripts([t for t in list(self._transcript_tasks) if not t.done()])
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _shield_transcripts(self, tasks: list[asyncio.Task]) -> None:
+        """Wait for transcripts without letting this task's cancellation cancel them.
+
+        CancelledError is re-raised so a cancelled generation does not continue into a side effect.
+        """
+        pending = [t for t in tasks if t is not None and not t.done()]
+        if not pending:
+            return
+        results = await asyncio.gather(*(asyncio.shield(t) for t in pending), return_exceptions=True)
+        cancelled = [r for r in results if isinstance(r, asyncio.CancelledError)]
+        if cancelled:
+            raise cancelled[0]
+        errors = [r for r in results if isinstance(r, BaseException)]
+        if errors:
+            raise errors[0]
 
     # --------------------------------------------------------------- events
     def _emit(self, type_: str, **data: Any) -> None:
@@ -300,7 +325,10 @@ class Session:
         self.history.append({"role": "user", "content": "[caller audio]"})
         self.history.append({"role": "assistant", "content": ""})
         user_idx = len(self.history) - 2
-        self._transcript_task = asyncio.create_task(self._transcribe(gen.audio, user_idx))
+        task = asyncio.create_task(self._transcribe(gen.audio, user_idx))
+        self._transcript_task = task
+        self._transcript_tasks.add(task)
+        task.add_done_callback(self._transcript_tasks.discard)
         gen.commit.set()
 
     async def _transcribe(self, audio: np.ndarray, idx: int) -> None:
@@ -320,8 +348,11 @@ class Session:
     async def _produce(self, gen: _Generation) -> None:
         followups: list[dict] = []
         try:
-            if self._transcript_task and not self._transcript_task.done():
-                await self._transcript_task  # previous turn's transcript must be in history
+            # Previous caller lines only: this snapshot is taken before the current turn is committed.
+            # Shielded so cancelling this generation does not drop a line it is waiting on.
+            prior = [t for t in list(self._transcript_tasks) if not t.done()]
+            if prior:
+                await self._shield_transcripts(prior)
                 gen.base_history = list(self.history[: len(gen.base_history)])
             for _round in range(self.cfg.max_tool_rounds + 1):
                 chunker = SentenceChunker()

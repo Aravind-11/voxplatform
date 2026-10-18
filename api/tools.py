@@ -6,6 +6,7 @@ Later entries override earlier ones with the same name (so a tenant can replace 
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import inspect
 import json
@@ -110,6 +111,8 @@ async def _caller_text(ctx) -> str:
         text = provider() if callable(provider) else provider
         if inspect.isawaitable(text):
             text = await text
+    except asyncio.CancelledError:
+        raise  # an empty line would fail open and run the side effect
     except Exception:  # noqa: BLE001
         return ""
     return text if isinstance(text, str) else ""

@@ -211,14 +211,19 @@ class Runtime:
         ctx.turn_fn = lambda: sess.stats["turns"]      # lets confirm-before-acting tools tell turns apart
 
         async def last_user_text() -> str:
-            # The committed turn is still "[caller audio]" until `_transcribe` finishes, and tools run in that
-            # window. Wait for it, then keep every caller line: a newer benign transcript must not hide an older one.
-            task = sess._transcript_task
-            if task is not None and not task.done():
-                try:
-                    await task
-                except Exception:  # noqa: BLE001  (a failed transcript still leaves the earlier lines to check)
-                    pass
+            # Tools run while the committed turn is still "[caller audio]". Wait for every in-flight
+            # transcript: barge-in cancels this generation, and a newer turn replaces `_transcript_task`
+            # while an older line is still being written. A newer benign line must not hide an older one.
+            try:
+                while True:
+                    pending = [t for t in list(sess._transcript_tasks) if not t.done()]
+                    if not pending:
+                        break
+                    await sess._shield_transcripts(pending)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001  (a failed transcript still leaves the earlier lines to check)
+                pass
             lines = []
             for message in sess.history:
                 if message.get("role") != "user":

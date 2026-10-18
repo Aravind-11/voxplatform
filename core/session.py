@@ -441,8 +441,14 @@ class Session:
 
     async def _finish_action(self, gen: _Generation) -> None:
         deadline = self.clock() + 30000.0
-        while self.tracker.buffered_ms() > 0 and self.clock() < deadline:   # the reply must finish playing first
+        # buffered_ms stays > 0 after clear() until the estimate catches up. A tentative barge
+        # must not take gen.after in that gap: a cough resumes the tail, a confirmed interrupt
+        # decides strict vs cancelled. Both cancel this wait.
+        while not gen.cancelled and self.clock() < deadline and (
+                gen.holding or self.tracker.buffered_ms() > 0):
             await asyncio.sleep(0.05)
+        if gen.cancelled or gen.holding:
+            return
         a, gen.after = gen.after, None      # taken only now: a barge-in during the wait still sees it
         if a is not None:
             self._spawn_action(a)

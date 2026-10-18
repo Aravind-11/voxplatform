@@ -453,6 +453,66 @@ async def test_non_strict_hangup_is_cancelled_by_the_caller_talking():
     assert r.clears >= 1 and ended == []
 
 
+async def _park_hangup_tail(r, target_ms=430):
+    """Commit the goodbye and leave the drain inside _finish_action with audio still buffered."""
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    g = r.s._gen
+    assert g is not None and g.after is not None and not g.tasks[-1].done()
+    for _ in range(80):
+        if r.s.tracker.buffered_ms() <= target_ms:
+            break
+        r.clk.t += 32
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("playback buffer did not reach the barge window")
+    assert r.s.tracker.is_playing()
+    return g
+
+
+async def _elapse_playout_wait(r):
+    """Let _finish_action's poll observe a clock that has moved past the buffered goodbye.
+
+    frames() only steps the clock between feeds. The hang-up wait sleeps on its own, and a
+    real clock keeps running there, so the same step has to happen across that sleep.
+    """
+    r.clk.t += r.s.tracker.buffered_ms() + 50
+    await asyncio.sleep(0.1)
+    await r.settle()
+
+
+async def test_short_barge_does_not_hang_up_while_the_goodbye_is_still_paused():
+    r, ended = _hangup_rig(strict=True)
+    g = await _park_hangup_tail(r)
+    await r.frames("s", 6)             # 192 ms: pause only, about 250 ms of goodbye left
+    assert g.holding and 200 <= r.s.tracker.buffered_ms() <= 300
+    await _elapse_playout_wait(r)      # shorter than the silence that will abort this cough
+    assert ended == [] and g.holding and g.after is not None
+    await r.frames("q", 8)             # silence: the burst was a cough, so the tail resumes
+    await r.settle()
+    assert ended == [] and "user_interrupted" not in r.types()
+    assert r.last("barge_aborted")["text"] == "then."
+    assert "then." in r.tts.texts
+    assert "[interrupted]" not in (r.s.history[-1].get("content") or "")
+    r.clk.t += 5000                    # strict hang-up still runs once that resumed tail finishes
+    await asyncio.sleep(0.2)
+    assert ended == [1]
+
+
+async def test_non_strict_hangup_does_not_run_when_the_buffer_ends_before_confirm():
+    r, ended = _hangup_rig(strict=False)
+    g = await _park_hangup_tail(r)
+    await r.frames("s", 6)
+    assert g.holding and 200 <= r.s.tracker.buffered_ms() <= 300 and r.s.turn.speech_ms < 400
+    await _elapse_playout_wait(r)
+    assert ended == [] and g.holding and r.s.turn.speech_ms < r.s.cfg.turn.barge_confirm_ms
+    await r.frames("s", 8)             # 14 speech frames: the pause becomes an interrupt
+    await r.settle()
+    assert r.s.stats["interruptions"] == 1 and ended == []
+    assert "call_action_done" not in r.types()
+
+
 # ---------------------------------------------------------------------------------- greeting
 async def test_greeting_is_spoken_first_without_a_model_call_and_enters_history():
     llm = FakeLLM([["Sure thing."]])

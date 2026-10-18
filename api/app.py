@@ -904,8 +904,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if call["status"] in ("created", "active"):
             store.update_call(call_id, status="ended", ended=time.time(), end_reason="stream_lost")
             limiter.release(call["tenant_id"], call_id)            # frees the dead node's slot at once
+        # resumeReason "transfer" belongs only to the call transfer-result created. Copying it would make
+        # this dropped stream keep the "not available" greeting instead of the cut-off line.
+        carried = {k: v for k, v in meta.items() if k != "resumeReason"}
         nxt = store.create_call(call["tenant_id"], call["agent_id"], "twilio", call["config"],
-                                {**meta, "resumedFrom": call_id, "resumes": n + 1})
+                                {**carried, "resumedFrom": call_id, "resumes": n + 1})
         METRICS.inc("vox_call_resumes_total")
         store.audit(call["tenant_id"], "system", "call.resume", nxt["id"], {"from": call_id, "attempt": n + 1})
         return Response(stream_twiml(nxt), media_type="text/xml")

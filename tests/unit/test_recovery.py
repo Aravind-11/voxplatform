@@ -112,6 +112,31 @@ def test_failed_warm_transfer_keeps_history_and_the_apology():
     assert "not available" in sess.cfg.greeting and "cut off" not in sess.cfg.greeting
 
 
+def test_stream_loss_after_a_failed_transfer_is_not_labeled_transfer():
+    """The transfer apology is only for the call created by transfer-result. A later dropped stream is a reconnect."""
+    c, store, _ = make()
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a", "systemPrompt": "Be brief.", "greeting": "Hello!"},
+               headers={"X-API-Key": k}).json()
+    call = store.create_call(tid, a["id"], "twilio", a["config"], {"from": "+1555", "to": "+1666"})
+    store.add_message(call["id"], "user", "I want Tuesday at eleven.", time.time())
+    path, q = f"/twilio/transfer-result/{call['id']}", "to=billing"
+    form = {"DialCallStatus": "no-answer"}
+    assert c.post(f"{path}?{q}", data=form, headers=sign(f"{BASE}{path}?{q}", form)).status_code == 200
+    transferred = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == call["id"]][0]
+    assert transferred["metadata"].get("resumeReason") == "transfer"
+    store.update_call(transferred["id"], status="active")
+    assert "<Stream" in resume(c, transferred["id"]).text
+    lost = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == transferred["id"]][0]
+    assert lost["metadata"].get("resumeReason") != "transfer"
+    assert "resumeReason" not in lost["metadata"]
+    sess = c.app.state.runtime.build_session(lost, type("T", (), {"out_rate": 8000, "call_sid": "CA1",
+                                                                   "send_audio": lambda s, *a: None, "clear": lambda s: None,
+                                                                   "end": lambda s: None})())
+    assert "cut off" in sess.cfg.greeting and "not available" not in sess.cfg.greeting
+    assert "I want Tuesday at eleven." in [m["content"] for m in sess.history]
+
+
 def test_resumes_are_capped_so_a_broken_call_cannot_loop():
     c, store, _ = make()
     k, tid = tenant(c)

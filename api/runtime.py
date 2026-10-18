@@ -23,7 +23,12 @@ class LimitedTTS:
 
     def __init__(self, inner, limit: int):
         self.inner, self.limit = inner, limit
-        self.sample_rate = inner.sample_rate
+
+    @property
+    def sample_rate(self) -> int:
+        # HttpTTS learns the rate from the WAV header during synthesize. A snapshot taken here
+        # would resample that audio at the default rate.
+        return self.inner.sample_rate
 
     async def synthesize(self, text: str):
         if LimitedTTS._sem is None:

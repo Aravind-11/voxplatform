@@ -3,7 +3,11 @@ import io
 import wave
 
 import numpy as np
+import pytest
 
+from api.runtime import LimitedTTS
+from core.audio import resample
+from core.session import Session, SessionConfig
 from core.tts import HttpTTS, make_tts_factory
 
 
@@ -57,6 +61,53 @@ async def test_http_tts_treats_a_headerless_body_as_raw_s16le():
     assert tts.sample_rate == 8000
     assert client.posts[0]["headers"] is None
     assert client.posts[0]["json"]["voice"] == "af_bella"
+
+
+async def test_http_tts_does_not_play_a_json_error_body():
+    client = _Client(b'{"error":"nope"}')
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client)
+    got = []
+    with pytest.raises(ValueError):
+        async for chunk in tts.synthesize("hello"):
+            got.append(chunk)
+    assert got == []
+
+
+async def test_wrapped_http_tts_is_resampled_at_the_wav_rate():
+    """VOX_TTS_CONCURRENCY wraps TTS, and that wrapper used to snapshot sample_rate at init.
+    A 16 kHz WAV was then resampled as 24 kHz."""
+    pcm = np.arange(160, dtype=np.int16)
+    client = _Client(_wav(pcm, 16000))
+    inner = HttpTTS("af_heart", "http://tts.local/v1", client, rate=24000)
+    wrapped = LimitedTTS(inner, 4)
+    sent = []
+
+    async def send(audio, rate):
+        sent.append((np.array(audio, copy=True), rate))
+
+    async def clear():
+        return None
+
+    class VAD:
+        def prob(self, frame):
+            return 0.0
+
+    class LLM:
+        async def stream(self, history, audio, followups, tools):
+            if False:
+                yield ""
+
+    sess = Session(llm=LLM(), tts=wrapped, vad=VAD(), send_audio=send, clear_audio=clear,
+                   clock=lambda: 0.0, cfg=SessionConfig(out_rate=8000, tts_poll_s=0))
+    sess.say("Hello.")
+    gen = sess._gen
+    assert gen is not None
+    await gen.tasks[-1]
+    assert wrapped.sample_rate == 16000
+    assert len(sent) == 1
+    assert sent[0][1] == 8000
+    assert sent[0][0].tolist() == resample(pcm, 16000, 8000).tolist()
+    assert len(sent[0][0]) != len(resample(pcm, 24000, 8000))
 
 
 def test_tts_url_selects_http_tts_for_every_voice():

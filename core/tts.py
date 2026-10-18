@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import wave
 from typing import AsyncIterator
 
@@ -147,7 +148,8 @@ class KokoroTTS:
 class HttpTTS:
     """OpenAI-compatible `POST {url}/audio/speech` with JSON `{model, voice, input}`.
 
-    A WAV response sets `sample_rate` from the header. Anything else is raw s16le at `rate`
+    A WAV response sets `sample_rate` from the header. A JSON or text body is refused
+    (an error document is not audio). Anything else is raw s16le at `rate`
     (`VOX_TTS_RATE`, default 24000). One response is one chunk.
     """
 
@@ -170,7 +172,7 @@ class HttpTTS:
         if hasattr(response, "raise_for_status"):
             response.raise_for_status()
         data = response.content
-        pcm, rate = _pcm_from_speech(data, self._default_rate)
+        pcm, rate = _pcm_from_speech(data, self._default_rate, _content_type(response))
         self.sample_rate = rate
         if len(pcm):
             yield pcm
@@ -192,7 +194,38 @@ def make_tts_factory(env, http):
     return lambda voice: KokoroTTS(voice=voice, pipeline=pipelines.for_voice(voice))
 
 
-def _pcm_from_speech(data: bytes, default_rate: int) -> tuple[np.ndarray, int]:
+def _content_type(response) -> str:
+    headers = getattr(response, "headers", None)
+    if headers is None or not hasattr(headers, "get"):
+        return ""
+    value = headers.get("content-type")
+    if not value and isinstance(headers, dict):
+        for key, item in headers.items():
+            if str(key).lower() == "content-type":
+                value = item
+                break
+    return str(value or "")
+
+
+def _json_document(data: bytes) -> bool:
+    """True when the whole body is a JSON object or array. A lone '{' byte is a PCM sample, not a document."""
+    try:
+        text = data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return False
+    if len(text) < 2 or text[0] not in "{[":
+        return False
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(value, (dict, list))
+
+
+def _pcm_from_speech(data: bytes, default_rate: int, content_type: str = "") -> tuple[np.ndarray, int]:
+    media = content_type.split(";")[0].strip().lower()
+    if media.startswith("text/") or "json" in media:
+        raise ValueError(f"TTS response is {media}, not audio")
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
         with wave.open(io.BytesIO(data), "rb") as w:
             channels, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
@@ -203,5 +236,7 @@ def _pcm_from_speech(data: bytes, default_rate: int) -> tuple[np.ndarray, int]:
         if channels > 1:
             pcm = pcm.reshape(-1, channels)[:, 0].copy()
         return pcm, rate
+    if _json_document(data):
+        raise ValueError("TTS response is JSON, not audio")
     even = data[: len(data) - (len(data) % 2)]
     return np.frombuffer(even, dtype=np.int16).copy(), default_rate

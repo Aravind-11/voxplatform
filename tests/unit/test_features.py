@@ -635,6 +635,41 @@ def test_outbound_holds_a_slot_while_dialing_and_releases_if_twilio_never_connec
     assert len(refused) == 1
 
 
+def test_outbound_non_json_success_releases_the_slot_and_ends_the_row():
+    """A 201 whose body is not JSON must not keep the reservation or leave /healthz failed."""
+    def html(req):
+        return httpx.Response(201, content=b"<html>queued</html>", headers={"content-type": "text/html"})
+
+    c, store, _ = make_outbound(html, node_max_calls=1)
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551234567"}, headers=H(k))
+    assert r.status_code == 502
+    assert c.app.state.limiter.local_active() == 0 and c.get("/healthz").status_code == 200
+    row = store.list_calls(tid)[0]
+    assert row["status"] == "ended" and row["end_reason"] == "twilio_rejected"
+
+    def ok(req):
+        return httpx.Response(201, json={"sid": "CA1"})
+
+    c2, store2, _ = make_outbound(ok, node_max_calls=1)
+    k2, tid2 = tenant(c2, limit=10)
+    a2 = c2.post("/v1/agents", json={"name": "a"}, headers=H(k2)).json()
+    orig = store2.update_call
+
+    def boom(call_id, **fields):
+        if "metadata" in fields:
+            raise RuntimeError("disk full")
+        return orig(call_id, **fields)
+
+    store2.update_call = boom
+    r2 = c2.post("/v1/calls/outbound", json={"agentId": a2["id"], "to": "+15551234567"}, headers=H(k2))
+    assert r2.status_code == 502
+    assert c2.app.state.limiter.local_active() == 0 and c2.get("/healthz").status_code == 200
+    row2 = store2.list_calls(tid2)[0]
+    assert row2["status"] == "ended" and row2["end_reason"] == "twilio_rejected"
+
+
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)
 def test_drain_stops_new_calls_but_reports_readiness():
     from test_api import speech, silence
@@ -916,6 +951,163 @@ def test_sip_call_holds_a_slot_until_the_uuid_arrives_and_releases_if_it_never_d
                 break
             time.sleep(0.05)
         assert freed and store.list_calls(tid) == []
+
+
+def _sip_app(port, store, lim, ag, node_max_calls=1):
+    from api.app import create_app
+    from api.runtime import Runtime
+    from test_api import FakeLLM, FakeTTS, FakeVAD
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    return create_app(store, rt, lim, None,
+                      Settings(admin_key="adm", audiosocket_port=port, audiosocket_agent=ag["id"],
+                               node_max_calls=node_max_calls))
+
+
+def _free_port():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_stalled_sip_uuid_read_releases_the_slot(monkeypatch):
+    """One byte and a peer that stays open must not hold the only slot past the UUID deadline."""
+    import socket
+    from api import security
+    from api.store import Store
+    from starlette.testclient import TestClient
+    monkeypatch.setattr("api.app.AUDIOSOCKET_UUID_TIMEOUT_S", 0.4)
+    port = _free_port()
+    store = Store()
+    tid = store.create_tenant("a", 10)
+    ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "Hi", "tools": []})
+    lim = security.ConcurrencyLimiter(4)
+    app = _sip_app(port, store, lim, ag)
+    sock = None
+    try:
+        with TestClient(app) as client:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+            sock.sendall(b"\x01")
+            held = False
+            for _ in range(40):
+                if lim.local_active() == 1:
+                    held = True
+                    break
+                time.sleep(0.02)
+            assert held and client.get("/healthz").status_code == 503
+            freed = False
+            for _ in range(40):
+                if lim.local_active() == 0:
+                    freed = True
+                    break
+                time.sleep(0.05)
+            assert freed and store.list_calls(tid) == []
+            assert client.get("/healthz").status_code == 200
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def test_sip_shutdown_releases_a_stalled_uuid_read(monkeypatch):
+    import socket
+    from api import security
+    from api.store import Store
+    from starlette.testclient import TestClient
+    monkeypatch.setattr("api.app.AUDIOSOCKET_UUID_TIMEOUT_S", 30)
+    port = _free_port()
+    store = Store()
+    tid = store.create_tenant("a", 10)
+    ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "Hi", "tools": []})
+    lim = security.ConcurrencyLimiter(4)
+    app = _sip_app(port, store, lim, ag)
+    sock = None
+    try:
+        with TestClient(app) as client:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+            sock.sendall(b"\x01")
+            held = False
+            for _ in range(50):
+                if lim.local_active() == 1:
+                    held = True
+                    break
+                time.sleep(0.02)
+            assert held and client.get("/healthz").json()["nodeFull"] is True
+        assert lim.local_active() == 0 and store.list_calls(tid) == []
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def test_sip_admit_failure_ends_the_row_and_does_not_rewrite_a_reject():
+    import socket
+    import uuid
+    from api import security
+    from api.store import Store
+    from starlette.testclient import TestClient
+    from transports import audiosocket as A
+    port = _free_port()
+    store = Store()
+    tid = store.create_tenant("a", 10)
+    ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "Hi", "tools": []})
+    lim = security.ConcurrencyLimiter(4)
+    app = _sip_app(port, store, lim, ag)
+    orig = store.update_call
+
+    def boom(call_id, **fields):
+        if fields.get("status") == "active":
+            raise RuntimeError("active write failed")
+        return orig(call_id, **fields)
+
+    store.update_call = boom
+    sock = None
+    try:
+        with TestClient(app):
+            sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+            sock.sendall(A.pack(A.KIND_UUID, uuid.uuid4().bytes))
+            row = None
+            for _ in range(50):
+                calls = store.list_calls(tid)
+                if calls and calls[0]["status"] == "ended":
+                    row = calls[0]
+                    break
+                time.sleep(0.05)
+            assert row is not None and row["end_reason"] == "admit_failed"
+            assert lim.local_active() == 0
+    finally:
+        if sock is not None:
+            sock.close()
+        store.update_call = orig
+
+    # Drain wins inside admit and ends the row before the exception. The finally must leave that reason.
+    port2 = _free_port()
+    app2 = _sip_app(port2, store, lim, ag)
+    sock2 = None
+    try:
+        with TestClient(app2) as client:
+            sock2 = socket.create_connection(("127.0.0.1", port2), timeout=5)
+            held = False
+            for _ in range(50):
+                if lim.local_active() == 1:
+                    held = True
+                    break
+                time.sleep(0.02)
+            assert held
+            client.app.state.draining = True
+            sock2.sendall(A.pack(A.KIND_UUID, uuid.uuid4().bytes))
+            row = None
+            for _ in range(50):
+                calls = [c for c in store.list_calls(tid) if c["end_reason"] == "draining"]
+                if calls:
+                    row = calls[0]
+                    break
+                time.sleep(0.05)
+            assert row is not None and row["status"] == "ended" and row["end_reason"] == "draining"
+            assert lim.local_active() == 0
+    finally:
+        if sock2 is not None:
+            sock2.close()
 
 
 def test_node_cap_zero_admits_a_second_call_and_healthz_stays_ready():

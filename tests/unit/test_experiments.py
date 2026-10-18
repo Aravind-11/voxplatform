@@ -7,7 +7,7 @@ from starlette.testclient import TestClient
 from api import security
 from api.app import Settings, create_app
 from api.experiments import ExperimentError, choose_variant, validate_experiment
-from api.runtime import Runtime, _count
+from api.runtime import Runtime
 from api.store import Store
 from core.metrics import METRICS
 from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD, make, sign, tenant
@@ -60,6 +60,8 @@ def test_choose_variant_is_deterministic_and_respects_a_1_99_split():
     for vid, cid in sample.items():
         assert choose_variant(SPLIT, cid)["id"] == vid
         assert choose_variant(SPLIT, cid) == choose_variant(SPLIT, cid)
+    # sha256 puts this id on A. Python's hash() puts it on B for seeds 0, 1, and 2.
+    assert choose_variant(SPLIT, "call_48")["id"] == "A"
 
 
 def test_agent_save_rejects_a_zero_weight_and_keeps_a_valid_experiment():
@@ -73,12 +75,24 @@ def test_agent_save_rejects_a_zero_weight_and_keeps_a_valid_experiment():
     assert c.post("/v1/agents", json={"name": "n", "experiment": dup}, headers=h).status_code == 422
     too_many = {"id": "exp1", "variants": [{"id": str(i), "weight": 1} for i in range(5)]}
     assert c.post("/v1/agents", json={"name": "n", "experiment": too_many}, headers=h).status_code == 422
+    four = {"id": "exp4", "variants": [{"id": f"v{i}", "weight": 1} for i in range(4)]}
+    saved_four = c.post("/v1/agents", json={"name": "four", "experiment": four}, headers=h)
+    assert saved_four.status_code == 200
+    assert [v["id"] for v in saved_four.json()["config"]["experiment"]["variants"]] == ["v0", "v1", "v2", "v3"]
+    assert [v["id"] for v in store.get_agent_any(saved_four.json()["id"])["config"]["experiment"]["variants"]] == ["v0", "v1", "v2", "v3"]
     bad_voice = {"id": "exp1", "variants": [{"id": "A", "weight": 1, "voice": "not_a_voice"}]}
     assert c.post("/v1/agents", json={"name": "n", "experiment": bad_voice}, headers=h).status_code == 422
     saved = c.post("/v1/agents", json={"name": "n", "systemPrompt": "base", "experiment": EXP}, headers=h)
     assert saved.status_code == 200
     assert saved.json()["config"]["experiment"]["id"] == "exp1"
     assert c.patch(f"/v1/agents/{saved.json()['id']}", json={"experiment": zero}, headers=h).status_code == 422
+    assert store.get_agent_any(saved.json()["id"])["config"]["experiment"]["variants"][0]["weight"] == 50
+    negative = {"id": "exp1", "variants": [{"id": "A", "weight": -1, "voice": "af_heart"},
+                                           {"id": "B", "weight": 50, "voice": "af_bella"}]}
+    posted = c.post("/v1/agents", json={"name": "neg", "experiment": negative}, headers=h)
+    assert posted.status_code == 422 and "positive number" in posted.json()["detail"]
+    patched = c.patch(f"/v1/agents/{saved.json()['id']}", json={"experiment": negative}, headers=h)
+    assert patched.status_code == 422 and "positive number" in patched.json()["detail"]
     assert store.get_agent_any(saved.json()["id"])["config"]["experiment"]["variants"][0]["weight"] == 50
 
 
@@ -418,12 +432,59 @@ def test_blank_variant_prompt_keeps_the_agent_prompt_and_blank_model_does_not_wr
         voices.clear()
 
 
+def _turn_total(label=None) -> float:
+    prefix = "vox_turns_total " if label is None else f'vox_turns_total{{variant="{label}"}} '
+    for line in METRICS.render().splitlines():
+        if line.startswith(prefix):
+            return float(line[len(prefix):])
+    return 0.0
+
+
 def test_turn_metric_labels_the_variant_without_dropping_the_unlabeled_series():
-    _count({"type": "user_end_of_turn"})
-    _count({"type": "user_end_of_turn"}, "A")
-    text = METRICS.render()
-    assert any(line.startswith("vox_turns_total ") for line in text.splitlines())
-    assert 'vox_turns_total{variant="A"}' in text
+    """The label has to come from the session callback. Calling _count directly stays green if that wiring drops it."""
+    _, store, _ = make()
+    tid = store.create_tenant("t")
+    rt = Runtime(FakeLLM(), lambda voice: FakeTTS(), FakeVAD, store)
+    exp = {"id": "exp1", "variants": [{"id": "A", "weight": 1, "voice": "af_heart"}]}
+    call = store.create_call(tid, None, "webSocket", {"systemPrompt": "p", "experiment": exp}, {})
+    sess = rt.build_session(call, T())
+    vid = store.get_call_any(call["id"])["metadata"]["variant"]
+    assert vid == "A"
+    labeled, plain = _turn_total(vid), _turn_total()
+    sess.on_event({"type": "user_end_of_turn"})
+    assert _turn_total(vid) == labeled + 1
+    assert _turn_total() == plain
+
+    bare = store.create_call(tid, None, "webSocket", {"systemPrompt": "plain"}, {})
+    sess2 = rt.build_session(bare, T())
+    assert "variant" not in (store.get_call_any(bare["id"])["metadata"] or {})
+    labeled, plain = _turn_total(vid), _turn_total()
+    sess2.on_event({"type": "user_end_of_turn"})
+    assert _turn_total() == plain + 1
+    assert _turn_total(vid) == labeled
+
+
+def test_experiment_report_counts_only_the_latest_1000_calls_and_omits_first_audio():
+    c, store, _ = make()
+    key, tid = tenant(c)
+    h = {"X-API-Key": key}
+    exp = {"id": "exp-window", "variants": [{"id": "A", "weight": 1}, {"id": "B", "weight": 1}]}
+    assert c.post("/v1/agents", json={"name": "n", "experiment": exp}, headers=h).status_code == 200
+    old = store.create_call(tid, None, "webSocket", {}, {"experiment": "exp-window", "variant": "A"})
+    mid = store.create_call(tid, None, "webSocket", {}, {"experiment": "exp-window", "variant": "B"})
+    fillers = [store.create_call(tid, None, "webSocket", {}, {}) for _ in range(999)]
+    # old is 1001st (1000 newer). mid has 60 newer rows: inside the latest 1000, outside the latest 50.
+    store._x("UPDATE calls SET created=? WHERE id=?", (0.0, old["id"]))
+    store._x("UPDATE calls SET created=? WHERE id=?", (940.0, mid["id"]))
+    for i, filler in enumerate(fillers):
+        created = float(i + 1) if i < 939 else float(941 + (i - 939))
+        store._x("UPDATE calls SET created=? WHERE id=?", (created, filler["id"]))
+    report = c.get("/v1/experiments/exp-window", headers=h)
+    assert report.status_code == 200
+    body = report.json()
+    assert set(body) == {"id", "variants"} and body["id"] == "exp-window"
+    assert all(set(row) == {"id", "calls"} for row in body["variants"])
+    assert {row["id"]: row["calls"] for row in body["variants"]} == {"A": 0, "B": 1}
 
 
 def _transfer_note(who):

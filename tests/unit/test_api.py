@@ -689,6 +689,31 @@ def test_resume_points_the_new_leg_at_its_own_status_callback():
     assert call["id"] not in posted["StatusCallback"]
 
 
+def test_transfer_result_points_the_return_leg_at_its_own_status_callback():
+    """A 2xx missed-transfer must register the new leg, not the parent the Dial already replaced."""
+    from urllib.parse import parse_qs
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append(req)
+        return httpx.Response(200, json={"sid": "CA9"})
+
+    c, store, lim = _make_twilio_rest(handler, node_max_calls=1)
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "n", "systemPrompt": "Be brief.", "greeting": "Hello!"},
+               headers={"X-API-Key": k}).json()
+    parent = store.create_call(tid, a["id"], "twilio", a["config"], {"from": "+1555", "to": "+1666", "callSid": "CA9"})
+    path, q = f"/twilio/transfer-result/{parent['id']}", "to=billing"
+    miss = {"DialCallStatus": "no-answer", "CallSid": "CA9"}
+    r = c.post(f"{path}?{q}", data=miss, headers=sign(f"https://vox.example.com{path}?{q}", miss))
+    assert "<Stream" in r.text and lim.local_active() == 1
+    back = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == parent["id"]]
+    assert len(back) == 1 and len(seen) == 1
+    posted = {key: vals[0] for key, vals in parse_qs(seen[0].content.decode()).items()}
+    assert posted["StatusCallback"].endswith(f"/twilio/status/{back[0]['id']}")
+    assert parent["id"] not in posted["StatusCallback"]
+
+
 def test_greeting_is_part_of_the_agent_and_is_spoken_on_a_browser_call():
     c, store, _ = make()
     k, _ = tenant(c)

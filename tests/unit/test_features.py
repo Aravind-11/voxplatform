@@ -658,16 +658,16 @@ def test_outbound_non_json_success_releases_the_slot_and_ends_the_row():
     orig = store2.update_call
 
     def boom(call_id, **fields):
-        if "metadata" in fields:
-            raise RuntimeError("disk full")
-        return orig(call_id, **fields)
+        raise RuntimeError("disk full")
 
     store2.update_call = boom
     r2 = c2.post("/v1/calls/outbound", json={"agentId": a2["id"], "to": "+15551234567"}, headers=H(k2))
     assert r2.status_code == 502
+    # The ended write throws too. The slot must already be gone; the row stays created.
     assert c2.app.state.limiter.local_active() == 0 and c2.get("/healthz").status_code == 200
     row2 = store2.list_calls(tid2)[0]
-    assert row2["status"] == "ended" and row2["end_reason"] == "twilio_rejected"
+    assert row2["status"] == "created" and not row2["end_reason"]
+    store2.update_call = orig
 
 
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)
@@ -1005,6 +1005,14 @@ def test_stalled_sip_uuid_read_releases_the_slot(monkeypatch):
                 time.sleep(0.05)
             assert freed and store.list_calls(tid) == []
             assert client.get("/healthz").status_code == 200
+            # Abort drops the socket. A drain/_close path would have written the hangup frame first.
+            from transports.audiosocket import KIND_HANGUP, pack
+            sock.settimeout(1)
+            try:
+                peer = sock.recv(64)
+            except OSError:
+                peer = b""
+            assert not peer.startswith(pack(KIND_HANGUP))
     finally:
         if sock is not None:
             sock.close()
@@ -1034,6 +1042,9 @@ def test_sip_shutdown_releases_a_stalled_uuid_read(monkeypatch):
                     break
                 time.sleep(0.02)
             assert held and client.get("/healthz").json()["nodeFull"] is True
+            exit_at = time.perf_counter()
+        # Shutdown must abort the accepted writer. Waiting out the 30s UUID deadline also frees the slot.
+        assert time.perf_counter() - exit_at < 2.0
         assert lim.local_active() == 0 and store.list_calls(tid) == []
     finally:
         if sock is not None:

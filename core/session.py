@@ -125,7 +125,8 @@ class Session:
         self._last_eot: Optional[float] = None
         self._eot_task: Optional[asyncio.Task] = None
         self.turn = TurnManager(self.cfg.turn, eot_scorer=self._eot_score if eot_fn else None)
-        self.tracker = PlaybackTracker(clock, self.cfg.output_latency_ms)
+        self.tracker = PlaybackTracker(clock, self.cfg.output_latency_ms,
+                                       mark_timeout_ms=self.cfg.mark_timeout_ms)
         self.history: list[dict] = [{"role": "system", "content": self.cfg.system_prompt}]
         self._pre: deque[np.ndarray] = deque(maxlen=self.cfg.pre_roll_frames)
         self._utt: list[np.ndarray] = []
@@ -153,9 +154,15 @@ class Session:
         if self.cfg.greeting.strip():
             self.say(self.cfg.greeting.strip())
 
+    def _drop_finished_playback(self) -> None:
+        """Forget chunks once playback has finished. A later turn must not inherit their acks."""
+        if not self.tracker.is_playing():
+            self.tracker.reset()
+
     def say(self, text: str) -> None:
         """Speaks fixed text with no model call. It is a normal committed reply: the caller can talk over it
         (barge-in) and the history keeps only what they heard."""
+        self._drop_finished_playback()
         gen = _Generation(np.zeros(0, np.int16), list(self.history), self.clock())
         gen.committed = True
         gen.commit.set()
@@ -206,6 +213,7 @@ class Session:
         elif g and not g.committed:
             await self._cancel(g)
             self._gen = None
+        self._drop_finished_playback()
         self.stats["turns"] += 1
         self.history.append({"role": "user", "content": text})
         base = list(self.history)
@@ -299,6 +307,7 @@ class Session:
 
     # ----------------------------------------------------------- generation
     def _start_generation(self) -> None:
+        self._drop_finished_playback()
         audio = np.concatenate(self._utt) if self._utt else np.zeros(0, np.int16)
         gen = _Generation(audio, list(self.history), self._last_speech_clock)
         gen.tasks = [asyncio.create_task(self._produce(gen)), asyncio.create_task(self._synth(gen)),

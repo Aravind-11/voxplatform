@@ -7,8 +7,10 @@ The tracker models the far end as a continuous jitter buffer: audio we send play
 starting no earlier than when it was sent (+ a fixed output latency). At the moment of
 interruption we can then work out which chunks finished playing and how far into the
 current chunk playback got. A transport that echoes playback marks (Twilio `mark`) corrects
-that estimate: until the first mark returns, the clock still applies; after it, a chunk counts
-as heard only when its mark was acked.
+that estimate: until the first mark of this playback returns, the clock still applies; after
+it, a chunk counts as heard only when its mark was acked. A missing mark stops blocking the
+call `mark_timeout_ms` after the clock estimate. Chunks from a playback that has finished are
+not part of the next one.
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ class _Chunk:
 class PlaybackTracker:
     clock: Callable[[], float]          # ms, monotonic
     output_latency_ms: float = 0.0      # network + device delay before the caller hears audio
+    mark_timeout_ms: float = 1500.0     # stop blocking this long after the clock estimate
     _chunks: list[_Chunk] = field(default_factory=list)
     _free_at: float = 0.0
     pending_marks: dict[str, int] = field(default_factory=dict)  # unacked mark name -> chunk index
@@ -66,15 +69,22 @@ class PlaybackTracker:
     def _trust_marks(self) -> bool:
         return bool(self._acked)
 
+    def _blocking_on_marks(self) -> bool:
+        # A lost echo must not keep lookahead or barge-in waiting past the give-up window.
+        return bool(self.pending_marks) and self.clock() < self.ends_at() + self.mark_timeout_ms
+
     def buffered_ms(self) -> float:
         """Audio already sent but not yet played (how far ahead of the listener we are)."""
         if self._trust_marks():
-            return sum(c.dur_ms for i, c in enumerate(self._chunks) if i not in self._acked)
+            if self._blocking_on_marks():
+                return sum(c.dur_ms for i, c in enumerate(self._chunks) if i not in self._acked)
+            if not self.pending_marks:
+                return 0.0
         return max(0.0, self._free_at - self.clock())
 
     def is_playing(self) -> bool:
         if self.pending_marks or self._acked:
-            return bool(self.pending_marks)   # an armed mark that has not been acked
+            return self._blocking_on_marks()
         return bool(self._chunks) and self.clock() < self._free_at
 
     def reset(self) -> None:

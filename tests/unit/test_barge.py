@@ -82,7 +82,9 @@ def test_trim_history_variants():
 
 def test_acked_mark_limits_what_was_heard_even_if_the_clock_is_ahead():
     clk = Clock()
-    tr = PlaybackTracker(clk)
+    # Give-up window is longer than this jump: a clock far past the audio still does not
+    # count an unacked chunk as heard, and the unacked duration stays buffered.
+    tr = PlaybackTracker(clk, mark_timeout_ms=60_000)
     tr.on_sent("Hello there friend.", 1000)
     tr.arm_mark("m1")
     tr.on_sent("How can I help you today?", 2000)
@@ -257,3 +259,169 @@ def test_twilio_session_waits_on_marks_and_a_browser_session_does_not():
             return None
     other = store.create_call(tid, None, "sip", {"systemPrompt": "p"}, {})
     assert rt.build_session(other, PhoneNoMarks()).cfg.output_latency_ms == 0
+
+
+def test_missing_mark_stops_blocking_after_the_timeout_but_a_late_echo_still_counts():
+    clk = Clock()
+    tr = PlaybackTracker(clk, mark_timeout_ms=1500)
+    tr.on_sent("Hello there friend.", 1000)
+    tr.arm_mark("m1")
+    tr.on_sent("How can I help you today?", 2000)
+    tr.arm_mark("m2")
+    tr.note_mark("m1")
+    clk.t = tr.ends_at() + 100
+    assert tr.is_playing() and tr.buffered_ms() == 2000
+    clk.t = tr.ends_at() + 1500
+    assert not tr.is_playing() and tr.buffered_ms() == 0
+    assert tr.heard() == ("Hello there friend.", True)
+    tr.note_mark("m2")  # armed through the give-up; the echo is late, not unknown
+    assert tr.heard() == ("Hello there friend. How can I help you today?", False)
+    assert not tr.is_playing() and tr.buffered_ms() == 0
+
+
+def _clock_heard(chunks, now):
+    parts: list[str] = []
+    cut = False
+    for c in chunks:
+        if now >= c.start_ms + c.dur_ms:
+            parts.append(c.text)
+        elif now > c.start_ms:
+            words = c.text.split()
+            k = int(len(words) * ((now - c.start_ms) / c.dur_ms))
+            if k > 0:
+                parts.append(" ".join(words[:k]))
+            cut = True
+            break
+        else:
+            cut = True
+            break
+    return " ".join(parts).strip(), cut
+
+
+async def test_acked_mark_does_not_block_the_tool_followup_past_the_timeout():
+    """Once a mark has been acked, unacked audio still counts against lookahead — but only until
+    mark_timeout_ms after the clock estimate. The deferred hang-up then runs with no further ack."""
+    ended = []
+
+    async def hang(args):
+        async def after():
+            ended.append(1)
+        return ToolResult({"ok": True}, after=after, strict=True)
+
+    llm = FakeLLM([
+        ["Goodbye now. ", "Please hold the line a moment longer now. ", ToolCall("h", "hang", {})],
+        ["Thanks for calling today friend."],
+    ])
+    r = Rig(llm, tts=FakeTTS(word_ms=200), tools={"hang": hang},
+            cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500, tts_lookahead_ms=1500))
+    _mark_sending(r)
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    assert r.tts.texts == ["Goodbye now.", "Please hold the line a moment longer now."]
+    assert set(r.s.tracker.pending_marks) == {"m1", "m2"} and not r.s._gen.produce_done
+    r.s.tracker.note_mark("m1")
+    # Clock buffer would already release the follow-up; the unacked mark must still hold it.
+    r.clk.t = r.s.tracker.ends_at() - 100
+    assert r.s.tracker.ends_at() - r.clk.t < r.s.cfg.tts_lookahead_ms
+    assert r.s.tracker.buffered_ms() > r.s.cfg.tts_lookahead_ms and r.s.tracker.is_playing()
+    await asyncio.sleep(0.2)
+    assert r.tts.texts == ["Goodbye now.", "Please hold the line a moment longer now."]
+    assert ended == [] and not r.s._gen.produce_done
+    r.clk.t = r.s.tracker.ends_at() + r.s.cfg.mark_timeout_ms
+    await asyncio.sleep(0.2)
+    assert r.tts.texts == ["Goodbye now.", "Please hold the line a moment longer now.",
+                           "Thanks for calling today friend."]
+    assert ended == [] and r.s.tracker.pending_marks
+    r.clk.t = r.s.tracker.ends_at() + r.s.cfg.mark_timeout_ms
+    await asyncio.sleep(0.2)
+    assert ended == [1] and r.s.tracker.pending_marks
+
+
+async def test_lost_last_mark_does_not_barge_in_after_the_timeout():
+    llm = FakeLLM([
+        ["Hello there friend. ", "How can I help you today?"],
+        ["Next reply here."],
+    ])
+    r = Rig(llm, cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500))
+    _mark_sending(r)
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    assert r.tts.texts == ["Hello there friend.", "How can I help you today?"]
+    r.s.tracker.note_mark("m1")
+    assert r.s.tracker.is_playing() and r.s.tracker.buffered_ms() == 480
+    r.clk.t = r.s.tracker.ends_at() + r.s.cfg.mark_timeout_ms
+    assert not r.s.tracker.is_playing() and r.s.tracker.buffered_ms() == 0
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    assert r.clears == 0 and r.s.stats["interruptions"] == 0
+    assistants = [m["content"] for m in r.s.history if m["role"] == "assistant"]
+    assert assistants == ["Hello there friend. How can I help you today?", "Next reply here."]
+
+
+async def test_later_turn_barge_in_hears_only_that_turn_until_its_own_mark():
+    llm = FakeLLM([
+        ["Hello there friend."],
+        ["One two three four five. ", "Six seven eight nine ten."],
+    ])
+    r = Rig(llm, tts=FakeTTS(word_ms=200), cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500))
+    _mark_sending(r)
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    assert r.tts.texts == ["Hello there friend."]
+    for name in list(r.s.tracker.pending_marks):
+        r.s.tracker.note_mark(name)
+    assert not r.s.tracker.is_playing() and not r.s._agent_active()
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    chunks = list(r.s.tracker._chunks)
+    assert [c.text for c in chunks] == ["One two three four five.", "Six seven eight nine ten."]
+    # No ack for this playback yet: the buffer follows the clock, not the previous turn's marks.
+    assert r.s.tracker.buffered_ms() == r.s.tracker.ends_at() - r.clk.t
+    assert r.s.tracker.heard()[0] != "Hello there friend."
+    second = chunks[1]
+    n_quiet = round((second.start_ms + 400 - r.clk.t - 5 * 32) / 32)
+    assert n_quiet > 0
+    interrupt_at = r.clk.t + (n_quiet + 5) * 32
+    expect, expect_cut = _clock_heard(chunks, interrupt_at)
+    assert expect.startswith("One two three four five.") and "Hello" not in expect and expect_cut
+    await r.frames("q", n_quiet)
+    await r.frames("s", 6)
+    await r.settle()
+    ev = r.last("user_interrupted")
+    assert ev["t"] == interrupt_at
+    assert ev["heard"] == expect and ev["cut"] is True
+    assert r.s.history[-3]["content"] == "Hello there friend."
+    assert r.s.history[-1]["content"] == expect + " [interrupted]"
+
+
+async def test_say_and_inject_drop_a_finished_playback_before_their_own_audio():
+    r = Rig(FakeLLM([["One two three four five."]]), tts=FakeTTS(word_ms=200),
+            cfg=SessionConfig(tts_poll_s=0))
+    _mark_sending(r)
+    r.s.say("Hello there friend.")
+    await r.settle()
+    for name in list(r.s.tracker.pending_marks):
+        r.s.tracker.note_mark(name)
+    assert not r.s.tracker.is_playing()
+    r.clk.t = 5000
+    r.s.say("One two three four five.")
+    await r.settle()
+    assert [c.text for c in r.s.tracker._chunks] == ["One two three four five."]
+    assert "Hello" not in r.s.tracker.heard()[0]
+
+    r2 = Rig(FakeLLM([["One two three four five."]]), tts=FakeTTS(word_ms=200),
+             cfg=SessionConfig(tts_poll_s=0))
+    _mark_sending(r2)
+    r2.s.tracker.on_sent("Hello there friend.", 600)
+    r2.s.tracker.arm_mark("old")
+    r2.s.tracker.note_mark("old")
+    r2.clk.t = 5000
+    await r2.s.inject_text("42")
+    await r2.settle()
+    assert [c.text for c in r2.s.tracker._chunks] == ["One two three four five."]
+    assert "Hello" not in r2.s.tracker.heard()[0]

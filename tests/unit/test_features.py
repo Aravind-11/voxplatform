@@ -765,6 +765,9 @@ def test_sip_answered_by_survives_call_sid_and_hangs_up_when_not_live(monkeypatc
             return httpx.Response(204)
         args = req.url.params.get("appArgs", "")
         cid = args.split(",", 1)[1] if str(args).startswith("amd,") else ""
+        channel_id = str(req.url.params.get("channelId") or "")
+        assert channel_id, "originate must pass channelId"
+        race["channel_id"] = channel_id
         if cid and race["during"]:
             transport = httpx.ASGITransport(app=app_box["app"])
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -773,8 +776,11 @@ def test_sip_answered_by_survives_call_sid_and_hangs_up_when_not_live(monkeypatc
                 assert res.status_code == 200, res.text
                 race["amd"] = res.json()
                 during = app_box["store"].get_call_any(cid)["metadata"]
-                assert during["answeredBy"] == "machine_end_beep" and "callSid" not in during
-        return httpx.Response(200, json={"id": race["sid"]})
+                assert during["answeredBy"] == "machine_end_beep" and during.get("callSid") == channel_id
+                assert during["deal"] == "42" and during["voicemail"] == "leave this"
+        # While the response is in flight the stored id is the one we allocated. A later body id wins.
+        body_id = channel_id if race["during"] else race["sid"]
+        return httpx.Response(200, json={"id": body_id})
 
     race["sid"] = "chan-9"
     c, store, rt = make_outbound(handler, sip_token="s3cret")
@@ -787,11 +793,11 @@ def test_sip_answered_by_survives_call_sid_and_hangs_up_when_not_live(monkeypatc
     assert r.status_code == 200, r.text
     cid = r.json()["id"]
     meta = store.get_call_any(cid)["metadata"]
-    assert meta["answeredBy"] == "machine_end_beep" and meta["callSid"] == "chan-9"
+    assert meta["answeredBy"] == "machine_end_beep" and meta["callSid"] == race["channel_id"]
     assert meta["deal"] == "42" and meta["voicemail"] == "leave this"
     assert meta["from"] == "+15550001111" and meta["to"] == "+15552223333" and meta["direction"] == "outbound"
-    assert race["amd"]["action"] == "none"
-    assert deleted == ["http://asterisk:8088/ari/channels/chan-9"]
+    assert race["amd"]["action"] == "hangup"
+    assert deleted == [f"http://asterisk:8088/ari/channels/{race['channel_id']}"]
     assert store.get_call_any(cid)["status"] == "ended"
     assert cid not in rt.live
 
@@ -989,6 +995,188 @@ def test_audiosocket_adopts_outbound_row_and_binds_the_ari_channel(monkeypatch):
     c2, *_ = make_outbound(lambda req: httpx.Response(500))
     assert c2.post("/sip/bind", data={"uuid": audio, "channelId": "chan-9"},
                    headers={"X-Vox-Sip-Token": "s3cret"}).status_code == 404
+
+
+def test_sip_machine_hangup_retries_unless_the_delete_finished(monkeypatch):
+    """A timeout or HTTP 5xx is not a finished hang-up: the row stays created and the next AMD deletes again.
+    HTTP 404 means the channel is already gone, so the row stays ended and a retry does not DELETE."""
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    mode = {"delete": "timeout"}
+    deletes = []
+
+    def handler(req: httpx.Request):
+        if req.method != "DELETE":
+            return httpx.Response(200, json={"id": "chan-9"})
+        deletes.append(str(req.url))
+        kind = mode["delete"]
+        if kind == "timeout":
+            raise httpx.ReadTimeout("timed out", request=req)
+        if kind == "500":
+            return httpx.Response(500, json={"message": "down"})
+        if kind == "404":
+            return httpx.Response(404, json={"message": "Channel not found"})
+        return httpx.Response(204)
+
+    c, store, _rt = make_outbound(handler, sip_token="s3cret")
+    k, _ = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    token = {"X-Vox-Sip-Token": "s3cret"}
+
+    def place() -> str:
+        r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                               "voicemailMessage": "leave this"}, headers=H(k))
+        assert r.status_code == 200, r.text
+        return r.json()["id"]
+
+    def amd(cid: str):
+        return c.post(f"/sip/amd/{cid}", data={"AnsweredBy": "machine_end_beep"}, headers=token)
+
+    cid = place()
+    first = amd(cid)
+    assert first.status_code == 502, first.text
+    row = store.get_call_any(cid)
+    assert row["status"] == "created" and not row.get("end_reason")
+    assert row["metadata"]["answeredBy"] == "machine_end_beep" and row["metadata"]["callSid"] == "chan-9"
+    assert len(deletes) == 1 and deletes[0].endswith("/ari/channels/chan-9")
+    mode["delete"] = "ok"
+    second = amd(cid)
+    assert second.status_code == 200 and second.json()["action"] == "hangup"
+    assert len(deletes) == 2 and deletes[1].endswith("/ari/channels/chan-9")
+    assert store.get_call_any(cid)["status"] == "ended"
+
+    mode["delete"] = "500"
+    cid = place()
+    n = len(deletes)
+    bad = amd(cid)
+    assert bad.status_code == 502, bad.text
+    assert store.get_call_any(cid)["status"] == "created" and not store.get_call_any(cid).get("end_reason")
+    assert len(deletes) == n + 1
+    mode["delete"] = "ok"
+    again = amd(cid)
+    assert again.status_code == 200 and again.json()["action"] == "hangup"
+    assert len(deletes) == n + 2 and store.get_call_any(cid)["status"] == "ended"
+
+    mode["delete"] = "404"
+    cid = place()
+    n = len(deletes)
+    gone = amd(cid)
+    assert gone.status_code == 200 and gone.json()["action"] == "hangup", gone.text
+    assert store.get_call_any(cid)["status"] == "ended"
+    assert store.get_call_any(cid)["end_reason"] == "machine_end_beep"
+    assert len(deletes) == n + 1
+    retry = amd(cid)
+    assert retry.status_code == 200 and retry.json()["action"] == "hangup"
+    assert len(deletes) == n + 1
+    assert store.get_call_any(cid)["status"] == "ended"
+
+
+def test_empty_answered_by_does_not_erase_machine_end(monkeypatch):
+    """An empty AnsweredBy must not clear machine_end, including one posted while originate is in flight.
+    The originated channel is still deleted. A later non-empty value may replace the stored one."""
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    app_box = {}
+    deleted = []
+
+    async def handler(req: httpx.Request):
+        if req.method == "DELETE":
+            deleted.append(str(req.url))
+            return httpx.Response(204)
+        args = str(req.url.params.get("appArgs") or "")
+        cid = args.split(",", 1)[1] if args.startswith("amd,") else ""
+        if cid and not app_box.get("posted"):
+            app_box["posted"] = True
+            transport = httpx.ASGITransport(app=app_box["app"])
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                headers = {"X-Vox-Sip-Token": "s3cret"}
+                first = await client.post(f"/sip/amd/{cid}", data={"AnsweredBy": "machine_end_beep"}, headers=headers)
+                app_box["first"] = (first.status_code, first.json())
+                app_box["n1"] = len(deleted)
+                second = await client.post(
+                    f"/sip/amd/{cid}", content=b"not-json",
+                    headers={**headers, "Content-Type": "application/json"})
+                app_box["second"] = (second.status_code, second.json())
+                app_box["n2"] = len(deleted)
+                app_box["mid"] = app_box["store"].get_call_any(cid)["metadata"].get("answeredBy")
+        return httpx.Response(200, json={"id": req.url.params.get("channelId") or "chan-9"})
+
+    c, store, _rt = make_outbound(handler, sip_token="s3cret")
+    app_box["app"] = c.app
+    app_box["store"] = store
+    k, _ = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                           "voicemailMessage": "leave this"}, headers=H(k))
+    assert r.status_code == 200, r.text
+    cid = r.json()["id"]
+    meta = store.get_call_any(cid)["metadata"]
+    assert app_box["first"][0] == 200 and app_box["mid"] == "machine_end_beep"
+    assert app_box["second"] == (200, {"action": "none", "answeredBy": "machine_end_beep"})
+    assert app_box["n1"] == app_box["n2"]
+    assert meta["answeredBy"] == "machine_end_beep" and meta.get("callSid")
+    assert deleted and any(meta["callSid"] in url for url in deleted)
+    token = {"X-Vox-Sip-Token": "s3cret"}
+    human = c.post(f"/sip/amd/{cid}", json={"AnsweredBy": "human"}, headers=token)
+    assert human.status_code == 200 and human.json()["answeredBy"] == "human"
+    assert store.get_call_any(cid)["metadata"]["answeredBy"] == "human"
+    assert store.get_call_any(cid)["metadata"]["callSid"] == meta["callSid"]
+
+    tid = store.get_call_any(cid)["tenant_id"]
+    row = store.create_call(tid, None, "sip", {}, {"voicemail": "x", "callSid": "chan-z", "deal": "9"})
+    n = len(deleted)
+    blank = c.post(f"/sip/amd/{row['id']}", content=b"{", headers={**token, "Content-Type": "application/json"})
+    assert blank.status_code == 200 and blank.json() == {"action": "none", "answeredBy": ""}
+    assert "answeredBy" not in store.get_call_any(row["id"])["metadata"] and len(deleted) == n
+    machine = c.post(f"/sip/amd/{row['id']}", data={"AnsweredBy": "machine_end_beep"}, headers=token)
+    assert machine.status_code == 200 and machine.json()["action"] == "hangup"
+    kept = store.get_call_any(row["id"])
+    assert kept["metadata"]["answeredBy"] == "machine_end_beep" and kept["metadata"]["deal"] == "9"
+    assert kept["status"] == "ended"
+    assert any(url.endswith("/ari/channels/chan-z") for url in deleted[n:])
+    n2 = len(deleted)
+    again = c.post(f"/sip/amd/{row['id']}", content=b"", headers={**token, "Content-Type": "application/json"})
+    assert again.json() == {"action": "none", "answeredBy": "machine_end_beep"}
+    assert store.get_call_any(row["id"])["metadata"]["answeredBy"] == "machine_end_beep"
+    assert len(deleted) == n2
+
+
+def test_sip_originate_timeout_deletes_the_allocated_channel(monkeypatch):
+    """Originate names the channel before the request. A lost response still DELETEs that id and ends the row."""
+    from urllib.parse import parse_qs, urlparse
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+
+    def run(exc: Exception) -> None:
+        seen = []
+
+        def handler(req: httpx.Request):
+            seen.append((req.method, str(req.url)))
+            if req.method == "DELETE":
+                return httpx.Response(204)
+            raise exc
+
+        c, store, _rt = make_outbound(handler, sip_token="s3cret")
+        k, tid = tenant(c)
+        a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+        r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip"},
+                   headers=H(k))
+        assert r.status_code == 502 and "could not reach Asterisk" in r.text and type(exc).__name__ in r.text
+        assert "Twilio" not in r.text
+        post = next(url for method, url in seen if method == "POST")
+        channel_id = parse_qs(urlparse(post).query)["channelId"][0]
+        deletes = [url for method, url in seen if method == "DELETE"]
+        assert len(deletes) == 1 and deletes[0].rstrip("/").endswith("/ari/channels/" + channel_id)
+        assert "api.twilio.com" not in post and "api.twilio.com" not in deletes[0]
+        row = store.list_calls(tid)[0]
+        assert row["status"] == "ended" and row["end_reason"] == "asterisk_unreachable"
+        assert row["metadata"]["callSid"] == channel_id
+
+    run(httpx.ReadTimeout("timed out"))
+    run(httpx.ConnectError("refused"))
 
 
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)

@@ -8,6 +8,8 @@ from typing import Any, Optional, Protocol
 from urllib.parse import quote
 from xml.sax.saxutils import escape, quoteattr
 
+import httpx
+
 # A dotted Asterisk uniqueid (1730000000.42) is one segment. "/", "?", and a bare ".." are not.
 _SAFE_CHANNEL = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~-")
 
@@ -79,10 +81,12 @@ def _channel_segment(call_sid: str) -> str:
 
 
 class AsteriskCallControl:
-    """ARI. `originate` enters Stasis app `vox` (this process does not run that app). `appArgs` of
-    `amd,<call id>` tells it to POST AnsweredBy to /sip/amd/<call id>. Cold `transfer` is a blind
-    redirect of the Asterisk channel id, not the AudioSocket UUID. Warm mode is refused: ARI has no
-    whisper-and-return dial, and a successful redirect would tell the model the warm transfer started."""
+    """ARI. `originate` enters Stasis app `vox` (this process does not run that app) and can send
+    `channelId` so a lost response still names the channel. `appArgs` of `amd,<call id>` tells it to
+    POST AnsweredBy to /sip/amd/<call id>. `transfer` redirects a channel that is already in Stasis.
+    A live SIP call is in AudioSocket, where redirect is HTTP 409, so the transfer tool does not call
+    it: it stores the number and drops the AudioSocket so the dialplan can Dial. Warm mode is refused
+    here too. `hangup` treats HTTP 404 as the channel already being gone."""
 
     def __init__(self, client: Any, ari_url: str, user: str = "", password: str = ""):
         self.client = client
@@ -92,10 +96,12 @@ class AsteriskCallControl:
     def _auth(self) -> tuple:
         return (self.user, self.password)
 
-    async def originate(self, to: str, from_: str, twiml_or_app: Any = None) -> Any:
+    async def originate(self, to: str, from_: str, twiml_or_app: Any = None, *, channel_id: str = "") -> Any:
         params = {"endpoint": f"PJSIP/{to}@voxsun", "app": "vox", "callerId": from_ or ""}
         if isinstance(twiml_or_app, str) and twiml_or_app:
             params["appArgs"] = twiml_or_app
+        if channel_id:
+            params["channelId"] = channel_id
         return await self.client.post(f"{self.ari_url}/ari/channels", params=params, auth=self._auth(), timeout=15)
 
     def _channel_url(self, call_sid: str) -> str:
@@ -112,9 +118,14 @@ class AsteriskCallControl:
             raise RuntimeError(f"asterisk transfer failed: HTTP {r.status_code}")
 
     async def hangup(self, call_sid: str) -> None:
-        r = await self.client.delete(self._channel_url(call_sid), auth=self._auth(), timeout=10)
-        if r.status_code >= 300:
-            raise RuntimeError(f"asterisk hangup failed: HTTP {r.status_code}")
+        try:
+            r = await self.client.delete(self._channel_url(call_sid), auth=self._auth(), timeout=10)
+        except httpx.TransportError as e:
+            # A timeout or a dropped connection did not finish the DELETE. Callers retry.
+            raise RuntimeError(f"asterisk hangup failed: {type(e).__name__}") from e
+        if r.status_code < 300 or r.status_code == 404:
+            return
+        raise RuntimeError(f"asterisk hangup failed: HTTP {r.status_code}")
 
 
 def control_from_env(client: Any, public_url: str = "", medium: Optional[str] = None) -> Optional[CallControl]:

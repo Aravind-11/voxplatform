@@ -176,6 +176,23 @@ def make(defn: dict, ctx, client):
         if isinstance(control, AsteriskCallControl) and mode == "warm":
             # Blind redirect is not a whisper-and-return. Reporting success would make the model hang up on the caller.
             return {"error": "warm transfer is not available on SIP calls"}
+        # AudioSocket is not Stasis, so POST /redirect answers 409. Store the number first and, after the
+        # goodbye, drop the audio leg. The dialplan then dials it. No store, no success payload.
+        record = getattr(ctx, "record_sip_transfer", None)
+        if isinstance(control, AsteriskCallControl) and record is not None:
+            if not getattr(ctx, "call_id", ""):
+                return {"error": "transfer is only available on a live phone call"}
+            try:
+                stored = bool(record(number))
+            except Exception:  # noqa: BLE001
+                stored = False
+            if not stored:
+                return {"error": "transfer could not be stored"}
+
+            async def drop_audio() -> None:
+                await ctx.end()
+
+            return ToolResult({"transferring": to}, after=drop_audio, strict=True)
         if not ctx.call_sid:
             # A controller from the environment used to skip this check and report success with no channel.
             return {"error": "transfer is only available on a live phone call"}

@@ -413,6 +413,22 @@ class Store:
         r = self._one(sql, args)
         return self._call(r) if r else None
 
+    def find_sip_by_audio_uuid(self, audio_uuid: str) -> Optional[dict]:
+        """Newest sip call with this AudioSocket UUID, including one that has already ended.
+        The dialplan reads a transfer target after the audio leg drops and the row is ended."""
+        if not audio_uuid:
+            return None
+        if self.pg:
+            sql = ("SELECT * FROM calls WHERE medium=? AND metadata::json->>? = ? "
+                   "ORDER BY created DESC LIMIT 1")
+            args = ("sip", "audioSocketUuid", audio_uuid)
+        else:
+            sql = ("SELECT * FROM calls WHERE medium=? AND json_extract(metadata, ?) = ? "
+                   "ORDER BY created DESC LIMIT 1")
+            args = ("sip", "$.audioSocketUuid", audio_uuid)
+        r = self._one(sql, args)
+        return self._call(r) if r else None
+
     # ---- usage
     def usage(self, tenant_id: str, days: int = 30) -> dict:
         """Totals plus per-day and per-agent breakdowns (UTC days) over the last `days` days."""

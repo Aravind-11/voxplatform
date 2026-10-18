@@ -231,27 +231,97 @@ def _ari_runtime(monkeypatch):
     return rt, seen
 
 
-async def test_sip_transfer_uses_the_ari_channel_not_the_audiosocket_uuid(monkeypatch):
-    """The AudioSocket UUID is not an ARI channel. Redirect the bound uniqueid, or return an error and post nothing."""
-    from urllib.parse import parse_qs, urlsplit
+async def test_sip_transfer_stores_the_target_instead_of_a_409_redirect(monkeypatch):
+    """AudioSocket is not Stasis, so ARI redirect is 409. Do not report success for that redirect.
+    Store the number, drop the audio leg, and that number is what the dialplan dials. No store, no success payload."""
+    from pathlib import Path
+    from api.app import Settings, create_app
+    from api import security
+    from core.session import ToolResult
     audio = "11111111-1111-1111-1111-111111111111"
-    rt, seen = _ari_runtime(monkeypatch)
-    cold = {"id": "c1", "tenant_id": "t1", "medium": "sip", "metadata": {"callSid": "1730000000.42",
-            "audioSocketUuid": audio}, "config": _spec()}
-    result = await rt.build_session(cold, _sip_phone(audio)).tools["transfer"]({"to": "billing"})
-    assert seen == []
-    await result.after()
-    assert len(seen) == 1 and "1730000000.42" in seen[0] and audio not in seen[0]
-    assert "api.twilio.com" not in seen[0]
-    q = parse_qs(urlsplit(seen[0]).query)
-    assert q["endpoint"] == ["PJSIP/+15551230001"] and "@voxsun" not in q["endpoint"][0]
+    seen = []
 
-    seen.clear()
-    missing = {"id": "c2", "tenant_id": "t1", "medium": "sip", "metadata": {"audioSocketUuid": audio}, "config": _spec()}
-    err = await rt.build_session(missing, _sip_phone(audio)).tools["transfer"]({"to": "billing"})
-    if not isinstance(err, dict):
-        await err.after()
-    assert isinstance(err, dict) and "error" in err and seen == []
+    def handler(req: httpx.Request):
+        seen.append((req.method, str(req.url)))
+        return httpx.Response(409, json={"message": "Channel not in Stasis application"})
+
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACx")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "t")
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store, http=http, public_url="https://vox.example.com")
+    app = create_app(store, rt, security.ConcurrencyLimiter(2), None,
+                     Settings(sip_token="s3cret", public_base_url="https://vox.example.com"))
+    row = store.create_call("t1", None, "sip", _spec(), {"callSid": "1730000000.42", "audioSocketUuid": audio})
+    ended = []
+    events = []
+
+    class Phone:
+        out_rate = 8000
+        call_sid = audio
+
+        async def end(self):
+            ended.append("end")
+
+        async def send_audio(self, *a):
+            return None
+
+        def clear(self):
+            return None
+
+    # Not in the store: redirect would 409, and the model must not be told the transfer started.
+    ghost = {"id": "missing", "tenant_id": "t1", "medium": "sip", "metadata": {"callSid": "1730000000.42",
+             "audioSocketUuid": audio}, "config": _spec()}
+    err = await rt.build_session(ghost, Phone()).tools["transfer"]({"to": "billing"})
+    assert isinstance(err, dict) and "error" in err and not isinstance(err, ToolResult)
+    assert ended == [] and seen == []
+
+    # No AudioSocket UUID: nothing for the dialplan to look up, so this is not success either.
+    no_audio = store.create_call("t1", None, "sip", _spec(), {"callSid": "1730000000.99"})
+    err = await rt.build_session(no_audio, Phone()).tools["transfer"]({"to": "billing"})
+    assert isinstance(err, dict) and "error" in err and ended == [] and seen == []
+    assert "transferTo" not in (store.get_call_any(no_audio["id"])["metadata"] or {})
+
+    sess = rt.build_session(row, Phone())
+    result = await sess.tools["transfer"]({"to": "billing"})
+    assert isinstance(result, ToolResult) and result.content == {"transferring": "billing"}
+    assert seen == []
+    sess.on_event = events.append
+    await sess._run_action(result)
+    assert ended == ["end"] and seen == []
+    assert not any(e.get("type") == "error" for e in events)
+    assert any(e.get("type") == "call_action_done" for e in events)
+    meta = store.get_call_any(row["id"])["metadata"]
+    assert meta["transferTo"] == "+15551230001" and meta["audioSocketUuid"] == audio
+    assert "1730000000.42" == meta["callSid"]
+
+    dialplan = (Path(__file__).resolve().parents[2] / "deploy/sip/extensions.conf").read_text()
+    after = dialplan.split("AudioSocket(", 1)[1]
+    assert "/sip/transfer?uuid=${AS_UUID}" in after
+    assert 'GotoIf($["${VOX_XFER}" = ""]?done)' in after
+    assert "GotoIf($[${LEN(${VOX_XFER})} < 8]?done)" in after
+    assert "Dial(PJSIP/${VOX_XFER})" in after and "@voxsun" not in after and "/redirect" not in after
+    assert "n(done),Hangup()" in after
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        denied = await client.get("/sip/transfer", params={"uuid": audio})
+        assert denied.status_code == 403
+        res = await client.get("/sip/transfer", params={"uuid": audio}, headers={"X-Vox-Sip-Token": "s3cret"})
+        assert res.status_code == 200 and res.text == "+15551230001"
+        assert f"PJSIP/{res.text}" == "PJSIP/+15551230001" and "@voxsun" not in f"PJSIP/{res.text}"
+        upper = await client.get("/sip/transfer", params={"uuid": audio.upper()}, headers={"X-Vox-Sip-Token": "s3cret"})
+        assert upper.text == "+15551230001"
+        store.update_call(row["id"], status="ended", ended=1.0, end_reason="agent_hangup")
+        still = await client.get("/sip/transfer", params={"uuid": audio}, headers={"X-Vox-Sip-Token": "s3cret"})
+        assert still.text == "+15551230001"
+        other = "22222222-2222-2222-2222-222222222222"
+        store.create_call("t1", None, "sip", {}, {"audioSocketUuid": other})
+        empty = await client.get("/sip/transfer", params={"uuid": other}, headers={"X-Vox-Sip-Token": "s3cret"})
+        assert empty.status_code == 200 and empty.text == ""
 
 
 async def test_sip_warm_transfer_does_not_redirect(monkeypatch):

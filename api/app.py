@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Optional, Union
 from xml.sax.saxutils import quoteattr
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
@@ -46,7 +47,7 @@ class Settings:
     audiosocket_port: int = 0          # >0: listen for Asterisk AudioSocket connections (the SIP path) on this TCP port
     audiosocket_agent: str = ""        # agent id that answers calls arriving on that port
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
-    sip_token: str = ""                  # shared secret for POST /sip/amd and POST /sip/bind; empty disables those routes (404)
+    sip_token: str = ""                  # shared secret for /sip/amd, /sip/bind, and /sip/transfer; empty disables them (404)
 
 
 class AgentIn(BaseModel):
@@ -891,7 +892,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             bound = str((call.get("metadata") or {}).get("callSid") or "")
             if bound:
                 app.state.sip_by_channel[bound] = call["id"]
-            tr.call_sid = bound  # never the AudioSocket UUID: transfer and ARI hangup both read this
+            tr.call_sid = bound  # never the AudioSocket UUID: ARI hangup reads metadata callSid, not this transport id
             state["call"] = call
             state["t"] = admit(call)
             return runtime.build_session(call, tr)
@@ -1033,14 +1034,23 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not isinstance(ctl, AsteriskCallControl):
             return ""
         # Mark ended before the DELETE await so a concurrent AudioSocket cannot adopt this row.
+        # Only a finished DELETE (2xx, or 404 already gone) keeps that mark. A timeout, connect
+        # error, or HTTP 5xx clears it and reopens the row this attempt ended, so a later
+        # /sip/amd deletes the channel again instead of treating the hang-up as done.
         app.state.sip_machine_done[call_id] = "hangup"
-        store.update_call(call_id, status="ended", ended=time.time(), end_reason=answered[:80])
+        reason = answered[:80]
+        we_ended = cur["status"] == "created"
+        if we_ended:
+            store.update_call(call_id, status="ended", ended=time.time(), end_reason=reason)
         try:
             await ctl.hangup(channel)
-        except RuntimeError as e:
+        except (RuntimeError, httpx.TransportError) as e:
             app.state.sip_machine_done.pop(call_id, None)
-            store.update_call(call_id, status="created", ended=None, end_reason=None)
-            raise HTTPException(502, str(e)) from e
+            if we_ended:
+                latest = store.get_call_any(call_id)
+                if latest and latest.get("status") == "ended" and (latest.get("end_reason") or "") == reason:
+                    store.update_call(call_id, status="created", ended=None, end_reason=None)
+            raise HTTPException(502, str(e) or type(e).__name__) from e
         return "hangup"
 
     @app.post("/v1/calls/outbound")
@@ -1090,9 +1100,20 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         call = store.create_call(t["id"], body.agentId, "sip" if channel == "sip" else "twilio", cfg, meta)
         if channel == "sip":
             # appArgs is how the Stasis app learns the call id. It POSTs AnsweredBy to /sip/amd/{id}.
+            # channelId is stored before the request so a lost response can still DELETE that channel.
             app_args = f"amd,{call['id']}" if body.voicemailMessage else None
+            channel_id = uuidlib.uuid4().hex
+            store.merge_call_metadata(call["id"], {"callSid": channel_id})
+            app.state.sip_by_channel[channel_id] = call["id"]
             try:
-                r = await control.originate(body.to, caller_id, app_args)
+                r = await control.originate(body.to, caller_id, app_args, channel_id=channel_id)
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                try:
+                    await control.hangup(channel_id)
+                except Exception:  # noqa: BLE001  (best-effort; the row is still a failure)
+                    pass
+                store.update_call(call["id"], status="ended", ended=time.time(), end_reason="asterisk_unreachable")
+                raise HTTPException(502, f"could not reach Asterisk: {type(e).__name__}") from e
             except Exception as e:  # noqa: BLE001
                 store.update_call(call["id"], status="ended", ended=time.time(), end_reason="asterisk_unreachable")
                 raise HTTPException(502, f"could not reach Asterisk: {type(e).__name__}") from e
@@ -1109,6 +1130,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 sid = ""
             if not isinstance(sid, str):
                 sid = str(sid)
+            if not sid:
+                sid = channel_id
         else:
             twiml = stream_twiml(call)
             data = {"To": body.to, "From": caller_id, "Twiml": twiml,
@@ -1219,11 +1242,19 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not store.get_call_any(call_id):
             raise HTTPException(404, "call not found")
         fields = await sip_fields(request)
-        answered = str(fields.get("AnsweredBy") or fields.get("answeredBy") or "")
+        answered = str(fields.get("AnsweredBy") or fields.get("answeredBy") or "").strip()
+        if not answered:
+            # Missing or invalid JSON is an empty result. Do not erase a machine_end already stored,
+            # and do not run the hang-up on a blank value.
+            cur = store.get_call_any(call_id)
+            if not cur:
+                raise HTTPException(404, "call not found")
+            kept = str((cur.get("metadata") or {}).get("answeredBy") or "")
+            return {"action": "none", "answeredBy": kept}
         # Merge only answeredBy so a callSid stored while this request was in flight is not dropped.
         if store.merge_call_metadata(call_id, {"answeredBy": answered}) is None:
             raise HTTPException(404, "call not found")
-        METRICS.inc("vox_amd_total", answered_by=answered or "unknown")
+        METRICS.inc("vox_amd_total", answered_by=answered)
         if answered.startswith("machine_end"):
             action = await sip_machine(call_id)
             if action:
@@ -1232,8 +1263,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     @app.post("/sip/bind")
     async def sip_bind(request: Request, x_vox_sip_token: str = Header(default="")):
-        """Dialplan posts CHANNEL(uniqueid) and the AudioSocket UUID before AudioSocket() opens. Transfer uses that
-        uniqueid. The AudioSocket UUID is not an ARI channel and must not be redirected or deleted."""
+        """Dialplan posts CHANNEL(uniqueid) and the AudioSocket UUID before AudioSocket() opens. Machine hangup
+        deletes that uniqueid. The AudioSocket UUID is not an ARI channel and must not be redirected or deleted."""
         require_sip_token(x_vox_sip_token)
         fields = await sip_fields(request)
         try:
@@ -1248,5 +1279,19 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                                      {"audioSocketUuid": audio_uuid, "callSid": channel_id, "channel": "sip"})
             app.state.sip_by_channel[channel_id] = found["id"]
         return {"ok": True, "uuid": audio_uuid, "channelId": channel_id}
+
+    @app.get("/sip/transfer")
+    async def sip_transfer(request: Request, x_vox_sip_token: str = Header(default="")):
+        """Dialplan reads the cold-transfer number after AudioSocket returns. Empty body means Hangup."""
+        require_sip_token(x_vox_sip_token)
+        try:
+            audio_uuid = str(uuidlib.UUID(str(request.query_params.get("uuid") or "")))
+        except ValueError:
+            return PlainTextResponse("")
+        found = store.find_sip_by_audio_uuid(audio_uuid)
+        number = str(((found or {}).get("metadata") or {}).get("transferTo") or "")
+        if not E164.match(number):
+            number = ""
+        return PlainTextResponse(number)
 
     return app

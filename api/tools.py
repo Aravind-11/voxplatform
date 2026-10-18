@@ -67,6 +67,7 @@ class CallContext:
     base_url: str = ""                                              # public URL of this API (warm-transfer callbacks)
     call_control: Any = None                                        # TwilioCallControl or AsteriskCallControl; None uses ctx.twilio
     medium: str = ""                                                # sip, twilio, webSocket; which controller a live call may use
+    record_sip_transfer: Optional[Callable[[str], bool]] = None    # SIP: store the dialplan target; None keeps ARI redirect
 
 
 def _canon(args: dict) -> str:

@@ -167,10 +167,13 @@ class HttpTTS:
 
     async def synthesize(self, text: str) -> AsyncIterator[np.ndarray]:
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
+        # The shared AsyncClient defaults to 5s. Override it for this POST: a sentence can take
+        # longer than that to start, but a dead peer must still hit a finite read deadline.
         response = await self.client.post(
             f"{self.url}/audio/speech",
             json={"model": self.model, "voice": self.voice, "input": text, "response_format": "pcm"},
-            headers=headers)
+            headers=headers,
+            timeout=30)
         if hasattr(response, "raise_for_status"):
             response.raise_for_status()
         data = response.content

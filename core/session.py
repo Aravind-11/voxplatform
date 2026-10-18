@@ -427,6 +427,11 @@ class Session:
         parts = [p async for p in self.tts.synthesize(text)]
         self._emit("tts_done", ms=self.clock() - t_tts, chars=len(text))
         pcm = np.concatenate(parts) if parts else np.zeros(0, np.int16)
+        if pcm.size == 0:
+            # A 2xx body with no samples is not speech the caller heard. Raising here would make
+            # _synth drop every sentence still queued; skip this one and keep going.
+            self._emit("error", where="tts", error="empty audio")
+            return
         pcm = resample(pcm, self.tts.sample_rate, self.cfg.out_rate)
         gen.pending_ms += pcm_duration_ms(len(pcm), self.cfg.out_rate)
         await gen.outbox.put((text, pcm))

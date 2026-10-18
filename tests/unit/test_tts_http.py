@@ -34,9 +34,30 @@ class _Client:
     def __init__(self, content: bytes, headers=None):
         self.content, self.headers, self.posts = content, headers, []
 
-    async def post(self, url, json=None, headers=None):
-        self.posts.append({"url": url, "json": json, "headers": headers})
+    async def post(self, url, json=None, headers=None, **kwargs):
+        self.posts.append({"url": url, "json": json, "headers": headers, **kwargs})
         return _Resp(self.content, headers=self.headers)
+
+
+def _read_timeout_s(timeout) -> float:
+    """Read budget on the speech POST. A bare number applies to every phase, including read."""
+    if isinstance(timeout, (int, float)):
+        return float(timeout)
+    read = getattr(timeout, "read", None)
+    if read is None:
+        raise AssertionError(f"speech POST read timeout is not finite: {timeout!r}")
+    return float(read)
+
+
+class _Scripted:
+    """One body per POST, in order. Records keyword arguments the same way `_Client` does."""
+
+    def __init__(self, bodies: list[bytes]):
+        self.bodies, self.posts = list(bodies), []
+
+    async def post(self, url, json=None, headers=None, **kwargs):
+        self.posts.append({"url": url, "json": json, "headers": headers, **kwargs})
+        return _Resp(self.bodies.pop(0))
 
 
 async def test_http_tts_decodes_a_wav_to_int16():
@@ -165,3 +186,55 @@ def test_tts_url_selects_http_tts_for_every_voice():
     assert isinstance(a, HttpTTS) and isinstance(b, HttpTTS)
     assert a.url == "http://tts.local/v1" and a.model == "custom-voice" and a.api_key == "k"
     assert a.sample_rate == 16000 and b.voice == "af_bella" and a.client is client
+
+
+async def test_http_tts_speech_post_waits_longer_than_the_shared_client_default():
+    """api.main builds one httpx.AsyncClient() with a 5s read timeout. A sentence whose first
+    byte takes longer than that must not be a ReadTimeout, and a dead peer must still unblock."""
+    pcm = np.array([1, -1], np.int16)
+    client = _Client(pcm.tobytes())
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client)
+    out = [x async for x in tts.synthesize("hello")]
+    assert out[0].tolist() == [1, -1]
+    assert _read_timeout_s(client.posts[0]["timeout"]) >= 30
+
+
+async def test_empty_speech_body_is_not_stored_as_spoken_and_the_next_sentence_plays():
+    """A 2xx body with no samples is not audio the caller heard. Dropping it must not cancel
+    the rest of the reply the way a synthesize exception does."""
+    pcm = np.array([100, -100, 50], np.int16)
+    client = _Scripted([b"", pcm.tobytes()])
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client)
+    events, sent = [], []
+
+    async def send(audio, rate):
+        sent.append((np.array(audio, copy=True), rate))
+
+    async def clear():
+        return None
+
+    class VAD:
+        def prob(self, frame):
+            return 0.0
+
+    class LLM:
+        async def stream(self, history, audio, followups, tools):
+            if False:
+                yield ""
+
+    sess = Session(llm=LLM(), tts=tts, vad=VAD(), send_audio=send, clear_audio=clear,
+                   clock=lambda: 0.0, cfg=SessionConfig(out_rate=8000, tts_poll_s=0),
+                   on_event=events.append)
+    sess.say("Hello there friend. Second sentence is fine.")
+    gen = sess._gen
+    assert gen is not None
+    await gen.tasks[-1]
+    assert [p["json"]["input"] for p in client.posts] == [
+        "Hello there friend.", "Second sentence is fine."]
+    assert len(sent) == 1 and sent[0][1] == 8000
+    assert sent[0][0].tolist() == resample(pcm, 24000, 8000).tolist()
+    assert [e["text"] for e in events if e["type"] == "agent_speech"] == ["Second sentence is fine."]
+    assert gen.spoken == ["Second sentence is fine."]
+    assert sess.history[-1] == {"role": "assistant", "content": "Second sentence is fine."}
+    errors = [e for e in events if e["type"] == "error"]
+    assert len(errors) == 1 and errors[0]["where"] == "tts"

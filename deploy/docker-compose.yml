@@ -60,8 +60,8 @@ services:
 
   asterisk:
     # SIP front end for VoxSun or any SIP provider: `docker compose --profile sip up -d`. Configure deploy/sip/pjsip.conf first.
-    # One Asterisk is a single point of failure. `asterisk2` is the second registrar; put Kamailio
-    # (deploy/sip/kamailio.cfg) or carrier failover in front of both. See docs/SIP.md.
+    # One Asterisk is a single point of failure. This node registers the trunk and dials api1.
+    # Put Kamailio (deploy/sip/kamailio.cfg) or carrier failover in front of both. See docs/SIP.md.
     profiles: [ sip ]
     build: { context: ., dockerfile: Dockerfile.asterisk }
     hostname: asterisk
@@ -70,12 +70,16 @@ services:
     restart: unless-stopped
 
   asterisk2:
-    # Same image, profile sip. Both register to the carrier or sit behind a SIP proxy (deploy/sip/kamailio.cfg).
-    # Do not publish 5060 here: that host port belongs to `asterisk`. Give this node its own address, or let the proxy reach it on the compose network.
+    # Same image, profile sip, inbound only. It does not register, so it does not fight `asterisk` for one contact.
+    # Kamailio reaches it on the compose network; do not publish 5060 (that host port belongs to `asterisk`).
+    # AudioSocket goes to api2. The primary dialplan still dials api1.
     profiles: [ sip ]
     build: { context: ., dockerfile: Dockerfile.asterisk }
     hostname: asterisk2
     depends_on: [ api2 ]
+    volumes:
+      - ./sip/extensions.api2.conf:/etc/asterisk/extensions.conf:ro
+      - ./sip/pjsip.no-register.conf:/etc/asterisk/pjsip.register.conf:ro
     restart: unless-stopped
 
   postgres:

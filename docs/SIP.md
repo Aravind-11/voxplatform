@@ -29,17 +29,17 @@ Calls are stored with medium `sip`.
 4. Check: `docker compose exec asterisk asterisk -rx "pjsip show registrations"` and `... "module show like audiosocket"`.
 5. Call the VoxSun number. In the engine logs you should see a new `sip` call.
 
-Without Docker: install Asterisk 18+ (needs the AudioSocket modules), copy the four files from `deploy/sip/` to `/etc/asterisk/`, and run the engine with `VOX_AUDIOSOCKET_PORT=9092 VOX_AUDIOSOCKET_AGENT=<id> VOX_AUDIOSOCKET_HOST=127.0.0.1` (change `api1:9092` in `extensions.conf` to `127.0.0.1:9092`).
+Without Docker: install Asterisk 18+ (needs the AudioSocket modules), copy `deploy/sip/` into `/etc/asterisk/` (`pjsip.conf` includes `pjsip.register.conf`), and run the engine with `VOX_AUDIOSOCKET_PORT=9092 VOX_AUDIOSOCKET_AGENT=<id> VOX_AUDIOSOCKET_HOST=127.0.0.1` (change `api1:9092` in `extensions.conf` to `127.0.0.1:9092`).
 
 ## Known limits
 - **Caller number is not passed:** AudioSocket carries only a call UUID. The agent does not know who is calling until we add it (Asterisk can pass it another way; not built).
-- **One engine node per Asterisk:** the sample dialplan points at `api1`. For two SIP front ends and continuing a call whose node died, see below.
+- **One engine node per Asterisk:** `extensions.conf` dials `api1`. Compose service `asterisk2` mounts `extensions.api2.conf` (dials `api2`) and does not load the trunk registration. Continuing a call whose node died is below.
 - **Security:** the AudioSocket port has no authentication. Keep it on a private network and never publish it.
 - **Outbound calls over SIP** (through VoxSun's `calls/initiate`) are not built.
 - **Open ports for Asterisk:** UDP 5060 and the RTP range 10000-10100. Behind NAT, set the public address in `pjsip.conf`.
 - Asterisk is GPL-2.0 software run as a separate program; this repo does not include or link it. Get the same licence check you would for any GPL component.
 
 ## More than one Asterisk
-One Asterisk is a single point of failure. The intended layout is carrier failover, or Kamailio (`deploy/sip/kamailio.cfg`, not run in CI) in front of the compose services `asterisk` and `asterisk2` (both profile `sip`), plus a TCP load balancer in front of AudioSocket. Each API process still applies its own concurrency cap before it admits a call, so a dead node stops taking new sockets once the balancer stops using it.
+One Asterisk is a single point of failure. The intended layout is carrier failover, or Kamailio (`deploy/sip/kamailio.cfg`, not run in CI) in front of the compose services `asterisk` and `asterisk2` (both profile `sip`), plus a TCP load balancer in front of AudioSocket. Kamailio pins each INVITE by the last character of the Call-ID local-part (the character before `@`), not the host. Only `asterisk` registers to the carrier; `asterisk2` is inbound from that proxy and sends AudioSocket to `api2`. Each API process still applies its own concurrency cap before it admits a call, so a dead node stops taking new sockets once the balancer stops using it.
 
 If the AudioSocket stream ends and the engine did not hang up (`ended_by_us` is false), `finish` already stores `end_reason=stream_closed`. A re-dial does not know the old call id. Whoever still has the AudioSocket UUID (the dialplan's `CALLUUID`, or the proxy) POSTs it as `uuid` to `/sip/recover` with header `X-Vox-Sip-Token` (`VOX_SIP_TOKEN`). The handler finds the call by metadata `callSid` and, when the agent did not hang up, creates a new SIP call with `resumedFrom` set so the next session keeps the transcript. An empty token leaves the endpoint off. An agent hang-up is not resumed.

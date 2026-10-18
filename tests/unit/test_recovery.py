@@ -2,7 +2,11 @@
 <Redirect> after <Connect>; the server then hangs up (agent ended it) or reconnects the caller with the conversation."""
 import base64
 import json
+import os
+import re
+import socket
 import time
+import uuid
 
 import numpy as np
 
@@ -241,6 +245,348 @@ def test_unknown_or_browser_calls_just_hang_up_and_draining_node_refuses():
     assert "<Hangup/>" in resume(c, browser["id"]).text
     c.post("/admin/drain", headers={"X-Admin-Key": "adm"})
     assert resume(c, "call_x").status_code == 503
+
+
+def _poll(pred, seconds=2.0):
+    end = time.time() + seconds
+    while time.time() < end:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _sip_lab(concurrency=None):
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+
+    from api import security
+    from api.app import create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+    from transports import audiosocket as audio
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    tid = store.create_tenant("a", concurrency_limit=concurrency)
+    ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "Hello!", "tools": []})
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    settings = Settings(admin_key="adm", public_base_url=BASE, twilio_auth_token="tok", sip_token="sip-secret",
+                        audiosocket_port=port, audiosocket_agent=ag["id"])
+    lim = security.ConcurrencyLimiter(default_limit=4)
+    app = create_app(store, rt, lim, None, settings)
+    return SimpleNamespace(app=app, store=store, rt=rt, lim=lim, tid=tid, ag=ag, port=port,
+                           client=TestClient, audio=audio)
+
+
+def _lost_sip(lab, uid, *, status="active", hold_slot=False):
+    call = lab.store.create_call(lab.tid, lab.ag["id"], "sip", lab.ag["config"],
+                                 {"callSid": uid, "from": "+15550001", "to": "+15550002", "channel": "sip"})
+    if status == "active":
+        lab.store.update_call(call["id"], status="active", joined=time.time())
+        if hold_slot:
+            assert lab.lim.acquire(lab.tid, call["id"], 5)
+    else:
+        lab.store.update_call(call["id"], status="ended", ended=time.time(), joined=time.time(), end_reason=status)
+    lab.store.add_message(call["id"], "agent", "Hello, how can I help?", time.time())
+    lab.store.add_message(call["id"], "user", "I want Tuesday at eleven.", time.time())
+    return call
+
+
+def _open_uuid(lab, uid):
+    sock = socket.create_connection(("127.0.0.1", lab.port), timeout=5)
+    sock.settimeout(5)
+    sock.sendall(lab.audio.pack(lab.audio.KIND_UUID, uuid.UUID(uid).bytes))
+    return sock
+
+
+def _push_uuid(lab, uid):
+    """Send a uuid and wait until the server closes. Used when the socket must not join."""
+    sock = _open_uuid(lab, uid)
+    sock.settimeout(5)
+    seen_eof = False
+    try:
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except (ConnectionResetError, BrokenPipeError):
+                seen_eof = True
+                break
+            except socket.timeout:
+                break
+            if chunk == b"":
+                seen_eof = True
+                break
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return seen_eof
+
+
+def _history(sess):
+    return [(m["role"], m["content"]) for m in sess.history]
+
+
+def _wait_live(lab, call_id, seconds=2.0):
+    found = {}
+
+    def ready():
+        live = lab.rt.live.get(call_id)
+        if live:
+            found["live"] = live
+            return True
+        return False
+
+    assert _poll(ready, seconds), f"call {call_id} was not admitted"
+    return found["live"]
+
+
+def test_sip_recover_stops_at_two_resumes():
+    """Two successful SIP resumes then a third POST is the same cap as Twilio. A missing check would keep creating rows."""
+    c, store, _ = make(Settings(admin_key="adm", public_base_url=BASE, twilio_auth_token="tok", sip_token="sip-secret"))
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "n", "greeting": "Hello!"}, headers={"X-API-Key": k}).json()
+    call = store.create_call(tid, a["id"], "sip", a["config"], {"callSid": "sip-cap", "channel": "sip"})
+    store.update_call(call["id"], status="active", joined=time.time())
+    headers = {"X-Vox-Sip-Token": "sip-secret"}
+    cur = call["id"]
+    for _ in range(2):
+        r = c.post("/sip/recover", json={"uuid": "sip-cap"}, headers=headers)
+        assert r.status_code == 200 and r.json().get("callId") and r.json()["callId"] != cur
+        cur = r.json()["callId"]
+        store.update_call(cur, status="ended", ended=time.time(), joined=time.time(), end_reason="stream_closed")
+    assert len(store.list_calls(tid)) == 3
+    r = c.post("/sip/recover", json={"uuid": "sip-cap"}, headers=headers)
+    assert r.status_code == 200 and r.json() == {"action": "hangup", "reason": "resume cap"}
+    assert len(store.list_calls(tid)) == 3
+    last = store.get_call_any(cur)
+    assert last["status"] == "ended" and last["end_reason"] == "stream_closed"
+
+
+def test_rejected_resume_keeps_the_same_continuation_and_transcript():
+    """A full tenant cap must not spend the resume. Two rejected sockets and a retry POST stay on one call id."""
+    lab = _sip_lab(concurrency=1)
+    assert lab.store.get_tenant(lab.tid)["concurrency_limit"] == 1
+    uid = str(uuid.uuid4())
+    _lost_sip(lab, uid, status="stream_closed")
+    assert lab.lim.acquire(lab.tid, "blocker", 1)
+    headers = {"X-Vox-Sip-Token": "sip-secret"}
+    with lab.client(lab.app) as c:
+        first = c.post("/sip/recover", json={"uuid": uid}, headers=headers)
+        assert first.status_code == 200
+        cid = first.json()["callId"]
+        assert lab.store.get_call_any(cid)["metadata"]["resumes"] == 1
+        assert len(lab.store.list_calls(lab.tid)) == 2
+        assert _push_uuid(lab, uid)
+        row = lab.store.get_call_any(cid)
+        assert row["status"] == "created" and row.get("end_reason") is None and row.get("joined") is None
+        assert row["metadata"]["resumes"] == 1 and len(lab.store.list_calls(lab.tid)) == 2
+        assert lab.lim.total_active() == 1
+        # Admit's write stuck (handler died before restore): the retry POST must not mint resumes=2.
+        lab.store.update_call(cid, status="ended", ended=time.time(), end_reason="concurrency_limit")
+        again = c.post("/sip/recover", json={"uuid": uid}, headers=headers)
+        assert again.status_code == 200 and again.json()["callId"] == cid
+        row = lab.store.get_call_any(cid)
+        assert row["status"] == "created" and row.get("end_reason") is None and row["metadata"]["resumes"] == 1
+        assert len(lab.store.list_calls(lab.tid)) == 2
+        assert _push_uuid(lab, uid)
+        row = lab.store.get_call_any(cid)
+        assert row["status"] == "created" and row["metadata"]["resumes"] == 1
+        lab.lim.release(lab.tid, "blocker")
+        assert lab.lim.total_active() == 0
+        sock = _open_uuid(lab, uid)
+        try:
+            live = _wait_live(lab, cid)
+            body = _history(live[0])
+            assert ("assistant", "Hello, how can I help?") in body
+            assert ("user", "I want Tuesday at eleven.") in body
+            assert "cut off" in live[0].cfg.greeting
+            assert lab.store.get_call_any(cid)["metadata"]["resumes"] == 1
+            assert len(lab.store.list_calls(lab.tid)) == 2
+            assert lab.lim.total_active() == 1
+        finally:
+            try:
+                sock.sendall(lab.audio.pack(lab.audio.KIND_HANGUP))
+            except OSError:
+                pass
+            sock.close()
+        assert _poll(lambda: lab.store.get_call_any(cid)["status"] == "ended")
+        assert lab.lim.total_active() == 0
+
+
+def test_agent_hangup_then_same_audiosocket_uuid_does_not_create_a_call():
+    lab = _sip_lab()
+    uid = str(uuid.uuid4())
+    with lab.client(lab.app) as c:
+        sock = _open_uuid(lab, uid)
+        try:
+            assert _poll(lambda: bool(lab.rt.live))
+            cid = next(iter(lab.rt.live))
+            _sess, transport = lab.rt.live[cid]
+            fut = c.portal.start_task_soon(transport.end)
+            sock.settimeout(0.2)
+            deadline = time.time() + 3
+            while time.time() < deadline and not (
+                    fut.done() and lab.store.get_call_any(cid)["status"] == "ended"):
+                try:
+                    sock.recv(4096)
+                except socket.timeout:
+                    pass
+            fut.result(timeout=1)
+            assert lab.store.get_call_any(cid)["end_reason"] == "agent_hangup"
+            assert cid not in lab.rt.live
+        finally:
+            sock.close()
+        before = len(lab.store.list_calls(lab.tid))
+        assert before == 1
+        for reason_uid, reason in ((str(uuid.uuid4()), "transfer"), (str(uuid.uuid4()), "no_credit")):
+            seeded = lab.store.create_call(lab.tid, lab.ag["id"], "sip", lab.ag["config"],
+                                           {"callSid": reason_uid, "channel": "sip"})
+            lab.store.update_call(seeded["id"], status="ended", ended=time.time(), end_reason=reason)
+        assert _push_uuid(lab, uid)
+        assert len(lab.store.list_calls(lab.tid)) == before + 2
+        assert lab.store.get_call_any(cid)["status"] == "ended"
+        assert lab.store.get_call_any(cid)["end_reason"] == "agent_hangup"
+        assert not lab.rt.live
+        for reason in ("transfer", "no_credit"):
+            rows = [row for row in lab.store.list_calls(lab.tid) if row.get("end_reason") == reason]
+            assert len(rows) == 1
+            assert _push_uuid(lab, rows[0]["metadata"]["callSid"])
+            assert len([row for row in lab.store.list_calls(lab.tid) if row.get("end_reason") == reason]) == 1
+        assert len(lab.store.list_calls(lab.tid)) == before + 2
+
+
+def test_second_audiosocket_while_recovered_call_is_live_does_not_create_a_call():
+    lab = _sip_lab()
+    uid = str(uuid.uuid4())
+    call = _lost_sip(lab, uid, hold_slot=True)
+    headers = {"X-Vox-Sip-Token": "sip-secret"}
+    with lab.client(lab.app) as c:
+        recovered = c.post("/sip/recover", json={"uuid": uid}, headers=headers)
+        assert recovered.status_code == 200
+        cid = recovered.json()["callId"]
+        assert lab.lim.total_active() == 0
+        sock = _open_uuid(lab, uid)
+        try:
+            live = _wait_live(lab, cid)
+            assert ("user", "I want Tuesday at eleven.") in _history(live[0])
+            assert lab.lim.total_active() == 1
+            other = _open_uuid(lab, uid)
+            try:
+                other.settimeout(2)
+                closed = False
+                deadline = time.time() + 2
+                while time.time() < deadline:
+                    if len(lab.store.list_calls(lab.tid)) > 2 or lab.lim.total_active() > 1:
+                        break
+                    try:
+                        chunk = other.recv(64)
+                    except socket.timeout:
+                        continue
+                    if chunk == b"" or (chunk and chunk[0] == lab.audio.KIND_HANGUP):
+                        closed = True
+                        break
+                assert closed, "the duplicate socket joined the call"
+                assert len(lab.store.list_calls(lab.tid)) == 2
+                assert lab.lim.total_active() == 1
+                assert list(lab.rt.live) == [cid]
+                assert ("user", "I want Tuesday at eleven.") in _history(lab.rt.live[cid][0])
+                assert c.post("/sip/recover", json={"uuid": uid}, headers=headers).status_code == 409
+                assert lab.store.get_call_any(call["id"])["end_reason"] == "stream_lost"
+            finally:
+                other.close()
+        finally:
+            try:
+                sock.sendall(lab.audio.pack(lab.audio.KIND_HANGUP))
+            except OSError:
+                pass
+            sock.close()
+        assert _poll(lambda: lab.store.get_call_any(cid)["status"] == "ended")
+        assert lab.lim.total_active() == 0
+
+
+def test_audiosocket_without_recover_post_keeps_the_lost_transcript():
+    """A socket for an active uuid this process is not running resumes it. stream_closed does too."""
+    lab = _sip_lab()
+    uid = str(uuid.uuid4())
+    call = _lost_sip(lab, uid, hold_slot=True)
+    with lab.client(lab.app):
+        sock = _open_uuid(lab, uid)
+        cid = None
+        try:
+            assert _poll(lambda: any(row["id"] != call["id"] and lab.rt.live.get(row["id"])
+                                     for row in lab.store.list_calls(lab.tid)))
+            cid = next(row["id"] for row in lab.store.list_calls(lab.tid) if row["id"] != call["id"])
+            live = lab.rt.live[cid]
+            assert ("user", "I want Tuesday at eleven.") in _history(live[0])
+            assert "cut off" in live[0].cfg.greeting
+            assert len(lab.store.list_calls(lab.tid)) == 2
+            nxt = lab.store.get_call_any(cid)
+            assert nxt["metadata"]["resumedFrom"] == call["id"] and nxt["metadata"]["resumes"] == 1
+            assert lab.store.get_call_any(call["id"])["status"] == "ended"
+            assert lab.store.get_call_any(call["id"])["end_reason"] == "stream_lost"
+            assert lab.lim.total_active() == 1
+        finally:
+            try:
+                sock.sendall(lab.audio.pack(lab.audio.KIND_HANGUP))
+            except OSError:
+                pass
+            sock.close()
+        assert cid and _poll(lambda: lab.store.get_call_any(cid)["status"] == "ended")
+        assert lab.store.get_call_any(cid)["end_reason"] == "stream_closed"
+        assert lab.lim.total_active() == 0
+        sock = _open_uuid(lab, uid)
+        try:
+            assert _poll(lambda: len(lab.store.list_calls(lab.tid)) == 3 and any(
+                lab.rt.live.get(row["id"]) for row in lab.store.list_calls(lab.tid) if row["id"] not in (call["id"], cid)))
+            third = next(row for row in lab.store.list_calls(lab.tid) if row["id"] not in (call["id"], cid))
+            live = lab.rt.live[third["id"]]
+            assert third["metadata"]["resumedFrom"] == cid and third["metadata"]["resumes"] == 2
+            assert ("user", "I want Tuesday at eleven.") in _history(live[0])
+            assert "cut off" in live[0].cfg.greeting
+            assert lab.store.get_call_any(cid)["end_reason"] == "stream_closed"
+            assert lab.lim.total_active() == 1
+        finally:
+            try:
+                sock.sendall(lab.audio.pack(lab.audio.KIND_HANGUP))
+            except OSError:
+                pass
+            sock.close()
+        assert _poll(lambda: lab.lim.total_active() == 0)
+
+
+def test_kamailio_pins_call_id_local_part_and_asterisk2_is_a_second_node():
+    """The last character of a Call-ID is the host. '.com' must not send every INVITE to one Asterisk."""
+    root = os.path.join(os.path.dirname(__file__), "..", "..", "deploy")
+    kam = open(os.path.join(root, "sip", "kamailio.cfg"), encoding="utf-8").read()
+    assert 'if ($ci =~ "[02468aceACE]@")' in kam
+    assert 'if ($ci =~ "[02468aceACE]$")' not in kam
+    pin = re.compile(r"[02468aceACE]@")
+    host_tail = re.compile(r"[02468aceACE]$")
+    even, odd = "abc124@sip.example.com", "abc125@sip.example.com"
+    assert pin.search(even) and pin.search(odd) is None
+    assert host_tail.search(even) is None and host_tail.search(odd) is None
+    ext = open(os.path.join(root, "sip", "extensions.conf"), encoding="utf-8").read()
+    ext2 = open(os.path.join(root, "sip", "extensions.api2.conf"), encoding="utf-8").read()
+    assert "api1:9092" in ext and "api2:9092" not in ext
+    assert "api2:9092" in ext2 and "api1:9092" not in ext2
+    reg = open(os.path.join(root, "sip", "pjsip.register.conf"), encoding="utf-8").read()
+    noreg = open(os.path.join(root, "sip", "pjsip.no-register.conf"), encoding="utf-8").read()
+    pjsip = open(os.path.join(root, "sip", "pjsip.conf"), encoding="utf-8").read()
+    assert "type=registration" in reg
+    assert "type=registration" not in noreg and "type=registration" not in pjsip
+    assert '#include "pjsip.register.conf"' in pjsip
+    compose = open(os.path.join(root, "docker-compose.yml"), encoding="utf-8").read()
+    primary, _, secondary = compose.partition("\n  asterisk2:")
+    assert "pjsip.no-register.conf" not in primary and "extensions.api2.conf" not in primary
+    assert "pjsip.no-register.conf" in secondary and "extensions.api2.conf" in secondary
 
 
 async def test_transport_end_records_the_reason_before_closing_the_stream():

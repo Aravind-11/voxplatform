@@ -847,7 +847,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
 
     async def audiosocket_call(reader, writer) -> None:
-        """One SIP call arriving from Asterisk over AudioSocket: create the call, admit it, run the agent."""
+        """One SIP call from Asterisk over AudioSocket. Resume that uuid, or create the call, then admit it."""
         from transports.audiosocket import AudioSocketTransport
         agent = store.get_agent_any(settings.audiosocket_agent)
         if not agent or app.state.draining:
@@ -856,20 +856,30 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         state: dict = {}
 
         async def factory(tr, custom):
-            # A recovered row is created, with resumedFrom, and waiting for this uuid.
-            # An ended or still-active row with the same uuid is a different call.
+            # Same uuid is the same call. A live socket or our own hang-up must not open another one.
+            # A lost socket (still active on a dead node, or ended stream_closed / stream_lost) resumes
+            # here, so a re-dial does not depend on /sip/recover having run first.
             uid = str(custom.get("uuid") or "")
             existing = store.find_call_by_sid(uid, medium="sip") if uid else None
-            meta = (existing or {}).get("metadata") or {}
-            if isinstance(meta, str):
-                meta = json.loads(meta or "{}")
-            if existing and existing["status"] == "created" and meta.get("resumedFrom"):
-                call = existing
+            if existing is not None and sip_socket_reuses(existing):
+                decision = sip_resume(existing)
+                if decision["action"] != "continue":
+                    raise _Reject(4401, decision.get("reason") or "sip call is not attachable")
+                call = decision["call"]
             else:
                 call = store.create_call(agent["tenant_id"], agent["id"], "sip", agent["config"],
                                          {"callSid": uid, "channel": "sip"})
             state["call"] = call
-            state["t"] = admit(call)
+            try:
+                state["t"] = admit(call)
+            except _Reject:
+                # admit marks the row ended before raising. A continuation that never joined holds no
+                # slot; leaving it ended spends a resume and the next socket mints a blank call.
+                # Restore before this handler awaits (_close drains), or that retry sees the ended row.
+                fresh = store.get_call_any(call["id"])
+                if fresh is not None and never_joined_continuation(fresh, sip_meta(fresh)):
+                    restore_continuation(fresh)
+                raise
             return runtime.build_session(call, tr)
 
         def mark_hangup() -> None:
@@ -927,6 +937,64 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         store.audit(call["tenant_id"], "system", "call.resume", nxt["id"], {"from": call_id, "attempt": n + 1})
         return Response(stream_twiml(nxt), media_type="text/xml")
 
+    SIP_OURS = ("agent_hangup", "transfer", "no_credit")
+    SIP_LOST = ("stream_closed", "stream_lost")
+
+    def sip_meta(call: dict) -> dict:
+        meta = call.get("metadata") or {}
+        return json.loads(meta or "{}") if isinstance(meta, str) else meta
+
+    def never_joined_continuation(call: dict, meta: dict) -> bool:
+        """Continuation admit rejected before join. It holds no slot and is not a used resume."""
+        if not meta.get("resumedFrom") or call.get("joined"):
+            return False
+        if call["status"] == "created":
+            return True
+        return call.get("end_reason") in ("concurrency_limit", "draining")
+
+    def restore_continuation(call: dict) -> dict:
+        if call["status"] == "created" and not call.get("ended") and not call.get("end_reason"):
+            return call
+        store.update_call(call["id"], status="created", ended=None, end_reason=None)
+        return store.get_call_any(call["id"])
+
+    def sip_resume(call: dict) -> dict:
+        """What POST /sip/recover and the next AudioSocket do with the newest row for a uuid.
+
+        action is hangup (no new row), busy (this process still has the socket), or continue
+        (call is the row to admit). A never-joined continuation is returned as-is.
+        """
+        if call.get("end_reason") in SIP_OURS:
+            return {"action": "hangup"}
+        # Ending a call this process is still running frees the slot under the session and the
+        # next socket opens a second call on the same caller.
+        if call["id"] in runtime.live:
+            return {"action": "busy"}
+        meta = sip_meta(call)
+        if never_joined_continuation(call, meta):
+            return {"action": "continue", "call": restore_continuation(call)}
+        n = int(meta.get("resumes", 0))
+        if n >= MAX_RESUMES:
+            METRICS.inc("vox_call_resume_refused_total")
+            return {"action": "hangup", "reason": "resume cap"}
+        if call["status"] in ("created", "active"):
+            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="stream_lost")
+            limiter.release(call["tenant_id"], call["id"])
+        nxt = store.create_call(call["tenant_id"], call["agent_id"], "sip", call["config"],
+                                {**meta, "resumedFrom": call["id"], "resumes": n + 1})
+        METRICS.inc("vox_call_resumes_total")
+        store.audit(call["tenant_id"], "system", "call.resume", nxt["id"],
+                    {"from": call["id"], "attempt": n + 1, "channel": "sip"})
+        return {"action": "continue", "call": nxt}
+
+    def sip_socket_reuses(call: dict) -> bool:
+        """True when a new AudioSocket must not mint a blank row for this uuid."""
+        if call["id"] in runtime.live or call.get("end_reason") in SIP_OURS:
+            return True
+        if call.get("end_reason") in SIP_LOST or call["status"] == "active":
+            return True
+        return never_joined_continuation(call, sip_meta(call))
+
     @app.post("/sip/recover")
     async def sip_recover(request: Request, x_vox_sip_token: str = Header(default="")):
         """Lost AudioSocket call. Body `uuid` is the AudioSocket id (metadata callSid), not our call id:
@@ -952,28 +1020,15 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         call = store.find_call_by_sid(uid, medium="sip")
         if not call:
             raise HTTPException(404, "call not found")
-        if call.get("end_reason") in ("agent_hangup", "transfer", "no_credit"):
-            return {"action": "hangup"}
-        meta = call["metadata"] if isinstance(call["metadata"], dict) else json.loads(call["metadata"] or "{}")
-        # This process still has the socket. Ending it here frees the slot while the session
-        # keeps running, and the next AudioSocket opens a second call on the same caller.
-        if call["id"] in runtime.live:
+        decision = sip_resume(call)
+        if decision["action"] == "hangup":
+            body = {"action": "hangup"}
+            if decision.get("reason"):
+                body["reason"] = decision["reason"]
+            return body
+        if decision["action"] == "busy":
             raise HTTPException(409, "call is still connected")
-        # A retry of this POST must not orphan the row the first attempt already created.
-        if call["status"] == "created" and meta.get("resumedFrom"):
-            return {"callId": call["id"], "agentId": call["agent_id"]}
-        n = int(meta.get("resumes", 0))
-        if n >= MAX_RESUMES:
-            METRICS.inc("vox_call_resume_refused_total")
-            return {"action": "hangup", "reason": "resume cap"}
-        if call["status"] in ("created", "active"):
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="stream_lost")
-            limiter.release(call["tenant_id"], call["id"])
-        nxt = store.create_call(call["tenant_id"], call["agent_id"], "sip", call["config"],
-                                {**meta, "resumedFrom": call["id"], "resumes": n + 1})
-        METRICS.inc("vox_call_resumes_total")
-        store.audit(call["tenant_id"], "system", "call.resume", nxt["id"],
-                    {"from": call["id"], "attempt": n + 1, "channel": "sip"})
+        nxt = decision["call"]
         return {"callId": nxt["id"], "agentId": nxt["agent_id"]}
 
     # ----------------------------------------------------- outbound calls

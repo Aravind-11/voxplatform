@@ -103,6 +103,7 @@ class _Generation:
         self.first_audio_sent = False
         self.cancelled = False
         self.speak_lock = asyncio.Lock()  # filler audio and sentence audio must not synthesize at the same time
+        self.holding_sentence = False     # dequeued by _synth but not spoken yet (off textq during lookahead)
         self.after: Optional[ToolResult] = None   # deferred call action requested by a tool this reply
 
 
@@ -386,12 +387,18 @@ class Session:
                 text = await gen.textq.get()
                 if text is None:
                     return
-                if idx > 0:
-                    await gen.commit.wait()
-                    while self.tracker.buffered_ms() + gen.pending_ms > self.cfg.tts_lookahead_ms:
-                        await asyncio.sleep(self.cfg.tts_poll_s)
-                await self._speak(gen, text)
-                idx += 1
+                # Off textq until _speak returns, including the commit and lookahead waits.
+                # A tool filler must see this or it takes speak_lock in that gap and plays first.
+                gen.holding_sentence = True
+                try:
+                    if idx > 0:
+                        await gen.commit.wait()
+                        while self.tracker.buffered_ms() + gen.pending_ms > self.cfg.tts_lookahead_ms:
+                            await asyncio.sleep(self.cfg.tts_poll_s)
+                    await self._speak(gen, text)
+                    idx += 1
+                finally:
+                    gen.holding_sentence = False
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -435,11 +442,18 @@ class Session:
             self._spawn_action(a)
 
     async def _tool_filler(self, gen: _Generation, name: str, done: asyncio.Event) -> None:
-        """Speak a short line if the tool is still running after filler_delay_s. Blank text disables it."""
+        """Speak a short line if the tool is still running after filler_delay_s and every sentence
+        already queued for this reply has been synthesized. Blank text disables it."""
         text = self.cfg.tool_fillers.get(name, self.cfg.filler_text)
         if not str(text).strip() or gen.cancelled:
             return
         await asyncio.sleep(self.cfg.filler_delay_s)
+        # textq is empty while _synth holds the next sentence for lookahead, so the flag is required.
+        # Do not take speak_lock here: _speak takes it, and the lock is not reentrant.
+        while gen.holding_sentence or not gen.textq.empty():
+            if done.is_set() or gen.cancelled:
+                return
+            await asyncio.sleep(self.cfg.tts_poll_s)
         if done.is_set() or gen.cancelled:
             return
         await self._speak(gen, str(text))

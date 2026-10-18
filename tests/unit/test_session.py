@@ -225,6 +225,12 @@ async def test_false_barge_keeps_the_unsent_sentence_and_does_not_restart():
     assert not any(t.startswith("One two") for t in new)
     assistant = [m for m in r.s.history if m["role"] == "assistant"]
     assert len(assistant) == 1
+    # Replay audio is already in the turn. Appending it again would repeat the cleared tail.
+    assert assistant[0]["content"] == (
+        "One two three four five. Six seven eight nine ten. "
+        "Eleven twelve thirteen fourteen fifteen.")
+    assert assistant[0]["content"].count("Six") == 1
+    assert assistant[0]["content"].count("five") == 1
     assert assistant[0]["content"].count("Eleven") == 1
     assert "[interrupted]" not in assistant[0]["content"]
 
@@ -632,10 +638,14 @@ async def test_send_failure_during_pause_replays_tail_on_a_new_drain():
     assert g.tasks[-1] is not old_drain
     assert g.tasks[1] is synth          # the sentence still in synth is not orphaned
     assert not g.holding
-    assert len(r.sent) > sent_before
-    assert any(n == 6400 for _, n, _ in r.sent[sent_before:])   # "two three four five." at 8 kHz
-    assert g.outbox.empty() or not g.tasks[-1].done()
-    assert any("two three four five" in t for t in r.tts.texts)
+    # Cleared tail, the chunk send_audio never wrote, then the sentence that was still in synth.
+    assert [n for _, n, _ in r.sent[sent_before:]] == [6400, 8000, 8000]
+    assert g.outbox.empty()
+    heard = r.s.history[-1]["content"]
+    assert heard.count("Six seven eight nine ten.") == 1
+    assert heard == (
+        "One two three four five. Six seven eight nine ten. "
+        "Eleven twelve thirteen fourteen fifteen.")
     assert r.last("barge_aborted")["text"]
 
 

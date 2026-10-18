@@ -971,10 +971,13 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     def sip_resume(call: dict) -> dict:
         """What POST /sip/recover and the next AudioSocket do with the newest row for a uuid.
 
-        action is hangup (no new row), busy (this process still has the socket), or continue
+        action is hangup (no new row), busy (this process or another node still has the slot), or continue
         (call is the row to admit). A never-joined continuation is returned as-is.
         A hangup of a dead created/active row ends it so the slot is not kept.
         """
+        # runtime.live is only this process. A Redis member another node still refreshes is that node's call.
+        if limiter.held_elsewhere(call["tenant_id"], call["id"]):
+            return {"action": "busy"}
         if call.get("end_reason") in SIP_OURS:
             end_dead_sip(call)                                 # keep the reason finish or mark_hangup stored
             return {"action": "hangup"}

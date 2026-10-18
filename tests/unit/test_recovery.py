@@ -4,7 +4,9 @@ import base64
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import time
 import uuid
 
@@ -166,6 +168,226 @@ def test_sip_recover_seeds_history_from_the_lost_audiosocket_call():
     assert store.find_call_by_sid("missing", medium="sip") is None
     off, *_ = make()
     assert off.post("/sip/recover", json={"uuid": "sip-uuid-1"}, headers={"X-Vox-Sip-Token": "sip-secret"}).status_code == 404
+
+
+def test_find_call_by_sid_escapes_like_wildcards():
+    """% and _ in a callSid are literal. An unescaped LIKE would return a newer wider row."""
+    from api.store import Store
+
+    store = Store()
+    tid = store.create_tenant("a")
+    ag = store.create_agent(tid, "n", {})
+    pct = store.create_call(tid, ag["id"], "sip", {}, {"callSid": "100%", "channel": "sip"})
+    store.create_call(tid, ag["id"], "sip", {}, {"callSid": "100xyz", "channel": "sip"})
+    under = store.create_call(tid, ag["id"], "sip", {}, {"callSid": "ab_cd", "channel": "sip"})
+    store.create_call(tid, ag["id"], "sip", {}, {"callSid": "abXcd", "channel": "sip"})
+    only = store.create_call(tid, ag["id"], "sip", {}, {"callSid": "%", "channel": "sip"})
+    store.create_call(tid, ag["id"], "sip", {}, {"callSid": "plain", "channel": "sip"})
+    assert store.find_call_by_sid("100%", medium="sip")["id"] == pct["id"]
+    assert store.find_call_by_sid("ab_cd", medium="sip")["id"] == under["id"]
+    assert store.find_call_by_sid("%", medium="sip")["id"] == only["id"]
+    assert store.find_call_by_sid("nope", medium="sip") is None
+
+
+def test_sip_recover_continues_the_sip_row_not_a_newer_websocket_call_sid():
+    """A tenant can store the same callSid on a newer web call. Recover still follows the sip row."""
+    c, store, lim = make(Settings(admin_key="adm", public_base_url=BASE, twilio_auth_token="tok", sip_token="sip-secret"))
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "n", "greeting": "Hello!"}, headers={"X-API-Key": k}).json()
+    sip = store.create_call(tid, a["id"], "sip", a["config"], {"callSid": "shared-sid", "channel": "sip"})
+    store.update_call(sip["id"], status="active", joined=time.time())
+    assert lim.acquire(tid, sip["id"], 5)
+    store.add_message(sip["id"], "agent", "Hello, how can I help?", time.time())
+    store.add_message(sip["id"], "user", "I want Tuesday at eleven.", time.time())
+    web = store.create_call(tid, a["id"], "webSocket", a["config"], {"callSid": "shared-sid"})
+    assert store.find_call_by_sid("shared-sid")["id"] == web["id"]
+    assert store.find_call_by_sid("shared-sid", medium="sip")["id"] == sip["id"]
+    before = len(store.list_calls(tid))
+    r = c.post("/sip/recover", json={"uuid": "shared-sid"}, headers={"X-Vox-Sip-Token": "sip-secret"})
+    assert r.status_code == 200 and r.json()["callId"] not in (sip["id"], web["id"])
+    stayed = store.get_call_any(web["id"])
+    assert stayed["status"] == "created" and stayed.get("end_reason") is None and stayed.get("ended") is None
+    old = store.get_call_any(sip["id"])
+    assert old["status"] == "ended" and old["end_reason"] == "stream_lost" and lim.total_active() == 0
+    new = store.get_call_any(r.json()["callId"])
+    assert new["medium"] == "sip" and new["metadata"]["resumedFrom"] == sip["id"]
+    assert len(store.list_calls(tid)) == before + 1
+    sess = c.app.state.runtime.build_session(new, type("T", (), {"out_rate": 8000, "call_sid": "shared-sid",
+                                                                  "send_audio": lambda s, *a: None, "clear": lambda s: None,
+                                                                  "end": lambda s: None})())
+    assert [m["content"] for m in sess.history[1:]] == ["Hello, how can I help?", "I want Tuesday at eleven."]
+
+
+class _SortedSetRedis:
+    """The sorted-set commands RedisLimiter uses, shared by two nodes when redis-server is absent."""
+
+    def __init__(self):
+        self.sets: dict[str, dict[str, float]] = {}
+
+    def register_script(self, _lua: str):
+        def call(keys=None, args=None):
+            key = keys[0]
+            now, exp, member, cap = float(args[0]), float(args[1]), str(args[2]), int(float(args[3]))
+            z = self.sets.setdefault(key, {})
+            for item, score in list(z.items()):
+                if score <= now:
+                    del z[item]
+            if member in z:
+                z[member] = exp
+                return 1
+            if len(z) >= cap:
+                return 0
+            z[member] = exp
+            return 1
+        return call
+
+    def zrem(self, key, member):
+        self.sets.get(key, {}).pop(str(member), None)
+
+    def zscore(self, key, member):
+        return self.sets.get(key, {}).get(str(member))
+
+    def zcount(self, key, low, _high):
+        floor = float("-inf") if low in ("-inf", b"-inf") else float(low)
+        return sum(score >= floor for score in self.sets.get(key, {}).values())
+
+    def zadd(self, key, mapping, xx=False):
+        z = self.sets.setdefault(key, {})
+        for member, score in mapping.items():
+            if xx and str(member) not in z:
+                continue
+            z[str(member)] = float(score)
+
+    def scan_iter(self, match="*"):
+        prefix = str(match).rstrip("*")
+        return [key for key in self.sets if key.startswith(prefix)]
+
+
+def _two_node_limiters():
+    """Owner and non-owner RedisLimiters over one set. redis-server when installed, else the in-memory set."""
+    from api.security import RedisLimiter
+
+    if shutil.which("redis-server"):
+        try:
+            import redis
+        except ImportError:
+            redis = None
+        if redis is not None:
+            sock = socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            sock.close()
+            proc = subprocess.Popen(["redis-server", "--port", str(port), "--save", "", "--appendonly", "no"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            client = redis.Redis(port=port, decode_responses=True)
+            for _ in range(50):
+                try:
+                    client.ping()
+                    break
+                except Exception:  # noqa: BLE001
+                    time.sleep(0.05)
+            else:
+                proc.terminate()
+                raise RuntimeError("redis-server did not start")
+            kw = dict(default_limit=4, prefix="sip45:")
+            return RedisLimiter(f"redis://127.0.0.1:{port}/0", **kw), RedisLimiter(f"redis://127.0.0.1:{port}/0", **kw), proc.terminate
+    client = _SortedSetRedis()
+    kw = dict(default_limit=4, prefix="sip45:", client=client)
+    return RedisLimiter(**kw), RedisLimiter(**kw), lambda: None
+
+
+def _redis_lab(limiter):
+    from types import SimpleNamespace
+
+    from fastapi.testclient import TestClient
+
+    from api.app import create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+
+    store = Store()
+    tid = store.create_tenant("a")
+    ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "Hello!", "tools": []})
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    settings = Settings(admin_key="adm", public_base_url=BASE, twilio_auth_token="tok", sip_token="sip-secret")
+    app = create_app(store, rt, limiter, None, settings)
+    return SimpleNamespace(app=app, store=store, rt=rt, tid=tid, ag=ag, client=TestClient)
+
+
+def _member_live(limiter, tenant_id, call_id) -> bool:
+    score = limiter.r.zscore(limiter._key(tenant_id), call_id)
+    return score is not None and float(score) >= time.time()
+
+
+def test_other_node_recover_does_not_free_a_live_redis_slot():
+    """POST /sip/recover is not sticky. A slot another node still holds is not a dead leg."""
+    owner, other, stop = _two_node_limiters()
+    try:
+        lab = _redis_lab(other)
+        uid = "sip-owned-elsewhere"
+        call = lab.store.create_call(lab.tid, lab.ag["id"], "sip", lab.ag["config"], {"callSid": uid, "channel": "sip"})
+        lab.store.update_call(call["id"], status="active", joined=time.time())
+        assert owner.acquire(lab.tid, call["id"], 4)
+        assert call["id"] not in lab.rt.live and other.local_active() == 0
+        headers = {"X-Vox-Sip-Token": "sip-secret"}
+        with lab.client(lab.app) as c:
+            refused = c.post("/sip/recover", json={"uuid": uid}, headers=headers)
+            assert refused.status_code == 409
+            row = lab.store.get_call_any(call["id"])
+            assert row["status"] == "active" and row.get("end_reason") is None
+            assert _member_live(owner, lab.tid, call["id"]) and owner.active(lab.tid) == 1
+            assert len(lab.store.list_calls(lab.tid)) == 1
+            owner.release(lab.tid, call["id"])
+            assert not _member_live(owner, lab.tid, call["id"])
+            resumed = c.post("/sip/recover", json={"uuid": uid}, headers=headers)
+            assert resumed.status_code == 200 and resumed.json()["callId"] != call["id"]
+            old = lab.store.get_call_any(call["id"])
+            assert old["status"] == "ended" and old["end_reason"] == "stream_lost"
+            assert len(lab.store.list_calls(lab.tid)) == 2
+            nxt = lab.store.get_call_any(resumed.json()["callId"])
+            assert nxt["medium"] == "sip" and nxt["metadata"]["resumedFrom"] == call["id"]
+    finally:
+        stop()
+
+
+def test_same_node_redis_dead_leg_still_ends_and_remote_hangup_stays_held():
+    """This node's _held is the dead leg we release. Another node's agent_hangup is still its call."""
+    owner, other, stop = _two_node_limiters()
+    try:
+        lab = _redis_lab(other)
+        headers = {"X-Vox-Sip-Token": "sip-secret"}
+        dead_uid = "sip-held-here"
+        dead = lab.store.create_call(lab.tid, lab.ag["id"], "sip", lab.ag["config"], {"callSid": dead_uid, "channel": "sip"})
+        lab.store.update_call(dead["id"], status="active", joined=time.time())
+        assert other.acquire(lab.tid, dead["id"], 4)
+        assert dead["id"] not in lab.rt.live
+        hang_uid = "sip-hang-elsewhere"
+        hang = lab.store.create_call(lab.tid, lab.ag["id"], "sip", lab.ag["config"], {"callSid": hang_uid, "channel": "sip"})
+        lab.store.update_call(hang["id"], status="active", joined=time.time(), end_reason="agent_hangup")
+        assert owner.acquire(lab.tid, hang["id"], 4)
+        with lab.client(lab.app) as c:
+            same = c.post("/sip/recover", json={"uuid": dead_uid}, headers=headers)
+            assert same.status_code == 200 and same.json()["callId"] != dead["id"]
+            row = lab.store.get_call_any(dead["id"])
+            assert row["status"] == "ended" and row["end_reason"] == "stream_lost"
+            assert not _member_live(other, lab.tid, dead["id"]) and other.local_active() == 0
+            before = len(lab.store.list_calls(lab.tid))
+            refused = c.post("/sip/recover", json={"uuid": hang_uid}, headers=headers)
+            assert refused.status_code == 409
+            held = lab.store.get_call_any(hang["id"])
+            assert held["status"] == "active" and held["end_reason"] == "agent_hangup"
+            assert _member_live(owner, lab.tid, hang["id"])
+            assert len(lab.store.list_calls(lab.tid)) == before
+            owner.release(lab.tid, hang["id"])
+            done = c.post("/sip/recover", json={"uuid": hang_uid}, headers=headers)
+            assert done.status_code == 200 and done.json() == {"action": "hangup"}
+            closed = lab.store.get_call_any(hang["id"])
+            assert closed["status"] == "ended" and closed["end_reason"] == "agent_hangup"
+            assert len(lab.store.list_calls(lab.tid)) == before
+            assert not _member_live(owner, lab.tid, hang["id"])
+    finally:
+        stop()
 
 
 def test_next_audiosocket_keeps_the_recovered_transcript():

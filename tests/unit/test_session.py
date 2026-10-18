@@ -258,6 +258,60 @@ async def test_tool_round_sends_transcript_instead_of_reprefilling_audio():
     assert all(m.get("role") != "user" for m in llm.calls[1]["followups"])
 
 
+async def test_tool_round_sends_inaudible_when_transcript_task_ended_without_text():
+    """A transcript task that finished without writing the row must not send '[caller audio]'."""
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def lookup(args):
+        return {"ok": True}
+
+    llm = FakeLLM([["unused"]])
+
+    async def stream(history, audio, followups, tools):
+        i = len(llm.calls)
+        llm.calls.append({"history": copy.deepcopy(history), "followups": copy.deepcopy(followups),
+                          "n_audio": len(audio)})
+        if i == 0:
+            started.set()
+            await release.wait()
+            yield "Let me check. "
+            yield ToolCall("t1", "lookup", {})
+        else:
+            yield "Booked."
+
+    async def transcribe(audio):
+        await asyncio.Event().wait()
+        return "should not land"
+
+    llm.stream = stream
+    llm.transcribe = transcribe
+    r = Rig(llm, tools={"lookup": lookup})
+    try:
+        await r.frames("s", 15)
+        await r.frames("q", 25)            # round 0 is blocked in stream; commit starts ASR
+        await r.settle()
+        assert started.is_set() and len(llm.calls) == 1 and llm.calls[0]["n_audio"] > 0
+        task = r.s._transcript_task
+        assert task is not None and not task.done()
+        assert r.s.history[1]["content"] == "[caller audio]"
+        task.cancel()                      # finish ASR without writing the row, still inside round 0
+        await r.settle()
+        assert task.cancelled() and r.s.history[1]["content"] == "[caller audio]"
+        assert len(llm.calls) == 1
+        release.set()
+        await r.settle()
+        follow = llm.calls[1]
+        assert follow["n_audio"] == 0
+        assert {"role": "user", "content": "[inaudible]"} in follow["history"]
+        assert "[caller audio]" not in _contents(follow["history"])
+        assert follow["followups"][0]["tool_calls"][0]["function"]["name"] == "lookup"
+        assert all(m.get("role") != "user" for m in follow["followups"])
+    finally:
+        release.set()
+        await r.settle()
+
+
 def _contents(history):
     return [m.get("content") for m in history]
 

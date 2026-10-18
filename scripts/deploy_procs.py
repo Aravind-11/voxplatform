@@ -36,3 +36,24 @@ def per_process_cap(node_max: int, procs: int) -> int:
             f"node cap {node_max} cannot be split across {procs} processes without exceeding it"
         )
     return cap
+
+
+def require_shared_db(procs: int, db: str) -> None:
+    """Several processes share one database. A SQLite file raises ``database is locked``.
+
+    ``procs == 1`` may use the default SQLite file. Above that, ``db`` must be
+    ``postgres://`` or ``postgresql://`` — the same check ``Store`` uses. Called
+    from ``scripts/deploy.sh`` before any process is started.
+    """
+    if isinstance(procs, bool) or not isinstance(procs, int) or procs < 1:
+        raise ValueError(f"procs must be an integer >= 1, got {procs!r}")
+    if procs == 1:
+        return
+    url = db if isinstance(db, str) else ""
+    if url.startswith(("postgres://", "postgresql://")):
+        return
+    shown = url or "the default SQLite file"
+    raise ValueError(
+        f"VOX_PROCS={procs} cannot share {shown}: SQLite raises database is locked. "
+        f"Set VOX_DB to postgres:// or postgresql:// before starting more than one process."
+    )

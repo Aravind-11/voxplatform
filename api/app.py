@@ -742,12 +742,27 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not limiter.acquire(call["tenant_id"], call["id"], cap):
             store.update_call(call["id"], status="ended", ended=time.time(), end_reason="concurrency_limit")
             raise _Reject(1013, "concurrency limit")
-        store.update_call(call["id"], status="active", joined=time.time())
-        webhook(t, "call.started", store.get_call_any(call["id"]))
+        try:
+            store.update_call(call["id"], status="active", joined=time.time())
+            webhook(t, "call.started", store.get_call_any(call["id"]))
+        except Exception:  # noqa: BLE001  (slot is held; finish runs only after admit returns)
+            METRICS.inc("vox_errors_total", where="admit")
+            try:
+                limiter.release(call["tenant_id"], call["id"])
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                store.update_call(call["id"], status="ended", ended=time.time(), end_reason="error")
+            except Exception:  # noqa: BLE001  (database still down: the slot is already released)
+                pass
+            raise _Reject(1011, "unavailable")
         return t
 
     def finish(call: dict, t: dict, reason: str) -> None:
-        limiter.release(call["tenant_id"], call["id"])
+        try:
+            limiter.release(call["tenant_id"], call["id"])
+        except Exception:  # noqa: BLE001  (a Redis blip must not skip ending the call)
+            METRICS.inc("vox_errors_total", where="limiter_release")
         cur = store.get_call_any(call["id"])
         if cur["status"] == "active":
             store.update_call(call["id"], status="ended", ended=time.time(), end_reason=reason)

@@ -188,3 +188,22 @@ def test_concurrent_acquires_do_not_pass_the_process_ceiling():
 def test_build_applies_the_exported_process_ceiling():
     text = Path(__file__).resolve().parents[2].joinpath("api/main.py").read_text()
     assert "security.make_limiter(" in text.split("def build()", 1)[1]
+
+
+def test_several_processes_refuse_a_sqlite_file_before_they_start():
+    """The default deploy DB is one SQLite file. VOX_PROCS>1 on it raises database is locked."""
+    from scripts.deploy_procs import require_shared_db
+
+    require_shared_db(1, "/lambda/nfs/arvi/vox.db")
+    require_shared_db(1, "")
+    require_shared_db(4, "postgresql://vox:pw@localhost/vox")
+    require_shared_db(4, "postgres://vox@localhost/vox")
+    for db in ("/lambda/nfs/arvi/vox.db", "", "sqlite:///tmp/vox.db", "vox.db"):
+        with pytest.raises(ValueError, match="database is locked"):
+            require_shared_db(4, db)
+    text = _DEPLOY.read_text()
+    check = text.find("require_shared_db")
+    launch = text.find('if [ "$VOX_PROCS" -eq 1 ]')
+    assert check != -1 and launch != -1 and check < launch
+    # The check sees the same path the processes will open, including the SQLite default.
+    assert '${VOX_DB:-$FS/vox.db}' in text[check - 400:check] or '${VOX_DB:-$FS/vox.db}' in text[check:check + 500]

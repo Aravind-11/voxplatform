@@ -151,9 +151,12 @@ return 1
             return ok
 
     def release(self, tenant_id: str, call_id: str) -> None:
-        self.r.zrem(self._key(tenant_id), call_id)
-        with self._lock:
-            self._held.get(tenant_id, set()).discard(call_id)
+        try:
+            self.r.zrem(self._key(tenant_id), call_id)
+        finally:
+            # A failed ZREM must not stick this process's ceiling. The member expires via ttl_s.
+            with self._lock:
+                self._held.get(tenant_id, set()).discard(call_id)
 
     def active(self, tenant_id: str) -> int:
         import time

@@ -25,6 +25,8 @@
                            Above 1, scripts/deploy.sh starts one process per port 8080..8080+N-1, not uvicorn's
                            shared --workers model: a WebSocket stays on the process that accepted it, and live
                            calls / VAD are per process. Inside one container, do not raise --workers.
+                           VOX_PROCS>1 requires VOX_DB to be postgres:// or postgresql://. deploy.sh refuses
+                           a SQLite file first: several processes writing it raise "database is locked".
   VOX_NODE_MAX_CALLS       Optional ceiling on active calls this process may hold, across tenants. deploy.sh
                            sets it to the already-split share (floor of the node cap / VOX_PROCS; the shares
                            sum to at most the node cap). This process does not divide by VOX_PROCS again.

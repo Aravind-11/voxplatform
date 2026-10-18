@@ -3,7 +3,9 @@
 #   bash scripts/deploy.sh
 # Prompts for the Twilio Auth Token with hidden input; it is never printed or written to disk.
 # Optional env: TWILIO_ACCOUNT_SID, VOX_TWILIO_NUMBER (+E.164)  -> also sets the number's webhook for you.
-#               VOX_DB (default $FS/vox.db; a postgresql:// URL works), VOX_REDIS_URL, VOX_RECORD_DIR.
+#               VOX_DB (default $FS/vox.db for one process; VOX_PROCS>1 requires
+#               postgres:// or postgresql:// — several processes on one SQLite file
+#               raise "database is locked"), VOX_REDIS_URL, VOX_RECORD_DIR.
 #               VOX_PROCS (default 1). 1 or unset: one uvicorn with --workers 1. Above 1: that many
 #               separate processes on ports 8080..8080+N-1 (not uvicorn's shared worker model).
 #               Caddy or the tunnel must list every port. WebSockets stick to the process that
@@ -52,6 +54,18 @@ done
 VOX_PROCS="${VOX_PROCS:-1}"
 if ! [[ "$VOX_PROCS" =~ ^[0-9]+$ ]] || [ "$VOX_PROCS" -lt 1 ]; then
   echo "VOX_PROCS must be an integer >= 1 (got ${VOX_PROCS})"; exit 1
+fi
+# One SQLite file cannot take several writers. Refuse before any process is started
+# (including before the old api sessions are killed).
+if [ "$VOX_PROCS" -gt 1 ]; then
+  _db="${VOX_DB:-$FS/vox.db}"
+  VOX_PROCS="$VOX_PROCS" VOX_DB="$_db" python3 -c 'import os, sys
+from scripts.deploy_procs import require_shared_db
+try:
+    require_shared_db(int(os.environ["VOX_PROCS"]), os.environ["VOX_DB"])
+except ValueError as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(1)'
 fi
 ADMIN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
 METRICS="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"

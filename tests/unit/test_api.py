@@ -130,6 +130,60 @@ def test_websocket_call_end_to_end_gets_agent_audio_and_records():
     assert e.value.code == 4401
 
 
+def test_redis_zrem_error_on_hangup_frees_the_ceiling_and_ends_the_call():
+    """A Redis blip during hang-up must not stick this process's ceiling or leave the row active."""
+    from tests.unit.test_deploy_procs import _FakeRedis
+
+    class _Boom(_FakeRedis):
+        def zrem(self, key, member):
+            raise ConnectionError("redis blip")
+
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    lim = security.RedisLimiter("redis://127.0.0.1/9", default_limit=10, client=_Boom(), process_ceiling=1)
+    c = TestClient(create_app(store, rt, lim, None, SETTINGS))
+    key, tid = tenant(c)
+    call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers={"X-API-Key": key}).json()
+    path = call["joinUrl"].replace("wss://vox.example.com", "")
+    try:
+        with c.websocket_connect(path) as ws:
+            ws.send_bytes(b"\x00\x00")
+    except Exception:
+        pass
+    row = store.get_call_any(call["id"])
+    assert row["status"] == "ended" and row["end_reason"] == "hangup"
+    assert lim.local_active() == 0
+    assert lim.acquire(tid, "next")
+
+
+def test_admit_write_error_releases_the_ceiling_and_ends_the_call():
+    """A database lock after acquire must not keep the slot or leave the call joinable."""
+    import sqlite3
+
+    class _Locked(Store):
+        def update_call(self, call_id, **fields):
+            if fields.get("status") == "active":
+                raise sqlite3.OperationalError("database is locked")
+            return super().update_call(call_id, **fields)
+
+    store = _Locked()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    lim = security.ConcurrencyLimiter(10, process_ceiling=1)
+    c = TestClient(create_app(store, rt, lim, None, SETTINGS))
+    key, tid = tenant(c)
+    call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers={"X-API-Key": key}).json()
+    path = call["joinUrl"].replace("wss://vox.example.com", "")
+    try:
+        with c.websocket_connect(path) as ws:
+            ws.send_bytes(b"\x00\x00")
+    except Exception:
+        pass
+    row = store.get_call_any(call["id"])
+    assert row["status"] == "ended" and row["end_reason"] == "error"
+    assert lim.local_active() == 0
+    assert lim.acquire(tid, "next")
+
+
 def test_websocket_bad_token_and_unknown_call():
     c, *_ = make()
     k, _ = tenant(c)

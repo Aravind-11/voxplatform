@@ -82,6 +82,26 @@ class MessageLog:
         self._late.clear()
         return batch
 
+    def _until_idle(self) -> None:
+        """Block until every `add` so far has been written. Caller must not hold `self._cv`."""
+        while True:
+            self._q.join()
+            with self._cv:
+                if self._q.unfinished_tasks:
+                    continue
+                if self._late or (self._closed and not self._drained):
+                    self._cv.wait()
+                    continue
+                return
+
+    def wait(self) -> None:
+        """Block until queued rows are in the store. Never call this on the event loop.
+
+        Does not consume insert errors. A reader that called `flush` would take the failure,
+        and `finish` would then report the lost transcript as a clean hang-up.
+        """
+        self._until_idle()
+
     def flush(self, call_id: str | None = None) -> None:
         """Block until every `add` so far has been written. Never call this on the event loop.
 

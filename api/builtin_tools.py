@@ -9,6 +9,7 @@ from xml.sax.saxutils import escape, quoteattr
 
 from core.session import ToolResult
 from .http_tools import NAME_RE, ToolConfigError
+from .writebehind import to_thread
 
 E164 = re.compile(r"^\+[1-9]\d{6,14}$")
 BUILTINS = {"hangUp", "transfer", "leaveVoicemail", "playDtmf", "queryCorpus", "client"}
@@ -122,7 +123,7 @@ def make(defn: dict, ctx, client):
         async def query(args: dict) -> Any:
             if ctx.docs is None:
                 return {"error": "knowledge base unavailable"}
-            version, docs = ctx.docs(defn["corpus"])
+            version, docs = await to_thread(ctx.docs, defn["corpus"])
             if version is None:
                 return {"error": f"knowledge base {defn['corpus']!r} not found"}
             if cache.get("v") != version:

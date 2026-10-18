@@ -481,6 +481,7 @@ def test_call_teardown_does_not_touch_the_database_on_the_event_loop():
 
 
 def test_failed_transcript_still_ends_the_call_and_is_not_silent(monkeypatch):
+    """A lost transcript is not a clean hang-up, even when the snapshot's own reads fail too."""
     from starlette.testclient import TestClient
 
     from api import security
@@ -490,31 +491,72 @@ def test_failed_transcript_still_ends_the_call_and_is_not_silent(monkeypatch):
     store = Store(":memory:")
     rt = Runtime(_LLM(), lambda voice: _TTS(), _VAD, store)
     lim = security.ConcurrencyLimiter(default_limit=2)
-    app = create_app(store, rt, lim, None, SETTINGS)
+    events: list[dict] = []
+
+    class D:
+        def spawn(self, url, secret, event):
+            events.append(event)
+
+    app = create_app(store, rt, lim, D(), SETTINGS)
+    phase = {"on": False}
+    state = {"wrote": False, "failure_updates": 0}
+    real_get, real_update, real_messages = store.get_call_any, store.update_call, store.messages
 
     def boom(call_id, role, text, t):
         raise sqlite3.OperationalError("disk full")
 
+    def get_call_any(call_id):
+        # The outage that lost the transcript also kills reads until a failure end has been written.
+        if phase["on"] and not state["wrote"]:
+            raise sqlite3.OperationalError("db down")
+        return real_get(call_id)
+
+    def update_call(call_id, **fields):
+        if phase["on"] and fields.get("status") == "ended":
+            if fields.get("end_reason") in (None, "", "hangup", "stream_closed", "agent_hangup", "error"):
+                raise sqlite3.OperationalError("clean end")
+            state["failure_updates"] += 1
+            if state["failure_updates"] == 1:
+                raise sqlite3.OperationalError("db down")
+            state["wrote"] = True
+        return real_update(call_id, **fields)
+
+    def messages(call_id):
+        if phase["on"]:
+            raise sqlite3.OperationalError("db down")
+        return real_messages(call_id)
+
     store.add_message = boom
+    store.get_call_any = get_call_any
+    store.update_call = update_call
+    store.messages = messages
     c = TestClient(app)
     k, _ = tenant(c)
+    assert c.put("/v1/webhook", json={"url": "https://hook.example.com/x"}, headers={"X-API-Key": k}).status_code == 200
     call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers={"X-API-Key": k}).json()
     path = call["joinUrl"].replace("wss://vox.example.com", "")
     caught = None
     try:
         with c.websocket_connect(path) as ws:
             for _ in range(50):
-                cur = store.get_call_any(call["id"])
+                cur = real_get(call["id"])
                 if cur and cur["status"] == "active":
                     break
                 time.sleep(0.02)
+            phase["on"] = True
             rt.message_log.add(call["id"], "user", "hello", 1.0)
             ws.send_bytes(silence(1)[0])
     except BaseException as exc:  # noqa: BLE001 — the disconnect must report the failed write
         caught = exc
-    assert store.get_call_any(call["id"])["status"] == "ended"
+    row = real_get(call["id"])
+    assert row["status"] == "ended" and row["end_reason"] not in (None, "", "hangup", "stream_closed", "agent_hangup", "error")
     assert lim.total_active() == 0
     assert caught is not None and "disk full" in repr(caught)
+    ended = [e for e in events if e["type"] == "call.ended"]
+    assert len(ended) == 1
+    assert ended[0]["call"]["end_reason"] == row["end_reason"]
+    assert "disk full" in ended[0].get("error", "")
+    assert "error" in ended[0]  # a clean call.ended has no failure on the payload
 
 
 def test_sip_setup_writes_stay_off_the_event_loop():
@@ -674,6 +716,226 @@ async def test_cancelled_shutdown_still_drains_the_message_log():
         assert store.messages("c") == [{"role": "user", "text": "last", "t": 1.0}]
     finally:
         release.set()
+
+
+def test_wait_makes_a_queued_row_visible_without_consuming_its_error():
+    """Readers wait out the insert, but finish() is still the caller that hears the failure."""
+    store = Store(":memory:")
+    real = store.add_message
+
+    def boom(call_id, role, text, t):
+        if text == "bad":
+            raise sqlite3.OperationalError("disk full")
+        return real(call_id, role, text, t)
+
+    store.add_message = boom
+    log = MessageLog(store)
+    try:
+        log.add("c", "user", "bad", 1.0)
+        log.wait()
+        assert store.messages("c") == []
+        with pytest.raises(sqlite3.OperationalError, match="disk full"):
+            log.flush("c")
+    finally:
+        try:
+            log.close()
+        except sqlite3.OperationalError:
+            pass
+
+
+def test_queued_transcript_is_visible_before_whisper_messages_history_or_end():
+    """A backed-up insert must not look like an empty transcript, and resume must not end the call first."""
+    import httpx
+
+    from api import security
+    from api.app import create_app
+    from tests.unit.test_api import SETTINGS, sign
+
+    store = Store(":memory:")
+    rt = Runtime(_LLM(), lambda voice: _TTS(), _VAD, store)
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), None, SETTINGS)
+    started, release = threading.Event(), threading.Event()
+    real_add, real_update, real_messages = store.add_message, store.update_call, store.messages
+    order: list[str] = []
+
+    def slow(call_id, role, text, t):
+        started.set()
+        release.wait(3)
+        return real_add(call_id, role, text, t)
+
+    def update(call_id, **fields):
+        if fields.get("end_reason") == "stream_lost":
+            rows = real_messages(call_id)
+            assert any(m["text"] == "need a refund" for m in rows), rows
+            order.append("end")
+        return real_update(call_id, **fields)
+
+    store.add_message = slow
+    store.update_call = update
+    tid = store.create_tenant("a")
+    key = security.generate_key()
+    store.add_key(tid, security.hash_key(key), "initial")
+    call = store.create_call(tid, None, "twilio", {"systemPrompt": "Be brief."},
+                             {"from": "+15550001", "to": "+15550002"})
+    real_update(call["id"], status="active", joined=time.time())
+    rt.message_log.add(call["id"], "user", "need a refund", 1.0)
+    assert started.wait(1)
+
+    async def _drive():
+        form = {"CallSid": "CA1"}
+        whisper = f"/twilio/whisper/{call['id']}"
+        resume = f"/twilio/resume/{call['id']}"
+        base = "https://vox.example.com"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=base) as client:
+            async def post(path):
+                return await client.post(path, data=form, headers=sign(base + path, form))
+
+            tasks = [
+                asyncio.create_task(post(whisper)),
+                asyncio.create_task(client.get(f"/v1/calls/{call['id']}/messages", headers={"X-API-Key": key})),
+                asyncio.create_task(post(resume)),
+                asyncio.create_task(to_thread(rt._earlier_messages, call["id"])),
+            ]
+            await asyncio.sleep(0.3)
+            # An empty read returns immediately; blocking means the handler is still inside the flush.
+            finished = [t for t in tasks if t.done()]
+            assert not finished, finished[0].result() if finished and finished[0].exception() is None else finished
+            assert real_messages(call["id"]) == []
+            assert store.get_call_any(call["id"])["status"] == "active"
+            assert order == []
+            release.set()
+            whisper_r, messages_r, resume_r, earlier = await asyncio.wait_for(asyncio.gather(*tasks), 3)
+        assert "need a refund" in whisper_r.text and "did not leave details" not in whisper_r.text
+        assert any(m["text"] == "need a refund" for m in messages_r.json())
+        assert "<Stream" in resume_r.text
+        assert any(m["text"] == "need a refund" for m in earlier)
+        assert order == ["end"]
+        assert store.get_call_any(call["id"])["status"] == "ended"
+        new = [c for c in store.list_calls(tid) if c["id"] != call["id"]][0]
+        sess = await to_thread(rt.build_session, new, _Transport())
+        assert "need a refund" in [m["content"] for m in sess.history]
+
+    try:
+        asyncio.run(_drive())
+    finally:
+        release.set()
+        try:
+            rt.message_log.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def test_query_corpus_reads_the_store_off_the_event_loop():
+    from api.tools import CallContext
+    from api import tools as toolmod
+
+    started, done = threading.Event(), {}
+
+    def docs(name):
+        started.set()
+        time.sleep(0.4)
+        done["t"] = time.monotonic()
+        return ("1", [{"id": "d1", "title": "Hours", "text": "Open on weekends."}])
+
+    _, fns = toolmod.build([{"builtin": "queryCorpus", "corpus": "faq", "topK": 1}], CallContext(docs=docs))
+    task = asyncio.create_task(fns["queryCorpus"]({"query": "weekend hours"}))
+    assert await asyncio.to_thread(started.wait, 2)
+    await asyncio.sleep(0.05)
+    assert "t" not in done  # the lookup is still in the worker; the loop was free
+    assert _on_loop()
+    out = await task
+    assert out["results"]
+
+
+async def test_slow_get_tool_create_call_and_ping_do_not_stall_the_loop():
+    """Call-path store work stays off the loop, so another task's sleep still finishes."""
+    import httpx
+
+    from api import security
+    from api.app import create_app
+    from tests.unit.test_api import SETTINGS, sign, twilio_form
+
+    store = Store(":memory:")
+    rt = Runtime(_LLM(), lambda voice: _TTS(), _VAD, store)
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=4), None, SETTINGS)
+    tid = store.create_tenant("a")
+    spec = {"name": "lookup", "description": "Find a record.",
+            "parameters": {"type": "object", "properties": {}},
+            "http": {"url": "https://example.com/lookup", "method": "GET"}}
+    store.put_tool(tid, "lookup", spec)
+    ag = store.create_agent(tid, "n", {"systemPrompt": "p", "voice": "af_heart", "greeting": "", "tools": [{"library": "lookup"}]})
+    call = store.create_call(tid, ag["id"], "webSocket", ag["config"], {})
+
+    async def _probe(started: threading.Event, done: dict):
+        assert await asyncio.to_thread(started.wait, 2)
+        assert done.get("on_loop") is False
+        t0 = time.monotonic()
+        await asyncio.sleep(0.05)
+        assert time.monotonic() - t0 < 0.25
+        assert "t" not in done  # the store call is still blocked; this sleep was not stuck behind it
+
+    def _slow(real):
+        started, done = threading.Event(), {}
+
+        def wrapped(*a, **k):
+            done["on_loop"] = _on_loop()
+            started.set()
+            time.sleep(0.4)
+            done["t"] = time.monotonic()
+            return real(*a, **k)
+
+        return wrapped, started, done
+
+    send_q: asyncio.Queue = asyncio.Queue()
+    recv_q: asyncio.Queue = asyncio.Queue()
+
+    async def receive():
+        return await send_q.get()
+
+    async def send(message):
+        await recv_q.put(message)
+
+    scope = {
+        "type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1", "scheme": "https",
+        "server": ("vox.example.com", 443), "client": ("127.0.0.1", 123),
+        "path": f"/ws/calls/{call['id']}", "raw_path": f"/ws/calls/{call['id']}".encode(),
+        "query_string": f"token={call['join_token']}".encode(), "headers": [], "root_path": "", "state": {},
+    }
+    real_tool, real_create, real_ping = store.get_tool, store.create_call, store.ping
+    try:
+        store.get_tool, started, done = _slow(real_tool)
+        ws = asyncio.create_task(app(scope, receive, send))
+        await send_q.put({"type": "websocket.connect"})
+        accept = await asyncio.wait_for(recv_q.get(), 2)
+        assert accept["type"] == "websocket.accept"
+        await _probe(started, done)
+        store.get_tool = real_tool
+
+        store.ping, started, done = _slow(real_ping)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://vox.example.com") as client:
+            health = asyncio.create_task(client.get("/healthz"))
+            await _probe(started, done)
+            assert (await health).status_code == 200
+        store.ping = real_ping
+
+        store.create_call, started, done = _slow(real_create)
+        form = twilio_form()
+        url = f"https://vox.example.com/twilio/voice/{ag['id']}"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://vox.example.com") as client:
+            voice = asyncio.create_task(client.post(f"/twilio/voice/{ag['id']}", data=form, headers=sign(url, form)))
+            await _probe(started, done)
+            assert (await voice).status_code == 200
+        store.create_call = real_create
+        await send_q.put({"type": "websocket.disconnect"})
+        await asyncio.wait_for(ws, 2)
+    finally:
+        store.get_tool, store.create_call, store.ping = real_tool, real_create, real_ping
+        release = threading.Event()
+        release.set()
+        try:
+            rt.message_log.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def test_programming_error_is_not_retried(pg_mod, monkeypatch):

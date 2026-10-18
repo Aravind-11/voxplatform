@@ -93,6 +93,13 @@ class Runtime:
         """
         self.message_log.flush(call_id)
 
+    def wait_messages(self) -> None:
+        """Block until queued transcripts are visible. Call via asyncio.to_thread.
+
+        Unlike `flush_messages`, this leaves a failed insert for `finish` to raise.
+        """
+        self.message_log.wait()
+
     def finalize(self, call_id: str) -> Optional[str]:
         """Called when a call ends: forgets the live session and writes the recording. Returns the WAV path."""
         self.live.pop(call_id, None)
@@ -105,7 +112,11 @@ class Runtime:
         return path
 
     def _earlier_messages(self, call_id: str, keep: int = 40) -> list[dict]:
-        """Transcript of the call this one continues (following the chain of reconnects), oldest first, last `keep`."""
+        """Transcript of the call this one continues (following the chain of reconnects), oldest first, last `keep`.
+
+        Waits until queued rows are written. Must not run on the event loop.
+        """
+        self.message_log.wait()
         chain: list[str] = []
         cur = call_id
         while cur and len(chain) < 4:

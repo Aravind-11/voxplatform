@@ -169,6 +169,7 @@ def test_full_sip_call_through_the_app_creates_a_call_speaks_back_and_hangs_up()
             time.sleep(0.05)
         assert calls[0]["medium"] == "sip" and calls[0]["status"] == "ended"
         assert app.state.limiter.local_active() == 0
+        assert calls[0]["metadata"].get("from") == "" and calls[0]["metadata"].get("to") == ""
 
 
 def test_number_normalize_and_setup_rows_expire():
@@ -468,3 +469,240 @@ def test_sip_doc_routes_by_number_and_passes_caller():
     assert "{{caller}}" in doc and "{{callee}}" in doc
     assessment = open("docs/ASSESSMENT.md", encoding="utf-8").read()
     assert "pass the caller number" not in assessment
+
+
+def test_sip_setup_puts_the_caller_on_the_call_and_into_the_prompt():
+    """The setup row is what a later AudioSocket reads, including after the process cache is gone.
+    A different UUID does not inherit it, and CallContext.caller is what an HTTP tool sends as `from`."""
+    import asyncio
+    import json
+    import socket
+
+    import httpx
+    from fastapi.testclient import TestClient
+    from api import security
+    from api.app import Settings, create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    tid = store.create_tenant("a")
+    caller, callee = "+15551212000", "+15551110000"
+    seen = {}
+
+    def handler(req: httpx.Request):
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"ok": True})
+
+    lookup = {"name": "lookup_caller", "description": "Look up who is calling.",
+              "parameters": {"type": "object", "properties": {}},
+              "http": {"url": "https://93.184.216.34/lookup", "method": "POST"},
+              "automatic": ["from", "to", "callSid"]}
+    ag = store.create_agent(tid, "n", {"systemPrompt": "Caller is {{caller}}", "voice": "af_heart",
+                                       "greeting": "", "tools": [lookup]})
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    rt.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = Settings(admin_key="adm", audiosocket_port=port, audiosocket_agent=ag["id"], sip_token="sip-secret")
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), None, settings)
+    u = uuid.uuid4()
+
+    def live_call(call_sid: str):
+        found = None
+        for _ in range(100):
+            for cand in store.list_calls(tid):
+                if cand["metadata"].get("callSid") == call_sid and cand["id"] in rt.live:
+                    found = cand
+                    return found
+            time.sleep(0.05)
+        return None
+
+    with TestClient(app) as c:
+        denied = c.post("/internal/sip/setup", data={"uuid": str(u), "caller": caller, "callee": callee})
+        assert denied.status_code == 403
+        assert store.get_sip_setup(str(u)) is None and str(u) not in app.state.sip_setups
+        ok = c.post("/internal/sip/setup", data={"uuid": str(u), "caller": caller, "callee": callee},
+                    headers={"X-Vox-Sip-Token": "sip-secret"})
+        assert ok.status_code == 200
+        assert app.state.sip_setups[str(u)]["caller"] == caller
+        assert app.state.sip_setups[str(u)]["callee"] == callee
+        row = store.get_sip_setup(str(u))
+        assert row is not None and row["caller"] == caller and row["callee"] == callee
+        app.state.sip_setups.clear()
+
+        other = uuid.uuid4()
+        sock_other = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock_other.settimeout(5)
+        sock_other.sendall(A.pack(A.KIND_UUID, other.bytes))
+        other_call = live_call(str(other))
+        assert other_call is not None, store.list_calls(tid)
+        assert other_call["metadata"]["from"] == "" and other_call["metadata"]["to"] == ""
+        sock_other.sendall(A.pack(A.KIND_HANGUP))
+        sock_other.close()
+        for _ in range(100):
+            if store.get_call_any(other_call["id"])["status"] == "ended":
+                break
+            time.sleep(0.05)
+        assert store.get_call_any(other_call["id"])["status"] == "ended"
+        assert store.get_call_any(other_call["id"])["metadata"]["from"] == ""
+        assert str(u) not in app.state.sip_setups
+
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.settimeout(5)
+        sock.sendall(A.pack(A.KIND_UUID, u.bytes))
+        call = live_call(str(u))
+        assert call is not None, store.list_calls(tid)
+        assert call["metadata"]["from"] == caller and call["metadata"]["to"] == callee
+        assert call["metadata"]["callSid"] == str(u)
+        assert call["metadata"]["channel"] == "sip" and call["medium"] == "sip"
+        sess = rt.live[call["id"]][0]
+        assert sess.history[0]["content"] == f"Caller is {caller}"          # {{caller}} rendered
+        asyncio.run(sess.tools["lookup_caller"]({}))
+        assert seen["body"]["from"] == caller and seen["body"]["to"] == callee
+        assert seen["body"]["callSid"] == str(u)
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        for _ in range(100):
+            if store.get_call_any(call["id"])["status"] == "ended":
+                break
+            time.sleep(0.05)
+        assert store.get_call_any(call["id"])["status"] == "ended"
+        assert store.get_call_any(call["id"])["metadata"]["from"] == caller
+
+    store2 = Store()
+    app2 = create_app(store2, Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store2),
+                      security.ConcurrencyLimiter(2), None, Settings(sip_token=""))
+    with TestClient(app2) as c2:
+        missing = c2.post("/internal/sip/setup", data={"uuid": "z", "caller": caller, "callee": callee},
+                          headers={"X-Vox-Sip-Token": "z"})
+        assert missing.status_code == 404
+        assert store2.get_sip_setup("z") is None and "z" not in app2.state.sip_setups
+
+
+def test_dialplan_keeps_the_dialed_number_and_does_not_shell_out_caller_id():
+    """_+X. must land in _X. with the digits still in ${EXTEN}. System() is a shell, and $() runs inside
+    double quotes, so CALLERID(num) and EXTEN cannot be interpolated into that command.
+    The setup helper and AudioSocket share ${CALLUUID}. The token is read inside sip_setup.py from
+    SIP_SETUP_TOKEN, so it is not placed on the command line. The helper posts the dialed number as
+    both exten and callee."""
+    text = open("deploy/sip/extensions.conf", encoding="utf-8").read()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith(";"))
+    assert "exten => _+X.,1,Goto(${EXTEN:1},1)" in code
+    assert "Goto(_X.,1)" not in code
+    shell_lines = [ln for ln in code.splitlines() if "System(" in ln or "SHELL(" in ln]
+    assert shell_lines, "the dialplan should still post the setup before AudioSocket"
+    for ln in shell_lines:
+        assert "${CALLERID(" not in ln
+        assert "${EXTEN}" not in ln
+        assert "${SIP_SETUP_TOKEN}" not in ln
+    assert "FILTER(0-9+" in code
+    assert "${SIP_CALLER}" in code and "${SIP_EXTEN}" in code
+    assert "sip_setup.py" in code
+    lines = [ln.strip() for ln in code.splitlines() if ln.strip()]
+
+    def at(fragment: str) -> int:
+        for i, ln in enumerate(lines):
+            if fragment in ln:
+                return i
+        raise AssertionError(fragment)
+
+    system_at = at("System(")
+    assert at("Set(SIP_CALLER=") < system_at and at("Set(SIP_EXTEN=") < system_at
+    assert at("Set(CALLUUID=") < system_at < at("AudioSocket(${CALLUUID}")
+    system = lines[system_at]
+    assert "${CALLUUID}" in system and "/internal/sip/setup" in system and "sip_setup.py" in system
+    assert "AudioSocket(${UUID()}" not in code
+    helper = open("deploy/sip/sip_setup.py", encoding="utf-8").read()
+    assert '"callee": exten' in helper or "'callee': exten" in helper
+    compose = open("deploy/docker-compose.yml", encoding="utf-8").read()
+    assert "VOX_SIP_TOKEN: ${VOX_SIP_TOKEN:-}" in compose
+    assert "SIP_SETUP_TOKEN: ${VOX_SIP_TOKEN:-}" in compose
+
+
+def test_sip_caller_is_dropped_when_the_call_ends_is_deleted_or_expires():
+    """The setup row is a second copy of the phone numbers. Finish, DELETE, and retention each remove it.
+    Routing ignores a row older than 60 seconds. Retention still sees the table row (max_age=None)."""
+    import socket
+    from fastapi.testclient import TestClient
+    from api import retention, security
+    from api.app import Settings, create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    tid = store.create_tenant("a")
+    key = security.generate_key()
+    store.add_key(tid, security.hash_key(key))
+    ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "", "tools": []})
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), None,
+                     Settings(admin_key="adm", audiosocket_port=port, audiosocket_agent=ag["id"],
+                              sip_token="sip-secret"))
+    caller, callee = "+15551212000", "+15551110000"
+    u = uuid.uuid4()
+    with TestClient(app) as c:
+        ok = c.post("/internal/sip/setup", data={"uuid": str(u), "caller": caller, "callee": callee},
+                    headers={"X-Vox-Sip-Token": "sip-secret"})
+        assert ok.status_code == 200
+        assert store.get_sip_setup(str(u))["caller"] == caller
+        assert app.state.sip_setups[str(u)]["caller"] == caller
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.settimeout(5)
+        sock.sendall(A.pack(A.KIND_UUID, u.bytes))
+        call = None
+        for _ in range(100):
+            for cand in store.list_calls(tid):
+                if cand["metadata"].get("callSid") == str(u) and cand["id"] in rt.live:
+                    call = cand
+                    break
+            if call:
+                break
+            time.sleep(0.05)
+        assert call is not None, store.list_calls(tid)
+        assert store.get_sip_setup(str(u)) is not None and str(u) in app.state.sip_setups
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        for _ in range(100):
+            if store.get_call_any(call["id"])["status"] == "ended":
+                break
+            time.sleep(0.05)
+        ended = store.get_call_any(call["id"])
+        assert ended["status"] == "ended" and ended["metadata"]["from"] == caller
+        assert store.get_sip_setup(str(u)) is None and str(u) not in app.state.sip_setups
+
+        u2 = str(uuid.uuid4())
+        store.put_sip_setup(u2, caller, callee)
+        app.state.sip_setups[u2] = {"uuid": u2, "caller": caller, "callee": callee, "created": time.time()}
+        parked = store.create_call(tid, ag["id"], "sip", {},
+                                   {"callSid": u2, "from": caller, "to": callee, "channel": "sip"})
+        store.update_call(parked["id"], status="ended")
+        assert c.delete(f"/v1/calls/{parked['id']}", headers={"X-API-Key": key}).status_code == 200
+        assert store.get_call_any(parked["id"]) is None
+        assert store.get_sip_setup(u2) is None and u2 not in app.state.sip_setups
+
+        now = time.time()
+        old_orphan, fresh, linked = "old-orphan", "fresh-orphan", "linked-uuid"
+        store.put_sip_setup(old_orphan, caller, callee, now - 40 * 86400)
+        store.put_sip_setup(fresh, caller, callee, now - 86400)
+        store.put_sip_setup(linked, caller, callee, now - 86400)
+        app.state.sip_setups[old_orphan] = {"uuid": old_orphan, "caller": caller, "callee": callee,
+                                            "created": now - 40 * 86400}
+        app.state.sip_setups[fresh] = {"uuid": fresh, "caller": caller, "callee": callee, "created": now - 86400}
+        app.state.sip_setups[linked] = {"uuid": linked, "caller": caller, "callee": callee, "created": now - 86400}
+        expired = store.create_call(tid, ag["id"], "sip", {}, {"callSid": linked, "from": caller, "to": callee})
+        store.update_call(expired["id"], status="ended", ended=now - 40 * 86400)
+        store.update_tenant(tid, retention_days=30)
+        assert retention.purge_expired(store, "", setups=app.state.sip_setups) == {tid: 1}
+        assert store.get_call_any(expired["id"]) is None
+        assert store.get_sip_setup(old_orphan, max_age=None) is None and old_orphan not in app.state.sip_setups
+        assert store.get_sip_setup(linked, max_age=None) is None and linked not in app.state.sip_setups
+        assert store.get_sip_setup(fresh, max_age=None)["caller"] == caller and fresh in app.state.sip_setups

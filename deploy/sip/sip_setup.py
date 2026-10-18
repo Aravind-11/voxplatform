@@ -25,7 +25,8 @@ def post_setup(caller: str, exten: str, uuid: str, token: str, url: str = DEFAUL
         return False
     if not uuid or not _SAFE_UUID.fullmatch(uuid):
         return False
-    body = urllib.parse.urlencode({"uuid": uuid, "caller": caller, "exten": exten}).encode()
+    # exten is the dialed number. callee is the same value: callers that post either field resolve the same row.
+    body = urllib.parse.urlencode({"uuid": uuid, "caller": caller, "exten": exten, "callee": exten}).encode()
     try:
         req = urllib.request.Request(
             url, data=body, method="POST", headers={"X-Vox-Sip-Token": token or ""})

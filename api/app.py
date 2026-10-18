@@ -259,7 +259,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             while True:
                 try:
                     await asyncio.get_running_loop().run_in_executor(None, lambda: retention.purge_expired(
-                        store, settings.record_dir or os.environ.get("VOX_RECORD_DIR", ""), settings.retention_default_days or None))
+                        store, settings.record_dir or os.environ.get("VOX_RECORD_DIR", ""),
+                        settings.retention_default_days or None, setups=app.state.sip_setups))
                 except Exception:  # noqa: BLE001  (try again next hour)
                     METRICS.inc("vox_errors_total", where="retention")
                 await asyncio.sleep(3600)
@@ -389,7 +390,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                              {"type": type_, "t": time.time(), "call": public_call(call), **extra})
 
     app.state.draining = False
-    app.state.sip_setups = {}          # uuid -> {caller, exten, created}; same rows as sip_setup, so tests need no extra process
+    app.state.sip_setups = {}          # uuid -> {caller, exten, callee, created}; same rows as sip_setup
 
     def at_node_cap() -> bool:
         """True when this process must refuse another call.
@@ -478,7 +479,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """Runs the retention purge now (the API also runs it hourly). Handy for cron or after changing a limit."""
         admin_only(x_admin_key)
         return {"erased": retention.purge_expired(store, settings.record_dir or os.environ.get("VOX_RETENTION_DIR", os.environ.get("VOX_RECORD_DIR", "")),
-                                                  settings.retention_default_days or None)}
+                                                  settings.retention_default_days or None, setups=app.state.sip_setups)}
 
     @app.put("/v1/webhook")
     async def set_webhook(body: WebhookIn, t: dict = Depends(tenant_admin)):
@@ -646,6 +647,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if c["status"] == "active":
             raise HTTPException(409, "call is still active")
         retention.delete_call_files(settings.record_dir or os.environ.get("VOX_RECORD_DIR", ""), call_id)
+        drop_sip_setup(c)
         store.delete_call(t["id"], call_id)
         log(t, "call.delete", call_id)
         return {"deleted": call_id}
@@ -968,6 +970,17 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             raise _Reject(1011, "unavailable")
         return t
 
+    def drop_sip_setup(call: Optional[dict]) -> None:
+        """The setup row is only how the caller id reaches the call. It is not kept after the call is over."""
+        meta = (call or {}).get("metadata") or {}
+        if isinstance(meta, str):
+            meta = json.loads(meta or "{}")
+        uid = str(meta.get("callSid") or "")
+        if not uid:
+            return
+        store.delete_sip_setup(uid)
+        app.state.sip_setups.pop(uid, None)
+
     def finish(call: dict, t: dict, reason: str) -> None:
         try:
             limiter.release(call["tenant_id"], call["id"])
@@ -982,6 +995,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         except Exception:  # noqa: BLE001  (a failed recording write must not break call teardown)
             METRICS.inc("vox_errors_total", where="finalize")
         done = store.get_call_any(call["id"])
+        drop_sip_setup(done or call)
         secs = round((done["ended"] - done["joined"]), 2) if done.get("joined") and done.get("ended") else 0.0
         webhook(t, "call.ended", done, durationSeconds=secs,
                 transcript=[{"role": m["role"], "text": m["text"], "t": m["t"]} for m in store.messages(call["id"])[:500]])
@@ -1141,25 +1155,31 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """In-memory row wins when it is fresh; the table covers a lookup from another worker. Older than 60 s is ignored."""
         now = time.time()
         mem = app.state.sip_setups.get(uid)
-        if mem and now - float(mem["created"]) <= 60:
-            return mem
+        if mem and now - float(mem.get("created") or 0) <= 60:
+            dialed = mem.get("exten") or mem.get("callee") or ""
+            return {**mem, "exten": dialed, "callee": dialed}
         return store.get_sip_setup(uid, max_age=60)
 
     @app.post("/internal/sip/setup")
     async def sip_setup(request: Request, x_vox_sip_token: str = Header(default="")):
-        """Asterisk calls this just before AudioSocket, so the UUID can be tied to the dialed number."""
+        """Asterisk posts the AudioSocket UUID, caller id, and dialed number before it connects the audio.
+
+        The dialed number is `exten` or `callee` (the same value). Both names are stored so routing and
+        {{callee}} see it.
+        """
         require_sip_token(x_vox_sip_token)
         form = {k: str(v) for k, v in (await request.form()).items()}
         uid = form.get("uuid", "").strip()
         if not uid:
             raise HTTPException(422, "uuid is required")
-        caller, exten = form.get("caller", ""), form.get("exten", "")
+        caller = form.get("caller", "")
+        dialed = form.get("exten") or form.get("callee") or ""
         created = time.time()
-        store.put_sip_setup(uid, caller, exten, created)
-        stale = [k for k, v in app.state.sip_setups.items() if created - float(v["created"]) > 60]
+        store.put_sip_setup(uid, caller, dialed, created)
+        stale = [k for k, v in app.state.sip_setups.items() if created - float(v.get("created") or 0) > 60]
         for k in stale:
             app.state.sip_setups.pop(k, None)
-        app.state.sip_setups[uid] = {"uuid": uid, "caller": caller, "exten": exten, "created": created}
+        app.state.sip_setups[uid] = {"uuid": uid, "caller": caller, "exten": dialed, "callee": dialed, "created": created}
         return {"ok": True}
 
     async def audiosocket_call(reader, writer) -> None:
@@ -1167,8 +1187,9 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
         A slot is reserved before the UUID read, so a second connection already sees a full node,
         and no call row exists until that UUID arrives. The setup row maps the UUID to the dialed
-        number, and `numbers` picks the agent. No fresh setup, or no mapping, falls back to
-        settings.audiosocket_agent. If neither resolves, the socket is closed and the slot is released.
+        number, and `numbers` picks the agent. Caller id is copied onto the call before the session
+        is built, so {{caller}} and {{callee}} are filled. No fresh setup, or no mapping, falls back
+        to settings.audiosocket_agent. If neither resolves, the socket is closed and the slot is released.
         """
         from transports.audiosocket import AudioSocketTransport
         app.state.audiosocket_writers.add(writer)
@@ -1194,8 +1215,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 uid = str(custom.get("uuid", ""))
                 setup = sip_setup_for(uid) if uid else None
                 chosen = None
+                dialed = ""
                 if setup:
-                    row = store.get_number(setup.get("exten") or "")
+                    dialed = setup.get("exten") or setup.get("callee") or ""
+                    row = store.get_number(dialed) if dialed else None
                     if row:
                         chosen = store.get_agent(row["tenant_id"], row["agent_id"])
                         if chosen is None:            # number points at a deleted agent: do not silently use the default
@@ -1212,10 +1235,12 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                         writer.close()
                         raise EOFError("node full")
                     holder = chosen
-                meta = {"callSid": uid, "channel": "sip"}
+                # build_session reads this dict, not a fresh store row, so the caller id has to be on it
+                # before the session is built ({{caller}} / CallContext.caller).
+                meta = {"callSid": uid, "channel": "sip", "from": "", "to": ""}
                 if setup:
                     meta["from"] = setup.get("caller") or ""
-                    meta["to"] = setup.get("exten") or ""
+                    meta["to"] = dialed
                 call = create_reserved(cid, chosen["tenant_id"], chosen["id"], "sip", chosen["config"], meta)
                 state["call"] = call
                 state["t"] = admit(call)
@@ -1246,6 +1271,17 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                     release_open(cur, "admit_failed")
                 else:
                     limiter.release(holder["tenant_id"], cid)
+                    # admit() records a failed active-status write as "error" so a browser websocket
+                    # still ends with that reason. This SIP leg never started, so the reason is admit_failed.
+                    # draining, node_full, and concurrency_limit are left as admit() wrote them.
+                    if cur and cur.get("end_reason") == "error":
+                        try:
+                            store.update_call(cur["id"], end_reason="admit_failed")
+                        except Exception:  # noqa: BLE001
+                            pass
+                # finish() drops the setup row for an admitted call. A rejected leg must not leave it either.
+                if cur or state.get("call"):
+                    drop_sip_setup(cur or state.get("call"))
             _abort_writer(writer)
 
     @app.on_event("startup")

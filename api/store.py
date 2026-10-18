@@ -47,7 +47,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ledger_ref ON ledger(kind, ref);
 CREATE TABLE IF NOT EXISTS numbers(
   e164 TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT);
 CREATE TABLE IF NOT EXISTS sip_setup(
-  uuid TEXT PRIMARY KEY, caller TEXT, exten TEXT, created {REAL});
+  uuid TEXT PRIMARY KEY, caller TEXT, exten TEXT, callee TEXT, created {REAL});
 """
 
 # columns added after the first release: (table, column, type)
@@ -219,10 +219,15 @@ class Store:
         return self.get_tenant(tenant_id)
 
     def delete_call(self, tenant_id: str, call_id: str) -> bool:
-        if self.get_call(tenant_id, call_id) is None:
+        call = self.get_call(tenant_id, call_id)
+        if call is None:
             return False
+        uid = str((call.get("metadata") or {}).get("callSid") or "")
         self._x("DELETE FROM messages WHERE call_id=?", (call_id,))
-        return self._x("DELETE FROM calls WHERE id=? AND tenant_id=?", (call_id, tenant_id)) > 0
+        ok = self._x("DELETE FROM calls WHERE id=? AND tenant_id=?", (call_id, tenant_id)) > 0
+        if ok and uid:
+            self.delete_sip_setup(uid)   # the staging copy of the caller id is not the call record
+        return ok
 
     def get_tenant(self, tenant_id: str) -> Optional[dict]:
         return self._one("SELECT * FROM tenants WHERE id=?", (tenant_id,))
@@ -453,17 +458,34 @@ class Store:
     def list_numbers(self, tenant_id: str) -> list[dict]:
         return self._all("SELECT e164, tenant_id, agent_id FROM numbers WHERE tenant_id=? ORDER BY e164", (tenant_id,))
 
-    # ---- SIP setup rows written by the dialplan just before AudioSocket connects. Older than max_age are ignored.
+    # ---- SIP setup rows written by the dialplan just before AudioSocket connects.
+    # The third argument is the dialed number. It is stored as both exten and callee.
+    # get_sip_setup hides rows older than max_age (default 60s) so a stale post cannot route a new call.
+    # Pass max_age=None to read the table itself (retention checks). delete and purge remove the row.
     def put_sip_setup(self, uuid: str, caller: str, exten: str, created: Optional[float] = None) -> None:
         created = time.time() if created is None else created
-        self._x("INSERT INTO sip_setup(uuid, caller, exten, created) VALUES(?,?,?,?) "
-                "ON CONFLICT(uuid) DO UPDATE SET caller=excluded.caller, exten=excluded.exten, created=excluded.created",
-                (uuid, caller, exten, created))
+        dialed = exten or ""
+        self._x("INSERT INTO sip_setup(uuid, caller, exten, callee, created) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(uuid) DO UPDATE SET caller=excluded.caller, exten=excluded.exten, "
+                "callee=excluded.callee, created=excluded.created",
+                (uuid, caller, dialed, dialed, created))
 
-    def get_sip_setup(self, uuid: str, max_age: float = 60.0) -> Optional[dict]:
-        r = self._one("SELECT uuid, caller, exten, created FROM sip_setup WHERE uuid=?", (uuid,))
+    def get_sip_setup(self, uuid: str, max_age: Optional[float] = 60.0) -> Optional[dict]:
+        r = self._one("SELECT uuid, caller, exten, callee, created FROM sip_setup WHERE uuid=?", (uuid,))
         if not r:
             return None
         if max_age is not None and time.time() - float(r["created"]) > max_age:
             return None
-        return dict(r)
+        row = dict(r)
+        dialed = row.get("exten") or row.get("callee") or ""
+        row["exten"] = dialed
+        row["callee"] = dialed
+        return row
+
+    def delete_sip_setup(self, uuid: str) -> None:
+        if uuid:
+            self._x("DELETE FROM sip_setup WHERE uuid=?", (uuid,))
+
+    def purge_sip_setups(self, cutoff: float) -> int:
+        """Drops setup rows posted before `cutoff`, including ones that never became a call."""
+        return self._x("DELETE FROM sip_setup WHERE created < ?", (cutoff,))

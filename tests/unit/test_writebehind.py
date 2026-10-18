@@ -1283,6 +1283,7 @@ async def test_slow_get_tool_create_call_and_ping_do_not_stall_the_loop():
         "query_string": f"token={call['join_token']}".encode(), "headers": [], "root_path": "", "state": {},
     }
     real_tool, real_create, real_ping = store.get_tool, store.create_call, store.ping
+    real_get = store.get_call_any
     try:
         store.get_tool, started, done = _slow(real_tool)
         ws = asyncio.create_task(app(scope, receive, send))
@@ -1307,10 +1308,44 @@ async def test_slow_get_tool_create_call_and_ping_do_not_stall_the_loop():
             await _probe(started, done)
             assert (await voice).status_code == 200
         store.create_call = real_create
+
+        store.get_call_any, started, done = _slow(real_get)
+        form = {"DialCallStatus": "completed"}
+        url = f"https://vox.example.com/twilio/transfer-result/{call['id']}?to=billing"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://vox.example.com") as client:
+            transfer = asyncio.create_task(client.post(
+                f"/twilio/transfer-result/{call['id']}?to=billing", data=form, headers=sign(url, form)))
+            await _probe(started, done)
+            hung = await transfer
+        assert hung.status_code == 200 and "<Hangup/>" in hung.text and "<Stream" not in hung.text
+        store.get_call_any = real_get
+
+        store.get_call_any, started, done = _slow(real_get)
+        form = {"AnsweredBy": "human"}
+        url = f"https://vox.example.com/twilio/amd/{call['id']}"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://vox.example.com") as client:
+            amd = asyncio.create_task(client.post(f"/twilio/amd/{call['id']}", data=form, headers=sign(url, form)))
+            await _probe(started, done)
+            amd_res = await amd
+        assert amd_res.status_code == 200 and amd_res.json() == {"action": "none", "answeredBy": "human"}
+        store.get_call_any = real_get
+
+        store.create_call, started, done = _slow(real_create)
+        form = {"DialCallStatus": "no-answer"}
+        url = f"https://vox.example.com/twilio/transfer-result/{call['id']}?to=billing"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://vox.example.com") as client:
+            back = asyncio.create_task(client.post(
+                f"/twilio/transfer-result/{call['id']}?to=billing", data=form, headers=sign(url, form)))
+            await _probe(started, done)
+            back_res = await back
+        assert back_res.status_code == 200 and "<Connect>" in back_res.text and "<Stream" in back_res.text
+        store.create_call = real_create
+
         await send_q.put({"type": "websocket.disconnect"})
         await asyncio.wait_for(ws, 2)
     finally:
         store.get_tool, store.create_call, store.ping = real_tool, real_create, real_ping
+        store.get_call_any = real_get
         release = threading.Event()
         release.set()
         try:
@@ -1429,3 +1464,312 @@ def test_programming_error_is_not_retried(pg_mod, monkeypatch):
     monkeypatch.setattr(store, "_open_postgres", open_postgres)
     with pytest.raises(err):
         store._run("NOPE")
+
+
+def _ws_scope(call: dict) -> dict:
+    path = f"/ws/calls/{call['id']}"
+    return {
+        "type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1", "scheme": "https",
+        "server": ("vox.example.com", 443), "client": ("127.0.0.1", 123),
+        "path": path, "raw_path": path.encode(),
+        "query_string": f"token={call['join_token']}".encode(), "headers": [], "root_path": "", "state": {},
+    }
+
+
+def _hold_get_tenant(store, need: int):
+    """Replace get_tenant so `need` callers sit inside it until `release` is set."""
+    real = store.get_tenant
+    entered, release, lock = threading.Event(), threading.Event(), threading.Lock()
+    seen = {"n": 0}
+
+    def get_tenant(tenant_id):
+        with lock:
+            seen["n"] += 1
+            if seen["n"] >= need:
+                entered.set()
+        release.wait(5)
+        return real(tenant_id)
+
+    store.get_tenant = get_tenant
+    return real, entered, release
+
+
+async def _open_ws(app, call):
+    send_q: asyncio.Queue = asyncio.Queue()
+    recv_q: asyncio.Queue = asyncio.Queue()
+
+    async def receive():
+        return await send_q.get()
+
+    async def send(message):
+        await recv_q.put(message)
+
+    task = asyncio.create_task(app(_ws_scope(call), receive, send))
+    await send_q.put({"type": "websocket.connect"})
+    return task, send_q, recv_q
+
+
+async def _next_close(recv_q, timeout: float = 2.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError("websocket did not close")
+        msg = await asyncio.wait_for(recv_q.get(), remaining)
+        if msg.get("type") == "websocket.close":
+            return msg
+
+
+def _stop_log(rt) -> None:
+    try:
+        rt.message_log.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _admit_app(dispatcher=None, limit: int = 1):
+    from api import security
+    from api.app import create_app
+    from tests.unit.test_api import SETTINGS
+
+    store = Store(":memory:")
+    rt = Runtime(_LLM(), lambda voice: _TTS(), _VAD, store)
+    lim = security.ConcurrencyLimiter(default_limit=limit)
+    app = create_app(store, rt, lim, dispatcher, SETTINGS)
+    tid = store.create_tenant("a", concurrency_limit=limit)
+    return store, rt, app, lim, tid
+
+
+def test_update_call_if_status_changes_a_created_row_once():
+    store = Store(":memory:")
+    tid = store.create_tenant("a")
+    call = store.create_call(tid, None, "webSocket", {}, {})
+    assert store.update_call_if_status(call["id"], "created", status="active", joined=1.0)
+    assert not store.update_call_if_status(call["id"], "created", status="ended", ended=2.0, end_reason="busy")
+    row = store.get_call_any(call["id"])
+    assert row["status"] == "active" and row["joined"] == 1.0 and row["end_reason"] is None
+
+
+async def test_one_join_claims_the_call_and_holds_the_slot_until_it_finishes():
+    """Two joins overlapping get_tenant must not both start, and the loser must not free the slot."""
+    events: list[str] = []
+    started = threading.Event()
+
+    class D:
+        def spawn(self, url, secret, event):
+            events.append(event["type"])
+            if event["type"] == "call.started":
+                started.set()
+
+    store, rt, app, lim, tid = _admit_app(D(), limit=1)
+    store.set_webhook(tid, "https://hook.example.com/x", "sec")
+    cfg = {"systemPrompt": "p", "greeting": ""}
+    call = store.create_call(tid, None, "webSocket", cfg, {})
+    other = store.create_call(tid, None, "webSocket", cfg, {})
+    real, entered, release = _hold_get_tenant(store, 2)
+    sockets: list[tuple] = []
+    waiters: list = []
+    try:
+        a_task, a_send, a_recv = await _open_ws(app, call)
+        b_task, b_send, b_recv = await _open_ws(app, call)
+        sockets.extend([(a_task, a_send), (b_task, b_send)])
+        assert await asyncio.to_thread(entered.wait, 2)
+        waiters = [asyncio.create_task(_next_close(a_recv)), asyncio.create_task(_next_close(b_recv))]
+        release.set()
+        assert await asyncio.to_thread(started.wait, 2)
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline and events.count("call.started") < 2:
+            await asyncio.sleep(0.02)
+        assert events.count("call.started") == 1
+        finished, pending = await asyncio.wait(set(waiters), timeout=2, return_when=asyncio.FIRST_COMPLETED)
+        assert finished, f"second join was not rejected; events={events}"
+        msg = next(iter(finished)).result()
+        assert msg["code"] == 4401 and msg["reason"] == "call not joinable"
+        for w in pending:
+            w.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        loser_is_a = waiters[0] in finished
+        winner_task, winner_send = (b_task, b_send) if loser_is_a else (a_task, a_send)
+        loser_task = a_task if loser_is_a else b_task
+        await asyncio.wait_for(loser_task, 2)
+        assert not winner_task.done()
+        assert lim.active(tid) == 1
+        assert store.get_call_any(call["id"])["status"] == "active"
+        store.get_tenant = real
+        c_task, c_send, c_recv = await _open_ws(app, other)
+        sockets.append((c_task, c_send))
+        msg = await _next_close(c_recv)
+        assert msg["code"] == 1013 and msg["reason"] == "concurrency limit"
+        await asyncio.wait_for(c_task, 2)
+        assert lim.active(tid) == 1
+        assert store.get_call_any(call["id"])["status"] == "active"
+        third = store.get_call_any(other["id"])
+        assert third["status"] == "ended" and third["end_reason"] == "concurrency_limit"
+        await winner_send.put({"type": "websocket.disconnect"})
+        await asyncio.wait_for(winner_task, 2)
+        assert lim.active(tid) == 0
+        assert events.count("call.started") == 1 and events.count("call.ended") == 1
+    finally:
+        release.set()
+        store.get_tenant = real
+        for w in waiters:
+            if not w.done():
+                w.cancel()
+        for task, send_q in sockets:
+            if not task.done():
+                await send_q.put({"type": "websocket.disconnect"})
+                try:
+                    await asyncio.wait_for(task, 2)
+                except Exception:  # noqa: BLE001
+                    task.cancel()
+        _stop_log(rt)
+
+
+async def test_busy_during_admit_stays_ended_and_takes_no_slot():
+    import httpx
+
+    from tests.unit.test_api import sign
+
+    events: list[str] = []
+
+    class D:
+        def spawn(self, url, secret, event):
+            events.append(event["type"])
+
+    store, rt, app, lim, tid = _admit_app(D(), limit=1)
+    store.set_webhook(tid, "https://hook.example.com/x", "sec")
+    call = store.create_call(tid, None, "webSocket", {"systemPrompt": "p", "greeting": ""}, {})
+    real, entered, release = _hold_get_tenant(store, 1)
+    task = send_q = None
+    try:
+        task, send_q, recv_q = await _open_ws(app, call)
+        assert await asyncio.to_thread(entered.wait, 2)
+        form = {"CallStatus": "busy"}
+        url = f"https://vox.example.com/twilio/status/{call['id']}"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://vox.example.com") as client:
+            res = await client.post(f"/twilio/status/{call['id']}", data=form, headers=sign(url, form))
+        assert res.status_code == 200
+        row = store.get_call_any(call["id"])
+        assert row["status"] == "ended" and row["end_reason"] == "busy"
+        release.set()
+        try:
+            msg = await _next_close(recv_q)
+        except AssertionError:
+            row = store.get_call_any(call["id"])
+            raise AssertionError(f"websocket did not close; row={row['status']}/{row['end_reason']} events={events}")
+        assert msg["code"] == 4401 and msg["reason"] == "call not joinable"
+        await asyncio.wait_for(task, 2)
+        row = store.get_call_any(call["id"])
+        assert row["status"] == "ended" and row["end_reason"] == "busy" and not row["joined"]
+        assert "call.started" not in events
+        assert lim.total_active() == 0
+    finally:
+        release.set()
+        store.get_tenant = real
+        if task is not None and send_q is not None and not task.done():
+            await send_q.put({"type": "websocket.disconnect"})
+            try:
+                await asyncio.wait_for(task, 2)
+            except Exception:  # noqa: BLE001
+                task.cancel()
+        _stop_log(rt)
+
+
+async def test_drain_during_admit_does_not_activate_or_take_a_slot():
+    events: list[str] = []
+
+    class D:
+        def spawn(self, url, secret, event):
+            events.append(event["type"])
+
+    store, rt, app, lim, tid = _admit_app(D(), limit=1)
+    store.set_webhook(tid, "https://hook.example.com/x", "sec")
+    call = store.create_call(tid, None, "webSocket", {"systemPrompt": "p", "greeting": ""}, {})
+    real, entered, release = _hold_get_tenant(store, 1)
+    task = send_q = None
+    try:
+        task, send_q, recv_q = await _open_ws(app, call)
+        assert await asyncio.to_thread(entered.wait, 2)
+        app.state.draining = True
+        release.set()
+        try:
+            msg = await _next_close(recv_q)
+        except AssertionError:
+            row = store.get_call_any(call["id"])
+            raise AssertionError(f"websocket did not close; row={row['status']}/{row['end_reason']} events={events}")
+        assert msg["code"] == 1013 and msg["reason"] == "node is draining"
+        await asyncio.wait_for(task, 2)
+        row = store.get_call_any(call["id"])
+        assert row["status"] == "ended" and row["end_reason"] == "draining"
+        assert "call.started" not in events
+        assert lim.total_active() == 0
+    finally:
+        release.set()
+        store.get_tenant = real
+        app.state.draining = False
+        if task is not None and send_q is not None and not task.done():
+            await send_q.put({"type": "websocket.disconnect"})
+            try:
+                await asyncio.wait_for(task, 2)
+            except Exception:  # noqa: BLE001
+                task.cancel()
+        _stop_log(rt)
+
+
+async def test_status_callback_does_not_clobber_a_join_that_claimed_created():
+    """A terminal status that already observed `created` must not end the join that claimed the row."""
+    import httpx
+
+    from tests.unit.test_api import sign
+
+    store, rt, app, lim, tid = _admit_app()
+    call = store.create_call(tid, None, "webSocket", {"systemPrompt": "p", "greeting": ""}, {})
+    real = store.get_call_any
+    seen, release = threading.Event(), threading.Event()
+    held = {"on": False}
+
+    def get_call_any(cid):
+        row = real(cid)
+        if not held["on"] and cid == call["id"] and row and row["status"] == "created":
+            held["on"] = True
+            seen.set()
+            release.wait(5)
+            return row
+        return row
+
+    store.get_call_any = get_call_any
+    task = send_q = None
+    try:
+        form = {"CallStatus": "busy"}
+        url = f"https://vox.example.com/twilio/status/{call['id']}"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://vox.example.com") as client:
+            status_task = asyncio.create_task(client.post(
+                f"/twilio/status/{call['id']}", data=form, headers=sign(url, form)))
+            assert await asyncio.to_thread(seen.wait, 2)
+            task, send_q, recv_q = await _open_ws(app, call)
+            row = None
+            for _ in range(100):
+                row = real(call["id"])
+                if row and row["status"] == "active":
+                    break
+                await asyncio.sleep(0.02)
+            assert row is not None and row["status"] == "active"
+            release.set()
+            res = await status_task
+        assert res.status_code == 200
+        row = real(call["id"])
+        assert row["status"] == "active" and not row["end_reason"] and row["joined"]
+        assert lim.active(tid) == 1
+        await send_q.put({"type": "websocket.disconnect"})
+        await asyncio.wait_for(task, 2)
+        assert lim.active(tid) == 0
+    finally:
+        release.set()
+        store.get_call_any = real
+        if task is not None and send_q is not None and not task.done():
+            await send_q.put({"type": "websocket.disconnect"})
+            try:
+                await asyncio.wait_for(task, 2)
+            except Exception:  # noqa: BLE001
+                task.cancel()
+        _stop_log(rt)

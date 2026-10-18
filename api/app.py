@@ -757,15 +757,26 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if call["status"] != "created":
             raise _Reject(4401, "call not joinable")
         if app.state.draining:
-            await to_thread(store.update_call, call["id"], status="ended", ended=time.time(), end_reason="draining")
+            await to_thread(store.update_call_if_status, call["id"], "created",
+                            status="ended", ended=time.time(), end_reason="draining")
             raise _Reject(1013, "node is draining")
         t = await to_thread(store.get_tenant, call["tenant_id"])
+        # The status check above is from before get_tenant. Claim the created row after that
+        # await, and only then take a slot. A drain in this gap is a failed claim: do not acquire.
+        if app.state.draining:
+            await to_thread(store.update_call_if_status, call["id"], "created",
+                            status="ended", ended=time.time(), end_reason="draining")
+            raise _Reject(1013, "node is draining")
         cap = t["concurrency_limit"] or settings.default_concurrency
+        claimed = await to_thread(
+            store.update_call_if_status, call["id"], "created",
+            status="active", joined=time.time())
+        if not claimed:
+            raise _Reject(4401, "call not joinable")
         if not limiter.acquire(call["tenant_id"], call["id"], cap):
             await to_thread(store.update_call, call["id"], status="ended", ended=time.time(),
                             end_reason="concurrency_limit")
             raise _Reject(1013, "concurrency limit")
-        await to_thread(store.update_call, call["id"], status="active", joined=time.time())
         fresh = await to_thread(store.get_call_any, call["id"])
         webhook(t, "call.started", fresh)
         return t
@@ -1106,8 +1117,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not call:
             raise HTTPException(404, "call not found")
         status = form.get("CallStatus", "")
-        if call["status"] == "created" and status in ("busy", "failed", "no-answer", "canceled", "completed"):
-            await to_thread(store.update_call, call_id, status="ended", ended=time.time(), end_reason=status)   # never answered / never connected
+        # The snapshot above goes stale across this await. Only a row still in `created` ends here,
+        # so a join that already claimed it is not rewritten back to busy/no-answer.
+        if status in ("busy", "failed", "no-answer", "canceled", "completed"):
+            await to_thread(store.update_call_if_status, call_id, "created",
+                            status="ended", ended=time.time(), end_reason=status)
         return {"ok": True}
 
     @app.post("/twilio/whisper/{call_id}")
@@ -1140,7 +1154,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """Twilio's <Dial action>: hang up when the human talked and finished; if nobody answered, bring the agent back."""
         form = {k: str(v) for k, v in (await request.form()).items()}
         twilio_check(request, form)
-        call = store.get_call_any(call_id)
+        call = await to_thread(store.get_call_any, call_id)
         if not call:
             raise HTTPException(404, "call not found")
         if form.get("DialCallStatus", "") == "completed":
@@ -1152,7 +1166,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         cfg["greeting"] = f"Sorry, {who} is not available right now. Is there anything else I can help you with?"
         cfg["systemPrompt"] = (cfg.get("systemPrompt") or "") + f"\nThe caller asked to be transferred to {who}, who did not answer. Offer to help or to take a message."
         meta = {**call["metadata"], "resumedFrom": call_id}
-        resumed = store.create_call(call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
+        resumed = await to_thread(store.create_call, call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
         return Response(stream_twiml(resumed), media_type="text/xml")
 
     @app.post("/twilio/amd/{call_id}")
@@ -1160,7 +1174,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """Answering-machine detection result. On a machine, play the prepared message and hang up."""
         form = {k: str(v) for k, v in (await request.form()).items()}
         twilio_check(request, form)
-        call = store.get_call_any(call_id)
+        call = await to_thread(store.get_call_any, call_id)
         if not call:
             raise HTTPException(404, "call not found")
         answered = form.get("AnsweredBy", "")

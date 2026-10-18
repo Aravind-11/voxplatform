@@ -493,6 +493,20 @@ class Store:
             cols = ", ".join(f"{k}=?" for k in fields)
             self._x(f"UPDATE calls SET {cols} WHERE id=?", (*fields.values(), call_id))
 
+    def update_call_if_status(self, call_id: str, current: str, **fields: Any) -> bool:
+        """Apply `fields` only while the row's status is still `current`. False if that lost the race."""
+        allowed = {"status", "joined", "ended", "end_reason", "metadata"}
+        assert set(fields) <= allowed, f"unexpected fields {set(fields) - allowed}"
+        if "metadata" in fields:
+            fields["metadata"] = json.dumps(fields["metadata"])
+        if not fields:
+            return False
+        cols = ", ".join(f"{k}=?" for k in fields)
+        return self._x(
+            f"UPDATE calls SET {cols} WHERE id=? AND status=?",
+            (*fields.values(), call_id, current),
+        ) > 0
+
     # ---- usage
     def usage(self, tenant_id: str, days: int = 30) -> dict:
         """Totals plus per-day and per-agent breakdowns (UTC days) over the last `days` days."""

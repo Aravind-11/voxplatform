@@ -141,21 +141,65 @@ async def test_limited_tts_follows_a_wav_sample_rate_change():
 
 async def test_http_tts_does_not_play_an_error_document_as_pcm():
     class _Err:
-        def __init__(self, status, content):
+        def __init__(self, status, content, content_type=None):
             self.status_code = status
             self.content = content
+            self.headers = {"content-type": content_type} if content_type else {}
 
     class _ClientErr:
-        def __init__(self, status, content):
-            self.status, self.content = status, content
+        def __init__(self, status, content, content_type=None):
+            self.status, self.content, self.content_type = status, content, content_type
 
         async def post(self, url, json=None, headers=None):
-            return _Err(self.status, self.content)
+            return _Err(self.status, self.content, self.content_type)
 
     with pytest.raises(RuntimeError):
         _ = [c async for c in HttpTTS("http://tts.example/v1", _ClientErr(500, b'{"error":"no"}')).synthesize("hi")]
     with pytest.raises(ValueError):
         _ = [c async for c in HttpTTS("http://tts.example/v1", _ClientErr(200, b'{"error":"no"}')).synthesize("hi")]
+    with pytest.raises(ValueError):
+        _ = [c async for c in HttpTTS("http://tts.example/v1", _ClientErr(200, b'\n{"error":"no"}\n')).synthesize("hi")]
+    played: list = []
+    with pytest.raises(ValueError):
+        async for c in HttpTTS("http://tts.example/v1", _byte_stream(b'\n{"error":"no"}', 3)).synthesize("hi"):
+            played.append(c)
+    assert played == []
+    with pytest.raises(ValueError):
+        _ = [c async for c in HttpTTS(
+            "http://tts.example/v1", _ClientErr(200, b"Internal Server Error", "text/plain")).synthesize("hi")]
+
+
+def _byte_stream(body: bytes, step: int):
+    class Client:
+        def post(self, url, json=None, headers=None):
+            async def chunks():
+                for i in range(0, len(body), step):
+                    yield body[i:i + step]
+
+            return chunks()
+
+    return Client()
+
+
+async def test_split_wav_keeps_its_sample_rate_and_every_sample():
+    """A WAV header cut across short reads is not raw 24 kHz, and a 1-byte read is not dropped."""
+    samples = list(range(20))
+    body = _wav(samples, 16000)
+    for step in (1, 7, 13):
+        tts = HttpTTS("http://tts.example/v1", _byte_stream(body, step), sample_rate=24000)
+        got = [c async for c in tts.synthesize("hi")]
+        pcm = np.concatenate(got) if got else np.zeros(0, np.int16)
+        assert tts.sample_rate == 16000
+        assert pcm.tolist() == samples
+
+
+async def test_a_pcm_sample_split_across_chunks_is_not_dropped():
+    raw = np.asarray([1000, -1000, 2000, -2000], dtype=np.int16).tobytes()
+    tts = HttpTTS("http://tts.example/v1", _byte_stream(raw, 3), sample_rate=24000)
+    got = [c async for c in tts.synthesize("hi")]
+    pcm = np.concatenate(got)
+    assert pcm.tolist() == [1000, -1000, 2000, -2000]
+    assert tts.sample_rate == 24000
 
 
 def test_claim_words_so_far_does_not_mark_the_rest_of_the_sentence_heard():

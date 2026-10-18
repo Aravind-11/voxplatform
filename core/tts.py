@@ -141,6 +141,30 @@ class KokoroTTS:
             await asyncio.shield(fut)
 
 
+_WS = b" \t\r\n"
+_ERR_OPEN = b"{[<"
+
+
+def _text_media(resp) -> bool:
+    """A JSON or text Content-Type is an error document, not a raw PCM body."""
+    headers = getattr(resp, "headers", None)
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return False
+    ctype = str(getter("content-type") or "").split(";", 1)[0].strip().lower()
+    return ctype.startswith("text/") or ctype == "application/json" or ctype.endswith("+json")
+
+
+def _is_error_document(raw: bytes) -> bool:
+    """JSON or HTML, including a leading BOM or whitespace. Those bytes are not s16le audio."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    i = 0
+    while i < len(raw) and raw[i] in _WS:
+        i += 1
+    return i < len(raw) and raw[i:i + 1] in _ERR_OPEN
+
+
 def _pcm_from_tts(raw, default_rate: int) -> tuple[np.ndarray, int]:
     """WAV bytes -> int16 PCM and the header rate. Anything else is raw s16le at `default_rate`."""
     if isinstance(raw, np.ndarray):
@@ -167,11 +191,172 @@ def _pcm_from_tts(raw, default_rate: int) -> tuple[np.ndarray, int]:
             pcm = pcm.reshape(-1, channels)[:, 0].copy()
         return pcm, rate
     # An error document (JSON or HTML) is even-length often enough to decode as loud PCM.
-    if raw[:1] in (b"{", b"[", b"<"):
+    if _is_error_document(raw):
         raise ValueError("HttpTTS response was not audio")
     if len(raw) % 2:
         raw = raw[: len(raw) - 1]
     return np.frombuffer(raw, dtype="<i2").copy(), default_rate
+
+
+class _BytePCM:
+    """Join streamed body reads into int16 chunks.
+
+    A read is not a whole sample, and a WAV header usually arrives before its data. Decoding
+    each read on its own plays the header at the default rate or drops the odd trailing byte.
+    """
+
+    def __init__(self, default_rate: int) -> None:
+        self.default_rate = default_rate
+        self.rate = default_rate
+        self._buf = bytearray()
+        self._i = 0
+        self._mode = "unk"  # unk until the leading bytes say wav or raw
+        self._channels = 1
+        self._data_left: int | None = None  # bytes still owed by the wav data chunk; -1 if the size is unknown
+
+    def feed(self, piece) -> list[np.ndarray]:
+        if isinstance(piece, np.ndarray):
+            ready = self._pull(final=False)
+            pcm, _rate = _pcm_from_tts(piece, self.rate)
+            if len(pcm):
+                ready.append(pcm)
+            return ready
+        self._buf += bytes(piece)
+        return self._pull(final=False)
+
+    def finish(self) -> list[np.ndarray]:
+        return self._pull(final=True)
+
+    def _pull(self, final: bool) -> list[np.ndarray]:
+        out: list[np.ndarray] = []
+        while True:
+            if self._mode == "unk" and not self._classify(final):
+                break
+            if self._mode == "raw":
+                out.extend(self._take_raw(final))
+                break
+            if self._data_left is None and not self._take_header():
+                if final and self._i < len(self._buf):
+                    raise ValueError("HttpTTS response was not audio")
+                break
+            out.extend(self._take_wav(final))
+            if self._data_left != 0:
+                break
+            self._mode = "unk"
+            self._data_left = None
+            if self._i >= len(self._buf):
+                break
+        self._compact()
+        return out
+
+    def _classify(self, final: bool) -> bool:
+        view = bytes(self._buf[self._i:])
+        if not view:
+            return False
+        if _is_error_document(view):
+            raise ValueError("HttpTTS response was not audio")
+        if _pending_error_prefix(view) and not final:
+            return False
+        if final and view.strip(b" \t\r\n") == b"" and view[:1] not in (b"R", b"r"):
+            raise ValueError("HttpTTS response was not audio")
+        if view.startswith(b"RIFF"):
+            if len(view) < 12 and not final:
+                return False
+            if len(view) >= 12 and view[8:12] != b"WAVE":
+                raise ValueError("HttpTTS response was not audio")
+            self._mode = "wav"
+            return True
+        if not final and len(view) < 4 and view.startswith(b"R"):
+            return False
+        self._mode = "raw"
+        return True
+
+    def _take_header(self) -> bool:
+        view = self._buf[self._i:]
+        if len(view) < 12:
+            return False
+        pos = 12
+        rate = channels = width = None
+        while pos + 8 <= len(view):
+            cid = bytes(view[pos:pos + 4])
+            size = int.from_bytes(view[pos + 4:pos + 8], "little")
+            start = pos + 8
+            if cid == b"data":
+                if width != 2:
+                    if width is None:
+                        raise ValueError("HttpTTS response was not audio")
+                    raise ValueError(f"HttpTTS expected 16-bit audio, got {width * 8}-bit")
+                if rate is None or not channels:
+                    raise ValueError("HttpTTS response was not audio")
+                self.rate = rate or self.default_rate
+                self._channels = channels
+                self._i += start
+                self._data_left = -1 if size >= 0x7FFFFFFF else size
+                return True
+            if size < 0 or start + size > len(view):
+                return False
+            if cid == b"fmt ":
+                if size < 16:
+                    raise ValueError("HttpTTS response was not audio")
+                channels = int.from_bytes(view[start + 2:start + 4], "little")
+                rate = int.from_bytes(view[start + 4:start + 8], "little")
+                width = int.from_bytes(view[start + 14:start + 16], "little") // 8
+            pos = start + size + (size & 1)
+        return False
+
+    def _take_wav(self, final: bool) -> list[np.ndarray]:
+        frame = self._channels * 2
+        if self._data_left is not None and self._data_left < 0 and final:
+            self._data_left = len(self._buf) - self._i
+        avail = len(self._buf) - self._i
+        if self._data_left is not None and self._data_left >= 0:
+            avail = min(avail, self._data_left)
+        n = avail - (avail % frame)
+        if n:
+            raw = bytes(self._buf[self._i:self._i + n])
+            self._i += n
+            if self._data_left is not None and self._data_left >= 0:
+                self._data_left -= n
+            pcm = np.frombuffer(raw, dtype="<i2").copy()
+            if self._channels > 1:
+                pcm = pcm.reshape(-1, self._channels)[:, 0].copy()
+        else:
+            pcm = np.zeros(0, dtype=np.int16)
+        if final and self._data_left is not None and self._data_left > 0:
+            drop = min(len(self._buf) - self._i, self._data_left)
+            self._i += drop
+            self._data_left -= drop
+        return [pcm] if len(pcm) else []
+
+    def _take_raw(self, final: bool) -> list[np.ndarray]:
+        avail = len(self._buf) - self._i
+        n = avail - (avail % 2)
+        if n <= 0:
+            if final:
+                self._i = len(self._buf)
+            return []
+        raw = bytes(self._buf[self._i:self._i + n])
+        self._i += n
+        if final:
+            self._i = len(self._buf)
+        return [np.frombuffer(raw, dtype="<i2").copy()]
+
+    def _compact(self) -> None:
+        if self._i and (self._i == len(self._buf) or self._i > 4096):
+            del self._buf[:self._i]
+            self._i = 0
+
+
+def _pending_error_prefix(view: bytes) -> bool:
+    """True while the leading bytes could still become a JSON/HTML error and not audio."""
+    if view.startswith(b"\xef") and not view.startswith(b"\xef\xbb\xbf"):
+        return len(view) < 3
+    if view.startswith(b"\xef\xbb\xbf"):
+        view = view[3:]
+    i = 0
+    while i < len(view) and view[i] in _WS:
+        i += 1
+    return i == len(view)
 
 
 async def _response_bytes(resp) -> bytes:
@@ -209,6 +394,19 @@ class HttpTTS:
         self.api_key = api_key
         self.sample_rate = sample_rate
 
+    async def _iter_pieces(self, pieces) -> AsyncIterator[np.ndarray]:
+        dec = _BytePCM(self.sample_rate)
+        async for piece in pieces:
+            for pcm in dec.feed(piece):
+                self.sample_rate = dec.rate
+                if len(pcm):
+                    yield pcm
+            self.sample_rate = dec.rate
+        for pcm in dec.finish():
+            self.sample_rate = dec.rate
+            if len(pcm):
+                yield pcm
+
     async def synthesize(self, text: str) -> AsyncIterator[np.ndarray]:
         payload = {"model": self.model, "voice": self.voice, "input": text}
         kwargs: dict = {"json": payload}
@@ -216,22 +414,18 @@ class HttpTTS:
             kwargs["headers"] = {"Authorization": f"Bearer {self.api_key}"}
         posted = self.client.post(f"{self.base_url}/audio/speech", **kwargs)
         if hasattr(posted, "__aiter__"):
-            async for piece in posted:
-                pcm, rate = _pcm_from_tts(piece, self.sample_rate)
-                self.sample_rate = rate
-                if len(pcm):
-                    yield pcm
+            async for pcm in self._iter_pieces(posted):
+                yield pcm
             return
         resp = await posted
         status = getattr(resp, "status_code", None)
         if status is not None and int(status) >= 400:
             raise RuntimeError(f"HttpTTS HTTP {status}")
+        if _text_media(resp):
+            raise ValueError("HttpTTS response was not audio")
         if hasattr(resp, "__aiter__") and not isinstance(resp, (bytes, bytearray)):
-            async for piece in resp:
-                pcm, rate = _pcm_from_tts(piece, self.sample_rate)
-                self.sample_rate = rate
-                if len(pcm):
-                    yield pcm
+            async for pcm in self._iter_pieces(resp):
+                yield pcm
             return
         pcm, rate = _pcm_from_tts(await _response_bytes(resp), self.sample_rate)
         self.sample_rate = rate

@@ -33,8 +33,9 @@ short yes/no correctly, which is far easier than hearing a day or a name.
 - `"hangUp"` or `{"builtin": "hangUp", "strict": false}`: ends the call after the agent finishes speaking.
   `strict: true` (default) hangs up even if the caller talks over the goodbye; `false` lets the caller keep the call.
 - `{"builtin": "transfer", "targets": {"billing": "+15551234567"}}`: the model picks a target **name**; it can never
-  dial a number of its own. Phone calls only; needs `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` on the server.
-  Implemented as a Twilio call redirect after the agent has said it is transferring (not SIP REFER; no warm transfer).
+  dial a number of its own. Phone calls only. A Twilio transfer needs `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN`.
+  A SIP transfer needs `ASTERISK_ARI_URL` and does not need `TWILIO_ACCOUNT_SID` or `TWILIO_AUTH_TOKEN`.
+  After the agent has said it is transferring: a Twilio call is redirected with TwiML; a SIP call stores the target and the Asterisk dialplan dials it when the AudioSocket leg drops (not an ARI redirect, not SIP REFER; warm transfer is Twilio-only).
 
 ## Safety
 URLs must be http(s) and resolve to public addresses only (loopback, private, link-local and metadata addresses are
@@ -51,7 +52,7 @@ checked just before the request, so DNS rebinding could race it; production shou
 | Per-call auth tokens | yes | no; credentials stored in the agent (write-only) |
 | Response-type control | hang-up, new-stage | hang-up only |
 | hangUp | yes | yes |
-| Call transfer | cold + warm over SIP | cold, via Twilio redirect, to configured targets only |
+| Call transfer | cold + warm over SIP | cold, to configured targets only (Twilio redirect or SIP dialplan dial); warm is Twilio-only |
 | playDtmfSounds, leaveVoicemail, queryCorpus (RAG) | yes | no |
 | Tool timeouts / async tools | not documented ? | 0.5-30 s timeout per tool; no async tools |
 | Egress protection | not documented ? | SSRF guard, no redirects, truncation |

@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import time
+import uuid as uuidlib
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -308,12 +309,38 @@ class Runtime:
             call["metadata"] = meta
             self.store.update_call(call["id"], metadata=meta)
         sid, token = os.environ.get("TWILIO_ACCOUNT_SID", ""), os.environ.get("TWILIO_AUTH_TOKEN", "")
+        # On SIP, transport.call_sid is the AudioSocket UUID. ARI will not redirect or delete that id.
+        if str(call.get("medium") or "") == "sip":
+            channel_sid = str(meta.get("callSid") or "")
+        else:
+            channel_sid = getattr(transport, "call_sid", "") or str(meta.get("callSid") or "")
         ctx = toolmod.CallContext(call_id=call["id"], caller=str(meta.get("from", "")), callee=str(meta.get("to", "")),
-                                  call_sid=getattr(transport, "call_sid", "") or str(meta.get("callSid", "")),
-                                  end=transport.end, twilio={"sid": sid, "token": token} if sid and token else None)
+                                  call_sid=channel_sid,
+                                  end=transport.end, twilio={"sid": sid, "token": token} if sid and token else None,
+                                  medium=str(call.get("medium") or ""))
         tid = call["tenant_id"]
         ctx.docs = lambda name: self.store.corpus_docs(tid, name)
         ctx.embedder, ctx.base_url = self.embedder, self.public_url
+        if self.http is not None:
+            from .callcontrol import control_from_env
+            ctx.call_control = control_from_env(self.http, self.public_url or "", call.get("medium") or None)
+        if str(call.get("medium") or "") == "sip":
+            cid = call["id"]
+
+            def record_sip_transfer(number: str) -> bool:
+                # The dialplan looks the target up by the AudioSocket UUID after this leg drops.
+                cur = self.store.get_call_any(cid)
+                if not cur:
+                    return False
+                audio = str((cur.get("metadata") or {}).get("audioSocketUuid") or "")
+                try:
+                    audio = str(uuidlib.UUID(audio))
+                except ValueError:
+                    return False
+                merged = self.store.merge_call_metadata(cid, {"transferTo": number, "audioSocketUuid": audio})
+                return merged is not None
+
+            ctx.record_sip_transfer = record_sip_transfer
         ctx.send_dtmf = getattr(transport, "send_dtmf", None)
         ctx.client_call = getattr(transport, "client_call", None)
         specs = toolmod.resolve_library(cfg.get("tools", []),

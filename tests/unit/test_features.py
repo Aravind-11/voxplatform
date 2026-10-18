@@ -500,7 +500,7 @@ def test_metrics_endpoint_is_protected_and_counts_calls():
 
 
 # ------------------------------------------------------------------ outbound calls
-def make_outbound(handler, **kw):
+def make_outbound(handler, limiter=2, **kw):
     from api import security
     from api.app import create_app
     from api.runtime import Runtime
@@ -512,7 +512,7 @@ def make_outbound(handler, **kw):
     rt = Runtime(L(), lambda v: T(), FakeVAD, store, http=http)
     s = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
                  twilio_account_sid="ACtest", twilio_number="+15550001111", **kw)
-    return TestClient(create_app(store, rt, security.ConcurrencyLimiter(2), None, s)), store, rt
+    return TestClient(create_app(store, rt, security.ConcurrencyLimiter(limiter), None, s)), store, rt
 
 
 def test_outbound_call_places_twilio_request_with_stream_twiml():
@@ -1437,6 +1437,760 @@ async def test_outbound_lock_wait_does_not_block_the_event_loop():
                 fake.kv.pop(key, None)
         if outbound_task is not None and not outbound_task.done():
             await outbound_task
+
+
+def test_sip_outbound_originates_on_asterisk_and_not_twilio(monkeypatch):
+    from urllib.parse import parse_qs, urlparse
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append(req)
+        if "twilio" in str(req.url):
+            return httpx.Response(201, json={"sid": "CA123"})
+        return httpx.Response(200, json={"id": "chan-1"})
+    # Each placed outbound holds its slot until the audio leg admits or the row ends.
+    # This test leaves three calls created (two SIP, one Twilio), so the limiter is above 2.
+    c, store, rt = make_outbound(handler, limiter=4, sip_token="s3cret")
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                           "voicemailMessage": "leave this"}, headers=H(k))
+    assert r.status_code == 200, r.text
+    url = str(seen[-1].url)
+    assert "api.twilio.com" not in url and url.startswith("http://asterisk:8088/ari/channels")
+    q = {k_: v[0] for k_, v in parse_qs(urlparse(url).query).items()}
+    assert q["endpoint"] == "PJSIP/+15552223333@voxsun" and q["app"] == "vox"
+    assert q["appArgs"] == f"amd,{r.json()['id']}" and q["callerId"] == "+15550001111"
+    call = store.get_call_any(r.json()["id"])
+    assert call["medium"] == "sip" and call["metadata"]["callSid"] == "chan-1"
+    # default channel stays on Twilio even when ARI is configured
+    r2 = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552224444"}, headers=H(k))
+    assert r2.status_code == 200 and "api.twilio.com" in str(seen[-1].url)
+    assert store.get_call_any(r2.json()["id"])["medium"] == "twilio"
+    # no voicemail: no amd appArgs
+    r3 = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552225555", "channel": "SIP"}, headers=H(k))
+    assert r3.status_code == 200
+    q3 = parse_qs(urlparse(str(seen[-1].url)).query)
+    assert "appArgs" not in q3 and store.get_call_any(r3.json()["id"])["medium"] == "sip"
+    assert c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552226666", "channel": "sms"},
+                  headers=H(k)).status_code == 422
+
+    # AMD: token required; machine_end on a live call speaks the message
+    spoke = []
+
+    class S:
+        async def say_and_wait(self, m):
+            spoke.append(m)
+
+    class Tr:
+        async def end(self):
+            spoke.append("END")
+    cid = r.json()["id"]
+    assert c.post(f"/sip/amd/{cid}", data={"AnsweredBy": "machine_end_beep"}).status_code == 403
+    assert c.post(f"/sip/amd/missing", json={"AnsweredBy": "human"},
+                  headers={"X-Vox-Sip-Token": "s3cret"}).status_code == 404
+    human = c.post(f"/sip/amd/{cid}", json={"AnsweredBy": "human"}, headers={"X-Vox-Sip-Token": "s3cret"})
+    assert human.json()["action"] == "none" and store.get_call_any(cid)["metadata"]["answeredBy"] == "human"
+    rt.live[cid] = (S(), Tr())
+    machine = c.post(f"/sip/amd/{cid}", data={"AnsweredBy": "machine_end_beep"},
+                     headers={"X-Vox-Sip-Token": "s3cret"})
+    assert machine.json()["action"] == "voicemail"
+    time.sleep(0.3)
+    assert spoke == ["leave this", "END"]
+    assert store.get_call_any(cid)["metadata"]["answeredBy"] == "machine_end_beep"
+    # endpoint off when the token is unset, even if a header is sent
+    c2, store2, _ = make_outbound(handler)
+    k2, tid2 = tenant(c2)
+    row = store2.create_call(tid2, None, "sip", {}, {"voicemail": "x"})
+    assert c2.post(f"/sip/amd/{row['id']}", data={"AnsweredBy": "machine_end_beep"},
+                   headers={"X-Vox-Sip-Token": "s3cret"}).status_code == 404
+
+
+def test_sip_outbound_needs_no_twilio_and_sends_ari_basic_auth(monkeypatch):
+    """channel=sip originates with ARI basic auth and a fromNumber. Twilio account settings are not required.
+    Dropping auth= on originate, or refusing sip without Twilio credentials, fails this test."""
+    import base64
+    from urllib.parse import parse_qs, urlparse
+    from api import security
+    from api.app import create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from starlette.testclient import TestClient
+    from test_api import FakeLLM as L, FakeTTS as T, FakeVAD
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "secret")
+    monkeypatch.delenv("TWILIO_ACCOUNT_SID", raising=False)
+    monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append(req)
+        return httpx.Response(200, json={"id": "chan-sip"})
+
+    store = Store()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = Runtime(L(), lambda v: T(), FakeVAD, store, http=http)
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com")
+    assert settings.twilio_account_sid == "" and settings.twilio_auth_token == "" and settings.twilio_number == ""
+    c = TestClient(create_app(store, rt, security.ConcurrencyLimiter(2), None, settings))
+    k, _tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                           "fromNumber": "+15559998888"}, headers=H(k))
+    assert r.status_code == 200, r.text
+    req = seen[-1]
+    url = str(req.url)
+    assert url.startswith("http://asterisk:8088/ari/channels") and "api.twilio.com" not in url
+    assert req.headers["authorization"] == "Basic " + base64.b64encode(b"ari:secret").decode()
+    q = {k_: v[0] for k_, v in parse_qs(urlparse(url).query).items()}
+    assert q["endpoint"] == "PJSIP/+15552223333@voxsun" and q["callerId"] == "+15559998888" and q["app"] == "vox"
+    call = store.get_call_any(r.json()["id"])
+    assert call["medium"] == "sip" and call["metadata"]["from"] == "+15559998888"
+
+
+def test_sip_amd_hangs_up_when_the_voicemail_cannot_be_spoken(monkeypatch):
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    c, store, rt = make_outbound(lambda req: httpx.Response(200, json={"id": "chan-9"}), sip_token="s3cret")
+    k, _ = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                           "voicemailMessage": "leave this"}, headers=H(k))
+    assert r.status_code == 200, r.text
+    cid = r.json()["id"]
+    spoke = []
+
+    class S:
+        async def say_and_wait(self, m):
+            spoke.append(m)
+            raise RuntimeError("tts down")
+
+    class Tr:
+        async def end(self):
+            spoke.append("END")
+    rt.live[cid] = (S(), Tr())
+    res = c.post(f"/sip/amd/{cid}", json={"AnsweredBy": "machine_end_beep"}, headers={"X-Vox-Sip-Token": "s3cret"})
+    assert res.json()["action"] == "voicemail"
+    deadline = time.time() + 2
+    while spoke != ["leave this", "END"] and time.time() < deadline:
+        time.sleep(0.05)
+    assert spoke == ["leave this", "END"]
+
+
+def test_sip_outbound_without_ari_is_503_and_stores_nothing(monkeypatch):
+    monkeypatch.delenv("ASTERISK_ARI_URL", raising=False)
+    c, store, _ = make_outbound(lambda req: httpx.Response(500, json={"message": "no"}))
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip"}, headers=H(k))
+    assert r.status_code == 503 and "ASTERISK_ARI_URL" in r.text
+    assert store.list_calls(tid) == []
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+
+    def down(req):
+        raise RuntimeError("down")
+    c3, store3, _ = make_outbound(down)
+    k3, tid3 = tenant(c3)
+    a3 = c3.post("/v1/agents", json={"name": "a"}, headers=H(k3)).json()
+    r = c3.post("/v1/calls/outbound", json={"agentId": a3["id"], "to": "+15552223333", "channel": "sip"}, headers=H(k3))
+    assert r.status_code == 502 and "could not reach Asterisk" in r.text and "Twilio" not in r.text
+    assert store3.list_calls(tid3)[0]["end_reason"] == "asterisk_unreachable"
+    c4, store4, _ = make_outbound(lambda req: httpx.Response(500, json={"message": "no endpoint"}))
+    k4, tid4 = tenant(c4)
+    a4 = c4.post("/v1/agents", json={"name": "a"}, headers=H(k4)).json()
+    r = c4.post("/v1/calls/outbound", json={"agentId": a4["id"], "to": "+15552223333", "channel": "sip",
+                                            "voicemailMessage": "hi"}, headers=H(k4))
+    assert r.status_code == 502 and "Asterisk refused" in r.text and "no endpoint" in r.text
+    assert store4.list_calls(tid4)[0]["end_reason"] == "asterisk_rejected"
+
+
+def test_call_metadata_merge_keeps_both_keys():
+    """Two writers must not replace the document. callSid and answeredBy both stay, with the keys already stored."""
+    import threading
+    from api.store import Store
+    store = Store()
+    tid = store.create_tenant("t")
+    call = store.create_call(tid, None, "sip", {}, {"deal": "42", "voicemail": "hi", "direction": "outbound"})
+
+    def write_sid():
+        for _ in range(40):
+            store.merge_call_metadata(call["id"], {"callSid": "chan-9"})
+
+    def write_amd():
+        for _ in range(40):
+            store.merge_call_metadata(call["id"], {"answeredBy": "machine_end_beep"})
+
+    threads = [threading.Thread(target=write_sid), threading.Thread(target=write_amd)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    meta = store.get_call_any(call["id"])["metadata"]
+    assert meta["callSid"] == "chan-9" and meta["answeredBy"] == "machine_end_beep"
+    assert meta["deal"] == "42" and meta["voicemail"] == "hi" and meta["direction"] == "outbound"
+    assert store.find_sip_call(call_sid="chan-9")["id"] == call["id"]
+
+
+def test_sip_answered_by_survives_call_sid_and_hangs_up_when_not_live(monkeypatch):
+    """AnsweredBy posted during originate must still be there after callSid is saved, and a machine with no
+    session must DELETE that ARI channel. A live session is spoken to and the channel is not deleted."""
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    app_box = {}
+    deleted = []
+    race = {"during": True}
+
+    async def handler(req: httpx.Request):
+        if req.method == "DELETE":
+            deleted.append(str(req.url))
+            return httpx.Response(204)
+        args = req.url.params.get("appArgs", "")
+        cid = args.split(",", 1)[1] if str(args).startswith("amd,") else ""
+        channel_id = str(req.url.params.get("channelId") or "")
+        assert channel_id, "originate must pass channelId"
+        race["channel_id"] = channel_id
+        if cid and race["during"]:
+            transport = httpx.ASGITransport(app=app_box["app"])
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                res = await client.post(f"/sip/amd/{cid}", data={"AnsweredBy": "machine_end_beep"},
+                                        headers={"X-Vox-Sip-Token": "s3cret"})
+                assert res.status_code == 200, res.text
+                race["amd"] = res.json()
+                during = app_box["store"].get_call_any(cid)["metadata"]
+                assert during["answeredBy"] == "machine_end_beep" and during.get("callSid") == channel_id
+                assert during["deal"] == "42" and during["voicemail"] == "leave this"
+        # While the response is in flight the stored id is the one we allocated. A later body id wins.
+        body_id = channel_id if race["during"] else race["sid"]
+        return httpx.Response(200, json={"id": body_id})
+
+    race["sid"] = "chan-9"
+    c, store, rt = make_outbound(handler, sip_token="s3cret")
+    app_box["app"] = c.app
+    app_box["store"] = store
+    k, _ = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                           "voicemailMessage": "leave this", "metadata": {"deal": "42"}}, headers=H(k))
+    assert r.status_code == 200, r.text
+    cid = r.json()["id"]
+    meta = store.get_call_any(cid)["metadata"]
+    assert meta["answeredBy"] == "machine_end_beep" and meta["callSid"] == race["channel_id"]
+    assert meta["deal"] == "42" and meta["voicemail"] == "leave this"
+    assert meta["from"] == "+15550001111" and meta["to"] == "+15552223333" and meta["direction"] == "outbound"
+    assert race["amd"]["action"] == "hangup"
+    assert deleted == [f"http://asterisk:8088/ari/channels/{race['channel_id']}"]
+    assert store.get_call_any(cid)["status"] == "ended"
+    assert cid not in rt.live
+
+    # The other order: callSid is already stored, the call is not live, machine_end still deletes that channel.
+    race["during"] = False
+    race["sid"] = "chan-2"
+    r2 = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552224444", "channel": "sip",
+                                            "voicemailMessage": "leave this", "metadata": {"deal": "7"}}, headers=H(k))
+    assert r2.status_code == 200, r2.text
+    cid2 = r2.json()["id"]
+    assert store.get_call_any(cid2)["metadata"]["callSid"] == "chan-2"
+    assert "answeredBy" not in store.get_call_any(cid2)["metadata"]
+    n = len(deleted)
+    human = c.post(f"/sip/amd/{cid2}", json={"AnsweredBy": "human"}, headers={"X-Vox-Sip-Token": "s3cret"})
+    assert human.json()["action"] == "none"
+    assert store.get_call_any(cid2)["metadata"]["callSid"] == "chan-2"
+    assert store.get_call_any(cid2)["metadata"]["answeredBy"] == "human"
+    assert store.get_call_any(cid2)["status"] == "created" and len(deleted) == n
+    machine = c.post(f"/sip/amd/{cid2}", data={"AnsweredBy": "machine_end_beep"}, headers={"X-Vox-Sip-Token": "s3cret"})
+    assert machine.json()["action"] == "hangup"
+    assert deleted[n:] == ["http://asterisk:8088/ari/channels/chan-2"]
+    meta2 = store.get_call_any(cid2)["metadata"]
+    assert meta2["callSid"] == "chan-2" and meta2["answeredBy"] == "machine_end_beep" and meta2["deal"] == "7"
+    assert store.get_call_any(cid2)["status"] == "ended"
+
+    # A live session is spoken to and hung up on the transport. The ARI channel id is not deleted.
+    race["sid"] = "chan-3"
+    r3 = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552225555", "channel": "sip",
+                                            "voicemailMessage": "leave this"}, headers=H(k))
+    cid3 = r3.json()["id"]
+    spoke = []
+
+    class S:
+        async def say_and_wait(self, m):
+            spoke.append(m)
+
+    class Tr:
+        async def end(self):
+            spoke.append("END")
+    rt.live[cid3] = (S(), Tr())
+    n = len(deleted)
+    res = c.post(f"/sip/amd/{cid3}", json={"AnsweredBy": "machine_end_beep"}, headers={"X-Vox-Sip-Token": "s3cret"})
+    assert res.json()["action"] == "voicemail"
+    deadline = time.time() + 2
+    while spoke != ["leave this", "END"] and time.time() < deadline:
+        time.sleep(0.05)
+    assert spoke == ["leave this", "END"] and deleted[n:] == []
+    assert store.get_call_any(cid3)["metadata"]["callSid"] == "chan-3"
+    assert store.get_call_any(cid3)["status"] == "created"
+
+
+def test_audiosocket_adopts_outbound_row_and_binds_the_ari_channel(monkeypatch):
+    """The AudioSocket UUID is merged onto the outbound row. Transfer sees the ARI id, not the UUID.
+    A bind before any row creates the call with that channel id. An unbound socket keeps callSid
+    equal to that uuid so /sip/recover can find the leg; it is still not sent to ARI."""
+    import socket
+    import uuid
+    from api import security
+    from api.app import Settings, create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from starlette.testclient import TestClient
+    from test_api import FakeLLM, FakeTTS, FakeVAD
+    from transports import audiosocket as A
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append((req.method, str(req.url)))
+        if req.method == "DELETE":
+            return httpx.Response(204)
+        return httpx.Response(200, json={"id": "chan-9"})
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store, http=http)
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                        twilio_account_sid="ACtest", twilio_number="+15550001111", sip_token="s3cret",
+                        audiosocket_port=port, audiosocket_agent="pending")
+    app = create_app(store, rt, security.ConcurrencyLimiter(4), None, settings)
+    audio = "33333333-3333-3333-3333-333333333333"
+    fresh = "44444444-4444-4444-4444-444444444444"
+    unbound = "55555555-5555-5555-5555-555555555555"
+    token = {"X-Vox-Sip-Token": "s3cret"}
+
+    def closed_context(fn):
+        for cell in fn.__closure__ or ():
+            try:
+                val = cell.cell_contents
+            except ValueError:
+                continue
+            if type(val).__name__ == "CallContext":
+                return val
+        raise AssertionError("transfer did not close over the call")
+
+    def wait_live(cid):
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            cur = store.get_call_any(cid)
+            if cur and cur["status"] == "active" and cid in rt.live:
+                return cur
+            time.sleep(0.05)
+        raise AssertionError(store.get_call_any(cid))
+
+    def wait_row(pred):
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            for row in store.list_calls(tid):
+                if pred(row) and row["status"] == "active" and row["id"] in rt.live:
+                    return row
+            time.sleep(0.05)
+        raise AssertionError([row["metadata"] for row in store.list_calls(tid)])
+
+    def open_uuid(u):
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.settimeout(5)
+        sock.sendall(A.pack(A.KIND_UUID, uuid.UUID(u).bytes))
+        return sock
+
+    def hang(sock):
+        try:
+            sock.sendall(A.pack(A.KIND_HANGUP))
+        except OSError:
+            pass
+        sock.close()
+
+    with TestClient(app) as c:
+        k, _ = tenant(c)
+        a = c.post("/v1/agents", json={"name": "a", "tools": [
+            {"builtin": "transfer", "targets": {"billing": "+15551230001"}}]}, headers=H(k)).json()
+        settings.audiosocket_agent = a["id"]
+        assert c.post("/sip/bind", data={"uuid": audio, "channelId": "chan-9"}).status_code == 403
+        assert c.post("/sip/bind", data={"uuid": "not-a-uuid", "channelId": "chan-9"}, headers=token).status_code == 422
+        r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                               "voicemailMessage": "leave this", "metadata": {"deal": "42"}},
+                   headers=H(k))
+        assert r.status_code == 200, r.text
+        cid = r.json()["id"]
+        bound = c.post("/sip/bind", data={"uuid": audio, "channelId": "chan-9"}, headers=token)
+        assert bound.status_code == 200 and bound.json()["channelId"] == "chan-9"
+        meta = store.get_call_any(cid)["metadata"]
+        assert meta["audioSocketUuid"] == audio and meta["callSid"] == "chan-9" and meta["voicemail"] == "leave this"
+        assert meta["deal"] == "42" and meta["from"] == "+15550001111" and meta["to"] == "+15552223333"
+        tid = store.get_call_any(cid)["tenant_id"]
+        assert len(store.list_calls(tid)) == 1
+        sock = open_uuid(audio)
+        try:
+            active = wait_live(cid)
+            meta = active["metadata"]
+            assert meta["callSid"] == "chan-9" and meta["audioSocketUuid"] == audio
+            assert meta["voicemail"] == "leave this" and meta["deal"] == "42" and meta["to"] == "+15552223333"
+            assert [row["id"] for row in store.list_calls(tid)] == [cid]
+            sess, _tr = rt.live[cid]
+            assert closed_context(sess.tools["transfer"]).call_sid == "chan-9"
+        finally:
+            hang(sock)
+        ended = None
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            ended = store.get_call_any(cid)
+            if ended and ended["status"] == "ended":
+                break
+            time.sleep(0.05)
+        assert ended["status"] == "ended"
+
+        pre = c.post("/sip/bind", data={"uuid": fresh, "channelId": "1730000000.42"}, headers=token)
+        assert pre.status_code == 200
+        sock2 = open_uuid(fresh)
+        try:
+            created = wait_row(lambda row: row["metadata"].get("audioSocketUuid") == fresh)
+            assert created["id"] != cid
+            assert created["metadata"]["callSid"] == "1730000000.42"
+            assert created["metadata"].get("voicemail") is None
+            sess2, _ = rt.live[created["id"]]
+            assert closed_context(sess2.tools["transfer"]).call_sid == "1730000000.42"
+        finally:
+            hang(sock2)
+
+        sock3 = open_uuid(unbound)
+        try:
+            extra = wait_row(lambda row: row["metadata"].get("audioSocketUuid") == unbound)
+            # Recover looks the leg up by callSid. Cold transfer stores transferTo and the dialplan
+            # GETs it; the assertions below still require this uuid to be absent from every ARI url.
+            assert extra["metadata"].get("callSid", "") == unbound
+            sess3, _ = rt.live[extra["id"]]
+            assert closed_context(sess3.tools["transfer"]).call_sid == unbound
+        finally:
+            hang(sock3)
+        assert all(method == "POST" and "/redirect" not in url for method, url in seen)
+        assert all(audio not in url and fresh not in url and unbound not in url for _method, url in seen)
+
+    c2, *_ = make_outbound(lambda req: httpx.Response(500))
+    assert c2.post("/sip/bind", data={"uuid": audio, "channelId": "chan-9"},
+                   headers={"X-Vox-Sip-Token": "s3cret"}).status_code == 404
+
+
+def test_sip_machine_hangup_retries_unless_the_delete_finished(monkeypatch):
+    """A timeout or HTTP 5xx is not a finished hang-up: the row stays created and the next AMD deletes again.
+    HTTP 404 means the channel is already gone, so the row stays ended and a retry does not DELETE."""
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    mode = {"delete": "timeout"}
+    deletes = []
+
+    def handler(req: httpx.Request):
+        if req.method != "DELETE":
+            return httpx.Response(200, json={"id": "chan-9"})
+        deletes.append(str(req.url))
+        kind = mode["delete"]
+        if kind == "timeout":
+            raise httpx.ReadTimeout("timed out", request=req)
+        if kind == "500":
+            return httpx.Response(500, json={"message": "down"})
+        if kind == "404":
+            return httpx.Response(404, json={"message": "Channel not found"})
+        return httpx.Response(204)
+
+    c, store, _rt = make_outbound(handler, sip_token="s3cret")
+    k, _ = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    token = {"X-Vox-Sip-Token": "s3cret"}
+
+    def place() -> str:
+        r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                               "voicemailMessage": "leave this"}, headers=H(k))
+        assert r.status_code == 200, r.text
+        return r.json()["id"]
+
+    def amd(cid: str):
+        return c.post(f"/sip/amd/{cid}", data={"AnsweredBy": "machine_end_beep"}, headers=token)
+
+    cid = place()
+    first = amd(cid)
+    assert first.status_code == 502, first.text
+    row = store.get_call_any(cid)
+    assert row["status"] == "created" and not row.get("end_reason")
+    assert row["metadata"]["answeredBy"] == "machine_end_beep" and row["metadata"]["callSid"] == "chan-9"
+    assert len(deletes) == 1 and deletes[0].endswith("/ari/channels/chan-9")
+    mode["delete"] = "ok"
+    second = amd(cid)
+    assert second.status_code == 200 and second.json()["action"] == "hangup"
+    assert len(deletes) == 2 and deletes[1].endswith("/ari/channels/chan-9")
+    assert store.get_call_any(cid)["status"] == "ended"
+
+    mode["delete"] = "500"
+    cid = place()
+    n = len(deletes)
+    bad = amd(cid)
+    assert bad.status_code == 502, bad.text
+    assert store.get_call_any(cid)["status"] == "created" and not store.get_call_any(cid).get("end_reason")
+    assert len(deletes) == n + 1
+    mode["delete"] = "ok"
+    again = amd(cid)
+    assert again.status_code == 200 and again.json()["action"] == "hangup"
+    assert len(deletes) == n + 2 and store.get_call_any(cid)["status"] == "ended"
+
+    mode["delete"] = "404"
+    cid = place()
+    n = len(deletes)
+    gone = amd(cid)
+    assert gone.status_code == 200 and gone.json()["action"] == "hangup", gone.text
+    assert store.get_call_any(cid)["status"] == "ended"
+    assert store.get_call_any(cid)["end_reason"] == "machine_end_beep"
+    assert len(deletes) == n + 1
+    retry = amd(cid)
+    assert retry.status_code == 200 and retry.json()["action"] == "hangup"
+    assert len(deletes) == n + 1
+    assert store.get_call_any(cid)["status"] == "ended"
+
+
+async def test_overlapping_machine_hangup_waits_for_the_delete(monkeypatch):
+    """A second /sip/amd during DELETE must not be told the hang-up finished. Both wait: 502 when the
+    DELETE times out, the row is created again, and a later AMD deletes once. Outbound waits too and
+    returns the placed call as created instead of 502 or ended."""
+    import asyncio
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    deletes = []
+    gate = {"mode": "block", "release": asyncio.Event(), "started": asyncio.Event(), "entered": asyncio.Event()}
+
+    async def handler(req: httpx.Request):
+        if req.method != "DELETE":
+            if gate["mode"] == "outbound":
+                args = str(req.url.params.get("appArgs") or "")
+                gate["cid"] = args.split(",", 1)[1] if args.startswith("amd,") else ""
+                gate["entered"].set()
+                await gate["started"].wait()
+                return httpx.Response(200, json={"id": str(req.url.params.get("channelId") or "chan-out")})
+            return httpx.Response(200, json={"id": "chan-9"})
+        deletes.append(str(req.url))
+        if gate["mode"] in ("block", "outbound"):
+            gate["started"].set()
+            await gate["release"].wait()
+            raise httpx.ReadTimeout("timed out", request=req)
+        return httpx.Response(204)
+
+    c, store, _rt = make_outbound(handler, sip_token="s3cret")
+    app = c.app
+    row = store.create_call("t1", None, "sip", {}, {"voicemail": "x", "callSid": "chan-9"})
+    token = {"X-Vox-Sip-Token": "s3cret"}
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        async def post_amd(call_id: str):
+            return await client.post(f"/sip/amd/{call_id}", data={"AnsweredBy": "machine_end_beep"}, headers=token)
+
+        first = asyncio.create_task(post_amd(row["id"]))
+        await asyncio.wait_for(gate["started"].wait(), timeout=2)
+        assert len(deletes) == 1 and deletes[0].endswith("/ari/channels/chan-9")
+        assert app.state.sip_machine_done.get(row["id"]) != "hangup"
+        held = store.get_call_any(row["id"])
+        assert held["status"] == "ended" and held["end_reason"] == "machine_end_beep"
+        assert store.find_sip_call(call_sid="chan-9") is None
+        second = asyncio.create_task(post_amd(row["id"]))
+        joined = False
+        for _ in range(100):
+            if second.done():
+                break
+            inflight = app.state.sip_machine_wait.get(row["id"]) or {}
+            if inflight.get("waiters", 0) >= 1:
+                joined = True
+                break
+            await asyncio.sleep(0.01)
+        assert joined and not second.done()
+        assert len(deletes) == 1
+        gate["release"].set()
+        r1, r2 = await first, await second
+        assert r1.status_code == 502, r1.text
+        assert r2.status_code == 502, r2.text
+        assert r2.json().get("action") != "hangup"
+        settled = store.get_call_any(row["id"])
+        assert settled["status"] == "created" and not settled.get("end_reason")
+        assert settled["metadata"]["answeredBy"] == "machine_end_beep"
+        assert app.state.sip_machine_done.get(row["id"]) is None
+        assert row["id"] not in app.state.sip_machine_wait
+        gate["mode"] = "ok"
+        later = await post_amd(row["id"])
+        assert later.status_code == 200 and later.json()["action"] == "hangup"
+        assert len(deletes) == 2 and deletes[1].endswith("/ari/channels/chan-9")
+        assert store.get_call_any(row["id"])["status"] == "ended"
+
+        gate["mode"] = "outbound"
+        gate["release"] = asyncio.Event()
+        gate["started"] = asyncio.Event()
+        gate["entered"] = asyncio.Event()
+        tres = await client.post("/admin/tenants", json={"name": "a"}, headers={"X-Admin-Key": "adm"})
+        assert tres.status_code == 200, tres.text
+        key = tres.json()["apiKey"]
+        agent = (await client.post("/v1/agents", json={"name": "a"}, headers={"X-API-Key": key})).json()
+        out_task = asyncio.create_task(client.post(
+            "/v1/calls/outbound",
+            json={"agentId": agent["id"], "to": "+15552223333", "channel": "sip", "voicemailMessage": "leave this"},
+            headers={"X-API-Key": key}))
+        await asyncio.wait_for(gate["entered"].wait(), timeout=2)
+        cid = gate["cid"]
+        amd_task = asyncio.create_task(post_amd(cid))
+        await asyncio.wait_for(gate["started"].wait(), timeout=2)
+        early_done = app.state.sip_machine_done.get(cid)
+        joined = False
+        early_out = False
+        for _ in range(100):
+            early_done = app.state.sip_machine_done.get(cid)
+            if early_done == "hangup" or out_task.done():
+                early_out = out_task.done()
+                break
+            inflight = app.state.sip_machine_wait.get(cid) or {}
+            if inflight.get("waiters", 0) >= 1:
+                joined = True
+                break
+            await asyncio.sleep(0.01)
+        n = len(deletes)
+        gate["release"].set()
+        amd_res, out_res = await amd_task, await out_task
+        assert early_done != "hangup" and not early_out and joined
+        assert amd_res.status_code == 502, amd_res.text
+        assert out_res.status_code == 200, out_res.text
+        body = out_res.json()
+        assert body["status"] == "created" and not body.get("end_reason")
+        assert body["metadata"]["answeredBy"] == "machine_end_beep"
+        # The timed-out DELETE is the only one. Outbound must not start a second attempt or report ended.
+        assert len(deletes) == n == 3 and deletes[-1].endswith("/ari/channels/" + body["callSid"])
+        assert store.get_call_any(cid)["status"] == "created"
+
+
+def test_empty_answered_by_does_not_erase_machine_end(monkeypatch):
+    """An empty or whitespace AnsweredBy must not clear machine_end, including one posted while originate is in flight.
+    The originated channel is still deleted. A later non-empty value may replace the stored one."""
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    app_box = {}
+    deleted = []
+
+    async def handler(req: httpx.Request):
+        if req.method == "DELETE":
+            deleted.append(str(req.url))
+            return httpx.Response(204)
+        args = str(req.url.params.get("appArgs") or "")
+        cid = args.split(",", 1)[1] if args.startswith("amd,") else ""
+        if cid and not app_box.get("posted"):
+            app_box["posted"] = True
+            transport = httpx.ASGITransport(app=app_box["app"])
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                headers = {"X-Vox-Sip-Token": "s3cret"}
+                first = await client.post(f"/sip/amd/{cid}", data={"AnsweredBy": "machine_end_beep"}, headers=headers)
+                app_box["first"] = (first.status_code, first.json())
+                app_box["n1"] = len(deleted)
+                spaces = await client.post(f"/sip/amd/{cid}", data={"AnsweredBy": "   "}, headers=headers)
+                app_box["spaces"] = (spaces.status_code, spaces.json())
+                spaces_json = await client.post(f"/sip/amd/{cid}", json={"AnsweredBy": "   "}, headers=headers)
+                app_box["spaces_json"] = (spaces_json.status_code, spaces_json.json())
+                app_box["n_spaces"] = len(deleted)
+                second = await client.post(
+                    f"/sip/amd/{cid}", content=b"not-json",
+                    headers={**headers, "Content-Type": "application/json"})
+                app_box["second"] = (second.status_code, second.json())
+                app_box["n2"] = len(deleted)
+                app_box["mid"] = app_box["store"].get_call_any(cid)["metadata"].get("answeredBy")
+        return httpx.Response(200, json={"id": req.url.params.get("channelId") or "chan-9"})
+
+    c, store, _rt = make_outbound(handler, sip_token="s3cret")
+    app_box["app"] = c.app
+    app_box["store"] = store
+    k, _ = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                           "voicemailMessage": "leave this"}, headers=H(k))
+    assert r.status_code == 200, r.text
+    cid = r.json()["id"]
+    meta = store.get_call_any(cid)["metadata"]
+    assert app_box["first"][0] == 200 and app_box["mid"] == "machine_end_beep"
+    kept_machine = {"action": "none", "answeredBy": "machine_end_beep"}
+    assert app_box["spaces"] == (200, kept_machine) and app_box["spaces_json"] == (200, kept_machine)
+    assert app_box["second"] == (200, kept_machine)
+    assert app_box["n1"] == app_box["n_spaces"] == app_box["n2"] and app_box["n1"] >= 1
+    assert meta["answeredBy"] == "machine_end_beep" and meta.get("callSid")
+    assert deleted and any(meta["callSid"] in url for url in deleted)
+    token = {"X-Vox-Sip-Token": "s3cret"}
+    human = c.post(f"/sip/amd/{cid}", json={"AnsweredBy": "human"}, headers=token)
+    assert human.status_code == 200 and human.json()["answeredBy"] == "human"
+    assert store.get_call_any(cid)["metadata"]["answeredBy"] == "human"
+    assert store.get_call_any(cid)["metadata"]["callSid"] == meta["callSid"]
+
+    tid = store.get_call_any(cid)["tenant_id"]
+    row = store.create_call(tid, None, "sip", {}, {"voicemail": "x", "callSid": "chan-z", "deal": "9"})
+    n = len(deleted)
+    blank = c.post(f"/sip/amd/{row['id']}", content=b"{", headers={**token, "Content-Type": "application/json"})
+    assert blank.status_code == 200 and blank.json() == {"action": "none", "answeredBy": ""}
+    assert "answeredBy" not in store.get_call_any(row["id"])["metadata"] and len(deleted) == n
+    machine = c.post(f"/sip/amd/{row['id']}", data={"AnsweredBy": "machine_end_beep"}, headers=token)
+    assert machine.status_code == 200 and machine.json()["action"] == "hangup"
+    kept = store.get_call_any(row["id"])
+    assert kept["metadata"]["answeredBy"] == "machine_end_beep" and kept["metadata"]["deal"] == "9"
+    assert kept["status"] == "ended"
+    assert any(url.endswith("/ari/channels/chan-z") for url in deleted[n:])
+    n2 = len(deleted)
+    again = c.post(f"/sip/amd/{row['id']}", content=b"", headers={**token, "Content-Type": "application/json"})
+    assert again.json() == {"action": "none", "answeredBy": "machine_end_beep"}
+    form_spaces = c.post(f"/sip/amd/{row['id']}", data={"AnsweredBy": "   "}, headers=token)
+    json_spaces = c.post(f"/sip/amd/{row['id']}", json={"AnsweredBy": "   "}, headers=token)
+    assert form_spaces.json() == {"action": "none", "answeredBy": "machine_end_beep"}
+    assert json_spaces.json() == {"action": "none", "answeredBy": "machine_end_beep"}
+    assert store.get_call_any(row["id"])["metadata"]["answeredBy"] == "machine_end_beep"
+    assert any(url.endswith("/ari/channels/chan-z") for url in deleted)
+    assert len(deleted) == n2
+
+
+def test_sip_originate_timeout_deletes_the_allocated_channel(monkeypatch):
+    """Originate names the channel before the request. A lost response still DELETEs that id and ends the row."""
+    from urllib.parse import parse_qs, urlparse
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+
+    def run(exc: Exception) -> None:
+        seen = []
+
+        def handler(req: httpx.Request):
+            seen.append((req.method, str(req.url)))
+            if req.method == "DELETE":
+                return httpx.Response(204)
+            raise exc
+
+        c, store, _rt = make_outbound(handler, sip_token="s3cret")
+        k, tid = tenant(c)
+        a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+        r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip"},
+                   headers=H(k))
+        assert r.status_code == 502 and "could not reach Asterisk" in r.text and type(exc).__name__ in r.text
+        assert "Twilio" not in r.text
+        post = next(url for method, url in seen if method == "POST")
+        channel_id = parse_qs(urlparse(post).query)["channelId"][0]
+        deletes = [url for method, url in seen if method == "DELETE"]
+        assert len(deletes) == 1 and deletes[0].rstrip("/").endswith("/ari/channels/" + channel_id)
+        assert "api.twilio.com" not in post and "api.twilio.com" not in deletes[0]
+        row = store.list_calls(tid)[0]
+        assert row["status"] == "ended" and row["end_reason"] == "asterisk_unreachable"
+        assert row["metadata"]["callSid"] == channel_id
+
+    run(httpx.ReadTimeout("timed out"))
+    run(httpx.ConnectError("refused"))
 
 
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)

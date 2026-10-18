@@ -37,7 +37,9 @@
   VOX_TTS_RATE             raw s16le rate when VOX_TTS_URL does not return a WAV (default 24000; a WAV header wins)
   VOX_AUDIOSOCKET_PORT / VOX_AUDIOSOCKET_AGENT / VOX_AUDIOSOCKET_HOST   SIP path: TCP port Asterisk streams call audio to, and the agent id that answers when no number is mapped (docs/SIP.md)
   VOX_AUDIOSOCKET_RATE     AudioSocket PCM rate (8000 ulaw, or 16000 with g722/slin16). Default 8000.
-  VOX_SIP_TOKEN            shared secret for POST /internal/sip/setup and POST /sip/recover; empty = both endpoints off
+  VOX_SIP_TOKEN            shared secret for POST /internal/sip/setup, POST /sip/recover, POST /sip/amd, POST /sip/bind, and GET /sip/transfer; empty = those endpoints off
+  ASTERISK_ARI_URL         e.g. http://asterisk:8088 — SIP outbound and machine hangup; also enables SIP transfer (dialplan Dial, not an ARI redirect). Unset keeps Twilio
+  ASTERISK_ARI_USER / ASTERISK_ARI_PASSWORD   ARI basic auth
   VOX_PROCS                API processes on one host (default 1). Unset or 1: a single uvicorn with --workers 1.
                            Above 1, scripts/deploy.sh starts one process per port 8080..8080+N-1, not uvicorn's
                            shared --workers model: a WebSocket stays on the process that accepted it, and live

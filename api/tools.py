@@ -67,6 +67,9 @@ class CallContext:
     base_url: str = ""                                              # public URL of this API (warm-transfer callbacks)
     guard_slots: bool = False                                       # require spoken read-back before state-changing tools
     last_assistant_text: Any = ""                                   # str, or a callable -> the previous assistant message
+    call_control: Any = None                                        # TwilioCallControl or AsteriskCallControl; None uses ctx.twilio
+    medium: str = ""                                                # sip, twilio, webSocket; which controller a live call may use
+    record_sip_transfer: Optional[Callable[[str], bool]] = None    # SIP: store the dialplan target; None keeps ARI redirect
 
 
 # Spoken read-back the model is told to do. It does not correct a mishearing: a wrong value that was

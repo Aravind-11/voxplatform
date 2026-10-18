@@ -39,8 +39,11 @@ x-api: &api
     VOX_AUDIOSOCKET_PORT: ${VOX_AUDIOSOCKET_PORT:-0}          # SIP path (docs/SIP.md): 0 = off
     VOX_AUDIOSOCKET_AGENT: ${VOX_SIP_AGENT:-}
     VOX_AUDIOSOCKET_HOST: 0.0.0.0                              # private compose network only; never publish this port
-    VOX_SIP_TOKEN: ${VOX_SIP_TOKEN:-}                          # /internal/sip/setup and /sip/recover; empty = both endpoints off (404)
+    VOX_SIP_TOKEN: ${VOX_SIP_TOKEN:-}                          # setup, recover, amd, bind, transfer; empty = those endpoints off (404)
     VOX_AUDIOSOCKET_RATE: "16000"                              # with g722 + slin16 in deploy/sip. 8000 only for a ulaw trunk (320-byte frames).
+    ASTERISK_ARI_URL: ${ASTERISK_ARI_URL:-}                    # SIP outbound and machine hangup; empty keeps Twilio
+    ASTERISK_ARI_USER: ${ASTERISK_ARI_USER:-}
+    ASTERISK_ARI_PASSWORD: ${ASTERISK_ARI_PASSWORD:-}
   volumes: [ "models:/models", "recordings:/data/recordings" ]
   deploy: { resources: { reservations: { devices: [ { driver: nvidia, count: 1, capabilities: [ gpu ] } ] } } }
   stop_grace_period: 1h          # live calls finish after the drain (see deploy/drain.py)
@@ -75,7 +78,8 @@ services:
     hostname: asterisk
     depends_on: [ api1 ]
     environment:
-      SIP_SETUP_TOKEN: ${VOX_SIP_TOKEN:-}                      # dialplan reads this; must match the api VOX_SIP_TOKEN. Not a secret in the image.
+      SIP_SETUP_TOKEN: ${VOX_SIP_TOKEN:-}                      # sip_setup.py reads this; must match the api VOX_SIP_TOKEN. Not a secret in the image.
+      VOX_SIP_TOKEN: ${VOX_SIP_TOKEN:-}                        # dialplan CURL /sip/bind and /sip/transfer; same value, not written into extensions.conf
     ports: [ "5060:5060/udp", "10000-10100:10000-10100/udp" ]
     restart: unless-stopped
 

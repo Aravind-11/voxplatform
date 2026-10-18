@@ -7,10 +7,12 @@ import json
 import os
 import re
 import time
+import uuid as uuidlib
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Union
 from xml.sax.saxutils import escape, quoteattr
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
@@ -26,6 +28,7 @@ from . import security, tools as toolmod
 from . import experiments as expmod
 from . import openapi_import, retention, variables as varmod
 from .callbus import make_bus
+from .callcontrol import AsteriskCallControl, TwilioCallControl, control_from_env
 from .runtime import Runtime
 from .store import ROLES, Store, new_id, normalize_e164
 from .writebehind import to_thread
@@ -51,7 +54,7 @@ class Settings:
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
     node_max_calls: int = 32           # this process; 0 = no node cap. Checked before the per-tenant cap.
     overflow_url: str = ""             # http(s) only; a full or draining node redirects Twilio here instead of speaking
-    sip_token: str = ""                # VOX_SIP_TOKEN; empty disables /internal/sip/setup and /sip/recover (404)
+    sip_token: str = ""                # VOX_SIP_TOKEN; empty disables setup, recover, amd, bind, and transfer (404)
     audiosocket_rate: int = 8000       # VOX_AUDIOSOCKET_RATE. 8000 keeps 320-byte frames; 16000 matches g722/slin16.
 
 
@@ -122,6 +125,7 @@ class OutboundIn(BaseModel):
     voicemailMessage: Optional[str] = Field(None, max_length=600)   # if an answering machine picks up, leave this
     variables: Optional[dict[str, Any]] = None                      # fills {{name}} in the agent's prompt and greeting
     metadata: dict = Field(default_factory=dict)
+    channel: str = "twilio"                                         # twilio (default) or sip (Asterisk ARI)
 
 
 class ToolIn(BaseModel):
@@ -408,6 +412,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     app.state.draining = False
     app.state.sip_setups = {}          # uuid -> {caller, exten, callee, created}; same rows as sip_setup
+    app.state.sip_by_uuid = {}       # AudioSocket UUID -> Asterisk channel uniqueid (POST /sip/bind)
+    app.state.sip_by_channel = {}    # Asterisk channel uniqueid -> call id
+    app.state.sip_machine_done = {}  # call id -> "voicemail" | "hangup" once that action has finished
+    app.state.sip_machine_wait = {}  # call id -> in-flight hangup shared by concurrent /sip/amd callers
 
     def at_node_cap() -> bool:
         """True when this process must refuse another call.
@@ -1062,15 +1070,22 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return t
 
     def drop_sip_setup(call: Optional[dict]) -> None:
-        """The setup row is only how the caller id reaches the call. It is not kept after the call is over."""
+        """The setup row is only how the caller id reaches the call. It is not kept after the call is over.
+
+        Inbound legs store the socket uuid as callSid. A bound or outbound leg stores the ARI channel
+        there and the socket uuid as audioSocketUuid. Both keys are removed; a missing row is a no-op.
+        """
         meta = (call or {}).get("metadata") or {}
         if isinstance(meta, str):
             meta = json.loads(meta or "{}")
-        uid = str(meta.get("callSid") or "")
-        if not uid:
-            return
-        store.delete_sip_setup(uid)
-        app.state.sip_setups.pop(uid, None)
+        seen: set[str] = set()
+        for key in ("callSid", "audioSocketUuid"):
+            uid = str(meta.get(key) or "")
+            if not uid or uid in seen:
+                continue
+            seen.add(uid)
+            store.delete_sip_setup(uid)
+            app.state.sip_setups.pop(uid, None)
 
     async def finish(call: dict, t: dict, reason: str) -> None:
         # A failed transcript insert must not skip the slot release or leave the call active,
@@ -1349,10 +1364,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         A slot is reserved before the UUID read, so a second connection already sees a full node,
         and no call row exists until that UUID arrives. A uuid that already belongs to a SIP call
         is resumed instead of minting a blank row; that path can run even when the placeholder
-        reservation was refused, because continuing a dead leg frees its slot. The setup row maps
-        the UUID to the dialed number, and `numbers` picks the agent. Caller id is copied onto the
-        call before the session is built. No fresh setup, or no mapping, falls back to
-        settings.audiosocket_agent.
+        reservation was refused, because continuing a dead leg frees its slot. An outbound row
+        created for this socket, or a bind that arrived before the row, is adopted the same way.
+        The setup row maps the UUID to the dialed number, and `numbers` picks the agent. Caller id
+        is copied onto the call before the session is built. No fresh setup, or no mapping, falls
+        back to settings.audiosocket_agent.
         """
         from transports.audiosocket import AudioSocketTransport
         app.state.audiosocket_writers.add(writer)
@@ -1378,7 +1394,14 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             async def factory(transport, custom):
                 nonlocal cid, holder
                 uid = str(custom.get("uuid", "") or "")
+                # /sip/bind maps this socket to the ARI channel. Recover still addresses a leg by callSid,
+                # which is the socket uuid when no channel was bound.
+                ari_id = app.state.sip_by_uuid.get(uid, "") if uid else ""
                 existing = store.find_call_by_sid(uid, medium="sip") if uid else None
+                if existing is None and uid:
+                    by_audio = store.find_sip_by_audio_uuid(uid)
+                    if by_audio is not None and sip_socket_reuses(by_audio):
+                        existing = by_audio
                 if existing is not None and sip_socket_reuses(existing):
                     resumed = sip_resume(existing)
                     if resumed["action"] != "continue":
@@ -1397,6 +1420,47 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                     except _Reject:
                         # admit marks the row ended before raising. A continuation that never joined holds no
                         # slot; leaving it ended spends a resume and the next socket mints a blank call.
+                        fresh = await to_thread(store.get_call_any, call["id"])
+                        if fresh is not None and never_joined_continuation(fresh, sip_meta(fresh)):
+                            await to_thread(restore_continuation, fresh)
+                        raise
+                    return await to_thread(runtime.build_session, call, transport)
+                # Outbound originate already inserted this row and holds its slot. Bind-before-audio
+                # names the same channel. Adopting it keeps voicemail, from, and to; a second row would
+                # be a different call. A brand-new uuid with no reservation still raises below.
+                adopted = None
+                if ari_id:
+                    bound_id = app.state.sip_by_channel.get(ari_id)
+                    if bound_id:
+                        found = store.get_call_any(bound_id)
+                        if found and found.get("medium") == "sip" and found.get("status") == "created":
+                            adopted = found
+                    if adopted is None:
+                        adopted = store.find_sip_call(call_sid=ari_id)
+                if adopted is None and uid:
+                    adopted = store.find_sip_call(audio_uuid=uid)
+                if adopted is not None:
+                    if cid and holder is not None and adopted["id"] != cid:
+                        limiter.release(holder["tenant_id"], cid)
+                        cid = ""
+                        holder = None
+                    patch = {"channel": "sip", "audioSocketUuid": uid}
+                    if ari_id:
+                        patch["callSid"] = ari_id
+                    store.merge_call_metadata(adopted["id"], patch)
+                    call = store.get_call_any(adopted["id"])
+                    if call is None:
+                        writer.close()
+                        raise EOFError("sip call is gone")
+                    bound = str((call.get("metadata") or {}).get("callSid") or "")
+                    if bound:
+                        app.state.sip_by_channel[bound] = call["id"]
+                    if ari_id:
+                        transport.call_sid = ari_id
+                    state["call"] = call
+                    try:
+                        state["t"] = await admit(call)
+                    except _Reject:
                         fresh = await to_thread(store.get_call_any, call["id"])
                         if fresh is not None and never_joined_continuation(fresh, sip_meta(fresh)):
                             await to_thread(restore_continuation, fresh)
@@ -1429,11 +1493,16 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                     holder = chosen
                 # build_session reads this dict, not a fresh store row, so the caller id has to be on it
                 # before the session is built ({{caller}} / CallContext.caller).
-                meta = {"callSid": uid, "channel": "sip", "from": "", "to": ""}
+                # No ARI channel: callSid stays the socket uuid so /sip/recover can find this leg.
+                # audioSocketUuid is the same id, which is what a cold transfer looks up.
+                meta = {"callSid": ari_id or uid, "audioSocketUuid": uid, "channel": "sip", "from": "", "to": ""}
                 if setup:
                     meta["from"] = setup.get("caller") or ""
                     meta["to"] = dialed
                 call = await to_thread(create_reserved, cid, chosen["tenant_id"], chosen["id"], "sip", chosen["config"], meta)
+                if ari_id:
+                    app.state.sip_by_channel[ari_id] = call["id"]
+                    transport.call_sid = ari_id
                 state["call"] = call
                 state["t"] = await admit(call)
                 return await to_thread(runtime.build_session, call, transport)
@@ -1725,12 +1794,131 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not security.validate_twilio(settings.twilio_auth_token, url, form, request.headers.get("X-Twilio-Signature", "")):
             raise HTTPException(403, "bad twilio signature")
 
+    def require_sip_token(got: str) -> None:
+        """Empty VOX_SIP_TOKEN hides the route (404). A wrong token is 403. compare_digest is false for unequal lengths."""
+        if not settings.sip_token:
+            raise HTTPException(404, "not found")
+        if not hmac.compare_digest(got, settings.sip_token):
+            raise HTTPException(403, "bad sip token")
+
+    async def sip_fields(request: Request) -> dict:
+        """JSON or form body. Asterisk CURL posts urlencoded fields and may omit a content type."""
+        ctype = (request.headers.get("content-type") or "").lower()
+        if "json" in ctype:
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            return body if isinstance(body, dict) else {}
+        try:
+            form = {k: str(v) for k, v in (await request.form()).items()}
+        except Exception:  # noqa: BLE001
+            form = {}
+        if form:
+            return form
+        from urllib.parse import parse_qs
+        raw = (await request.body()).decode("utf-8", "ignore")
+        parsed = {k: v[-1] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+        return parsed or {k: v for k, v in request.query_params.items()}
+
+    def clean_channel_id(value: object) -> str:
+        channel_id = str(value or "").strip()
+        if not channel_id or len(channel_id) > 200 or any(ord(c) < 32 or ord(c) == 127 for c in channel_id):
+            raise HTTPException(422, "channelId is required")
+        return channel_id
+
+    async def sip_machine(call_id: str) -> str:
+        """Act on a stored machine_end result once. A live session is spoken to and hung up; otherwise the ARI
+        channel (metadata callSid, never the AudioSocket UUID) is deleted so the originated call does not stay up.
+        A hang-up is finished only after DELETE returns 2xx or 404. Concurrent callers wait on that attempt."""
+        done = app.state.sip_machine_done.get(call_id)
+        if done:
+            return done
+        inflight = app.state.sip_machine_wait.get(call_id)
+        if inflight is not None:
+            inflight["waiters"] += 1
+            await inflight["event"].wait()
+            if inflight.get("error"):
+                raise HTTPException(502, inflight["error"])
+            return inflight.get("result") or ""
+        cur = store.get_call_any(call_id)
+        if not cur:
+            return ""
+        meta = cur.get("metadata") or {}
+        answered = str(meta.get("answeredBy") or "")
+        if not answered.startswith("machine_end"):
+            return ""
+        msg = meta.get("voicemail")
+        live = runtime.live.get(call_id)
+        if live and msg:
+            app.state.sip_machine_done[call_id] = "voicemail"
+            sess, transport = live
+
+            async def go():
+                try:
+                    await sess.say_and_wait(msg)
+                finally:
+                    # A TTS failure must still drop the line; otherwise the machine stays connected.
+                    await transport.end()
+
+            import asyncio
+            asyncio.get_running_loop().create_task(go())
+            return "voicemail"
+        if live or cur["status"] != "created":
+            return ""
+        channel = str(meta.get("callSid") or "")
+        if not channel or runtime.http is None:
+            return ""
+        ctl = control_from_env(runtime.http, settings.public_base_url, "sip")
+        if not isinstance(ctl, AsteriskCallControl):
+            return ""
+        # Mark ended before the DELETE await so a concurrent AudioSocket cannot adopt this row.
+        # Do not publish "hangup" until DELETE returns 2xx or 404. A timeout, connect error, or
+        # HTTP 5xx drops the in-flight mark and reopens the row this attempt ended.
+        import asyncio
+        inflight = {"event": asyncio.Event(), "result": "", "error": "", "waiters": 0}
+        app.state.sip_machine_wait[call_id] = inflight
+        reason = answered[:80]
+        we_ended = cur["status"] == "created"
+        try:
+            if we_ended:
+                store.update_call(call_id, status="ended", ended=time.time(), end_reason=reason)
+            try:
+                await ctl.hangup(channel)
+            except (RuntimeError, httpx.TransportError) as e:
+                if we_ended:
+                    latest = store.get_call_any(call_id)
+                    if latest and latest.get("status") == "ended" and (latest.get("end_reason") or "") == reason:
+                        store.update_call(call_id, status="created", ended=None, end_reason=None)
+                inflight["error"] = str(e) or type(e).__name__
+                inflight["event"].set()
+                raise HTTPException(502, inflight["error"]) from e
+            app.state.sip_machine_done[call_id] = "hangup"
+            # The audio leg never joined, so finish() will not release the outbound reservation.
+            # A timed-out DELETE reopens the row above and keeps the slot: the call may still be up.
+            try:
+                limiter.release(cur["tenant_id"], call_id)
+            except Exception:  # noqa: BLE001
+                METRICS.inc("vox_errors_total", where="limiter_release")
+            inflight["result"] = "hangup"
+            inflight["event"].set()
+            return "hangup"
+        finally:
+            if not inflight["event"].is_set():
+                inflight["error"] = inflight.get("error") or "machine hangup failed"
+                inflight["event"].set()
+            if app.state.sip_machine_wait.get(call_id) is inflight:
+                app.state.sip_machine_wait.pop(call_id, None)
+
     @app.post("/v1/calls/outbound")
     async def outbound(body: OutboundIn, t: dict = Depends(tenant_write)):
-        """Places a phone call through your Twilio account and connects the answered call to the agent."""
+        """Places a phone call. "twilio" (default) uses your Twilio account; "sip" originates through Asterisk ARI."""
         if app.state.draining:
             raise HTTPException(503, "node is draining")
-        if not (settings.twilio_account_sid and settings.twilio_auth_token):
+        channel = (body.channel or "twilio").strip().lower()
+        if channel not in ("twilio", "sip"):
+            raise HTTPException(422, "channel must be 'twilio' or 'sip'")
+        if channel == "twilio" and not (settings.twilio_account_sid and settings.twilio_auth_token):
             raise HTTPException(503, "outbound calling needs TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN on the server")
         if runtime.http is None:
             raise HTTPException(503, "no HTTP client configured")
@@ -1744,6 +1932,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         agent = await to_thread(store.get_agent, t["id"], body.agentId)
         if not agent:
             raise HTTPException(404, "agent not found")
+        # Refuse sip before any row. A missing ARI url must not leave a call behind.
+        if channel == "sip":
+            control = control_from_env(runtime.http, settings.public_base_url, "sip")
+            if not isinstance(control, AsteriskCallControl):
+                raise HTTPException(503, "sip outbound needs ASTERISK_ARI_URL")
         cfg = dict(agent["config"])
         if body.record is not None:
             cfg["record"] = body.record
@@ -1758,11 +1951,12 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             meta["voicemail"] = body.voicemailMessage
         tenant_id = t["id"]
         node_draining = object()
+        medium = "sip" if channel == "sip" else "twilio"
 
         def _admit():
             # hold() sleeps while another node inserts; that wait must not block this event loop.
             # Drain can flip during the wait, and the lease can disappear. Re-check both before the insert.
-            # Reserve before dialing. A full node must not place a call Twilio will connect to a 1013.
+            # Reserve before dialing. A full node must not place a call the far end will connect to a 1013.
             with outbound_cap.hold(tenant_id, settings.outbound_per_day) as allowed:
                 if not allowed:                        # over the cap, or this holder's lease is gone
                     return None
@@ -1771,7 +1965,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 cid, decision = reserve_slot(tenant_id)
                 if decision != "ok":
                     return decision                    # "node" or "tenant"; no row, cap not consumed
-                return create_reserved(cid, tenant_id, body.agentId, "twilio", cfg, meta)
+                return create_reserved(cid, tenant_id, body.agentId, medium, cfg, meta)
 
         call = await to_thread(_admit)
         if call is node_draining:
@@ -1780,6 +1974,63 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             raise HTTPException(429, f"outbound limit reached ({settings.outbound_per_day} per 24 h)")
         if call in ("node", "tenant"):
             raise HTTPException(503, "node full" if call == "node" else "concurrency limit")
+
+        async def _release_failed(reason: str) -> None:
+            try:
+                limiter.release(t["id"], call["id"])
+            except Exception:  # noqa: BLE001
+                METRICS.inc("vox_errors_total", where="limiter_release")
+            await to_thread(store.update_call, call["id"], status="ended", ended=time.time(), end_reason=reason)
+
+        if channel == "sip":
+            # appArgs is how the Stasis app learns the call id. It POSTs AnsweredBy to /sip/amd/{id}.
+            # channelId is stored before the request so a lost response can still DELETE that channel,
+            # and an AnsweredBy that arrives during originate merges instead of replacing this document.
+            app_args = f"amd,{call['id']}" if body.voicemailMessage else None
+            channel_id = uuidlib.uuid4().hex
+            await to_thread(store.merge_call_metadata, call["id"], {"callSid": channel_id})
+            app.state.sip_by_channel[channel_id] = call["id"]
+            try:
+                r = await control.originate(body.to, caller_id, app_args, channel_id=channel_id)
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                try:
+                    await control.hangup(channel_id)
+                except Exception:  # noqa: BLE001  (best-effort; the row is still a failure)
+                    pass
+                await _release_failed("asterisk_unreachable")
+                raise HTTPException(502, f"could not reach Asterisk: {type(e).__name__}") from e
+            except Exception as e:  # noqa: BLE001
+                await _release_failed("asterisk_unreachable")
+                raise HTTPException(502, f"could not reach Asterisk: {type(e).__name__}") from e
+            if r.status_code >= 300:
+                await _release_failed("asterisk_rejected")
+                try:
+                    msg = r.json().get("message", "")
+                except ValueError:
+                    msg = ""
+                raise HTTPException(502, f"Asterisk refused the call (HTTP {r.status_code}): {msg}")
+            try:
+                payload = r.json()
+                sid = payload.get("id", "") if isinstance(payload, dict) else ""
+            except ValueError:
+                sid = ""
+            if not isinstance(sid, str):
+                sid = str(sid)
+            if not sid:
+                sid = channel_id
+            if sid:
+                await to_thread(store.merge_call_metadata, call["id"], {"callSid": sid})
+                app.state.sip_by_channel[sid] = call["id"]
+            try:
+                await sip_machine(call["id"])
+            except HTTPException:
+                # The originate succeeded. A machine DELETE that timed out leaves the row created;
+                # 502 here would look like Asterisk never placed the call.
+                pass
+            await to_thread(log, t, "call.outbound", call["id"], to=body.to)
+            fresh = await to_thread(store.get_call_any, call["id"])
+            return {**public_call(fresh), "callSid": sid}
+
         twiml = stream_twiml(call)
         data = {"To": body.to, "From": caller_id, "Twiml": twiml,
                 "StatusCallback": f"{settings.public_base_url}/twilio/status/{call['id']}",
@@ -1977,5 +2228,65 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             delivered = bool(bus.publish(call_id, {"op": "voicemail", "text": msg})) if bus is not None else False
             return {"action": "voicemail", "delivered": delivered}
         return {"action": "none", "answeredBy": answered}
+
+    @app.post("/sip/amd/{call_id}")
+    async def sip_amd(call_id: str, request: Request, x_vox_sip_token: str = Header(default="")):
+        """Asterisk (or the Stasis app) posts AnsweredBy here. Same voicemail action as /twilio/amd when the call
+        is live. A machine result with no session deletes the originated ARI channel instead of leaving it up."""
+        require_sip_token(x_vox_sip_token)
+        if not store.get_call_any(call_id):
+            raise HTTPException(404, "call not found")
+        fields = await sip_fields(request)
+        answered = str(fields.get("AnsweredBy") or fields.get("answeredBy") or "").strip()
+        if not answered:
+            # Missing or invalid JSON is an empty result. Do not erase a machine_end already stored,
+            # and do not run the hang-up on a blank value.
+            cur = store.get_call_any(call_id)
+            if not cur:
+                raise HTTPException(404, "call not found")
+            kept = str((cur.get("metadata") or {}).get("answeredBy") or "")
+            return {"action": "none", "answeredBy": kept}
+        # Merge only answeredBy so a callSid stored while this request was in flight is not dropped.
+        if store.merge_call_metadata(call_id, {"answeredBy": answered}) is None:
+            raise HTTPException(404, "call not found")
+        METRICS.inc("vox_amd_total", answered_by=answered)
+        if answered.startswith("machine_end"):
+            action = await sip_machine(call_id)
+            if action:
+                return {"action": action, "answeredBy": answered}
+        return {"action": "none", "answeredBy": answered}
+
+    @app.post("/sip/bind")
+    async def sip_bind(request: Request, x_vox_sip_token: str = Header(default="")):
+        """Dialplan posts CHANNEL(uniqueid) and the AudioSocket UUID before AudioSocket() opens. Machine hangup
+        deletes that uniqueid. The AudioSocket UUID is not an ARI channel and must not be redirected or deleted."""
+        require_sip_token(x_vox_sip_token)
+        fields = await sip_fields(request)
+        try:
+            audio_uuid = str(uuidlib.UUID(str(fields.get("uuid") or fields.get("audioSocketUuid") or "")))
+        except ValueError:
+            raise HTTPException(422, "uuid must be a UUID") from None
+        channel_id = clean_channel_id(fields.get("channelId") or fields.get("uniqueid") or "")
+        app.state.sip_by_uuid[audio_uuid] = channel_id
+        found = store.find_sip_call(call_sid=channel_id)
+        if found:
+            store.merge_call_metadata(found["id"],
+                                     {"audioSocketUuid": audio_uuid, "callSid": channel_id, "channel": "sip"})
+            app.state.sip_by_channel[channel_id] = found["id"]
+        return {"ok": True, "uuid": audio_uuid, "channelId": channel_id}
+
+    @app.get("/sip/transfer")
+    async def sip_transfer(request: Request, x_vox_sip_token: str = Header(default="")):
+        """Dialplan reads the cold-transfer number after AudioSocket returns. Empty body means Hangup."""
+        require_sip_token(x_vox_sip_token)
+        try:
+            audio_uuid = str(uuidlib.UUID(str(request.query_params.get("uuid") or "")))
+        except ValueError:
+            return PlainTextResponse("")
+        found = store.find_sip_by_audio_uuid(audio_uuid)
+        number = str(((found or {}).get("metadata") or {}).get("transferTo") or "")
+        if not E164.match(number):
+            number = ""
+        return PlainTextResponse(number)
 
     return app

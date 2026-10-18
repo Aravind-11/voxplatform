@@ -82,6 +82,24 @@ def injection_risk(text) -> bool:
     return bool(text) and _INJECTION.search(str(text)) is not None
 
 
+def _iter_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_strings(item)
+
+
+def _injection_blocked(ctx, args) -> bool:
+    """True when the caller line or a string argument matches the injection phrase list."""
+    if injection_risk(_caller_text(ctx)):
+        return True
+    return any(injection_risk(text) for text in _iter_strings(args))
+
+
 def _caller_text(ctx) -> str:
     provider = getattr(ctx, "last_user_text", None)
     if provider is None:
@@ -100,7 +118,8 @@ def _injection_refusal() -> dict:
 def _with_budget(fn, ctx):
     """Shared per-call cap. The refused call does not run `fn` and does not increment the counter."""
     async def run(args: dict):
-        if injection_risk(_caller_text(ctx)):
+        args = dict(args or {})
+        if _injection_blocked(ctx, args):
             return _injection_refusal()
         used = int(getattr(ctx, "tool_calls", 0) or 0)
         budget = int(getattr(ctx, "tool_budget", 8))
@@ -132,9 +151,9 @@ def with_confirmation(fn, schema: dict, ctx):
     pending: dict[str, int] = {}
 
     async def run(args: dict):
-        if injection_risk(_caller_text(ctx)):
-            return _injection_refusal()
         args = dict(args or {})
+        if _injection_blocked(ctx, args):
+            return _injection_refusal()
         confirmed = args.pop("confirmed", False) is True
         key, turn = _canon(args), ctx.turn_fn()
         if confirmed and key in pending and pending[key] < turn:

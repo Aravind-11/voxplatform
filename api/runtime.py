@@ -209,4 +209,15 @@ class Runtime:
             sess.seed_history(self._earlier_messages(meta["resumedFrom"]))
         self.live[call["id"]] = (sess, transport)
         ctx.turn_fn = lambda: sess.stats["turns"]      # lets confirm-before-acting tools tell turns apart
+
+        def last_user_text() -> str:
+            # This turn is still "[caller audio]" when tools run. The previous caller line is the transcript.
+            for message in reversed(sess.history):
+                if message.get("role") != "user":
+                    continue
+                text = str(message.get("content") or "").strip()
+                if text and text != "[caller audio]":
+                    return text
+            return ""
+        ctx.last_user_text = last_user_text
         return sess

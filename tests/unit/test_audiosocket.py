@@ -205,6 +205,81 @@ async def test_slin16_kind_is_wideband_and_outbound_16khz_is_not_tagged_8khz():
     srv.close()
 
 
+async def test_kind_0x12_stays_16khz_when_the_socket_rate_is_8000():
+    """Kind 0x12 is already 16 kHz. The default 8000 socket rate must not upsample those samples as 8 kHz."""
+    sess = StubSession()
+
+    async def factory(tr, custom):
+        return sess
+
+    async def handler(r, w):
+        await A.AudioSocketTransport(r, w, factory, sample_rate=8000).run()
+
+    srv, port = await serve(handler)
+    try:
+        _r, w = await asyncio.open_connection("127.0.0.1", port)
+        payload = np.full(320, 1000, dtype="<i2").tobytes()
+        assert len(payload) == 640
+        w.write(A.pack(A.KIND_UUID, uuid.uuid4().bytes))
+        w.write(A.pack(0x12, payload) + A.pack(0x12, payload))
+        w.write(A.pack(A.KIND_HANGUP))
+        await w.drain()
+        for _ in range(200):
+            if sess.closed:
+                break
+            await asyncio.sleep(0.01)
+        assert sess.closed
+        # Two 640-byte frames are 640 samples: one 512-sample frame of the original samples.
+        # Treating them as 8 kHz and upsampling yields two frames, not this one.
+        assert len(sess.frames) == 1
+        assert np.array_equal(sess.frames[0], np.full(512, 1000, dtype=np.int16))
+    finally:
+        srv.close()
+
+
+async def test_send_audio_rejects_a_mismatched_rate_and_dtmf_uses_the_socket_rate():
+    """An 8 kHz buffer must not be framed as 640-byte kind 0x12, and DTMF must be generated at out_rate."""
+    from core import dtmf
+    import pytest
+
+    sess = StubSession()
+
+    async def factory(tr, custom):
+        return sess
+
+    box = {}
+
+    async def handler(r, w):
+        tr = A.AudioSocketTransport(r, w, factory, sample_rate=16000)
+        box["tr"] = tr
+        await tr.run()
+
+    srv, port = await serve(handler)
+    try:
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(A.pack(A.KIND_UUID, uuid.uuid4().bytes))
+        await w.drain()
+        for _ in range(100):
+            if "tr" in box and sess.started:
+                break
+            await asyncio.sleep(0.01)
+        tr = box["tr"]
+        with pytest.raises(AssertionError):
+            await tr.send_audio(np.zeros(160, dtype=np.int16), 8000)
+        await tr.send_dtmf("5")
+        frames = []
+        for _ in range(10):
+            kind, payload = await asyncio.wait_for(A.read_message(r), 2)
+            frames.append((kind, payload))
+        assert all(kind == 0x12 and len(payload) == 640 for kind, payload in frames)
+        pcm = np.concatenate([np.frombuffer(payload, dtype="<i2") for _, payload in frames])
+        # 120 ms tone + 80 ms gap at 16 kHz is 3200 samples, ten 20 ms frames. 8000 Hz would be five.
+        assert np.array_equal(pcm, dtmf.sequence("5", 16000))
+        await tr.end()
+    finally:
+        srv.close()
+
+
 def test_dialplan_requests_slin16_on_the_audiosocket_channel():
     """AudioSocket() forces 8 kHz slin and ignores CHANNEL(audioreadformat). The channel driver does not."""
     text = open("deploy/sip/extensions.conf", encoding="utf-8").read()
@@ -216,6 +291,29 @@ def test_dialplan_requests_slin16_on_the_audiosocket_channel():
     assert "Goto(${EXTEN:1},1)" in code
     modules = open("deploy/sip/modules.conf", encoding="utf-8").read()
     assert "load = chan_audiosocket.so" in modules
+    # Comment lines do not count. g722 before ulaw/alaw is what keeps a dual-offer peer off 8 kHz.
+    sections: list[tuple[str, list[str]]] = []
+    name, body = None, []
+    for raw in open("deploy/sip/pjsip.conf", encoding="utf-8"):
+        ln = raw.split(";", 1)[0].strip()
+        if not ln:
+            continue
+        if ln.startswith("[") and ln.endswith("]"):
+            if name is not None:
+                sections.append((name, body))
+            name, body = ln[1:-1], []
+        elif name is not None:
+            body.append(ln)
+    if name is not None:
+        sections.append((name, body))
+    endpoints = [b for _, b in sections if "type=endpoint" in b]
+    assert len(endpoints) == 1
+    endpoint = endpoints[0]
+    assert "disallow=all" in endpoint
+    assert "allow=g722" in endpoint and "allow=ulaw" in endpoint and "allow=alaw" in endpoint
+    g722 = endpoint.index("allow=g722")
+    assert endpoint.index("disallow=all") < g722
+    assert g722 < endpoint.index("allow=ulaw") and g722 < endpoint.index("allow=alaw")
 
 
 def test_full_sip_call_through_the_app_creates_a_call_speaks_back_and_hangs_up():
@@ -284,6 +382,9 @@ def test_asterisk_image_plays_slin16_and_bare_metal_sets_the_rate():
     assert "downloads.asterisk.org" in docker
     assert "asterisk-${ASTERISK_VERSION}.tar.gz" in docker
     assert "chan_audiosocket" in docker and "res_audiosocket" in docker
+    code = "\n".join(ln for ln in docker.splitlines() if not ln.lstrip().startswith("#"))
+    assert re.search(r"menuselect\s+--enable\s+codec_g722\b", code)
+    assert re.search(r"test\s+-f\s+\S*codec_g722\.so\b", code)
     flat = docker.replace("\\\n", " ")
     installs = re.findall(r"apt-get\s+install\b([^;&|]*)", flat)
     assert installs, "Dockerfile.asterisk lost its package install"
@@ -298,6 +399,25 @@ def test_asterisk_image_plays_slin16_and_bare_metal_sets_the_rate():
     assert "VOX_AUDIOSOCKET_AGENT=" in bare
     assert "VOX_AUDIOSOCKET_HOST=127.0.0.1" in bare
     assert "VOX_AUDIOSOCKET_RATE=16000" in bare
+
+
+def test_compose_api_sets_audiosocket_rate_16000():
+    """The shipped api services must run at 16000. A missing or 8000 value leaves 320-byte frames against slin16."""
+    text = open("deploy/docker-compose.yml", encoding="utf-8").read()
+    env = re.search(r"(?m)^  environment: &api-env\n((?:    .*\n)*)", text)
+    assert env, "api environment anchor missing"
+    rate = re.search(r'(?m)^    VOX_AUDIOSOCKET_RATE:\s*"16000"\s*(?:#.*)?$', env.group(1))
+    assert rate, "api environment must set VOX_AUDIOSOCKET_RATE to the literal 16000"
+    assert re.search(r"(?m)^  api1:\s*\{[^}\n]*<<:\s*\*api\b", text)
+    assert re.search(r"(?m)^  api2:\s*\{[^}\n]*<<:\s*\*api\b", text)
+
+
+def test_settings_audiosocket_rate_defaults_to_8000_and_build_reads_the_env():
+    """The code default stays 8000. build() must still pass the env value through; do not call build() (it loads TTS)."""
+    from api.app import Settings
+    assert Settings().audiosocket_rate == 8000
+    src = open("api/main.py", encoding="utf-8").read()
+    assert 'audiosocket_rate=int(env.get("VOX_AUDIOSOCKET_RATE", "8000"))' in src
 
 
 def test_wideband_sip_call_through_the_app_speaks_kind_0x12_at_the_session_rate():

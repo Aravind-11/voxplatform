@@ -2,9 +2,9 @@
 
 A card is one number of 13–19 digits: a contiguous run, or several groups joined by
 spaces or dashes. It must pass Luhn, or be at least 15 digits and be the whole run
-(a proper prefix would leave the rest of the number in clear). A year, zip, or clock
-fragment beside an order id under 13 digits is not a card. Years, times like 11:00,
-and those order ids stay.
+(a proper prefix would leave the rest of the number in clear). A year, zip, or
+1–2 digit fragment beside an order id stays as written only when that span fails
+Luhn. Years, times like 11:00, and order ids under 13 digits stay.
 """
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def _clock_or_date(raw: str) -> bool:
 
 
 def _separate_numbers(groups: list[str]) -> bool:
-    """A year, zip, or 1–2 digit fragment next to an order id is not one card."""
+    """A year, zip, or 1–2 digit fragment next to a 7–12 digit order id."""
     has_order = has_sticky = False
     for g in groups:
         n = len(g)
@@ -98,11 +98,15 @@ def _redact_run(raw: str) -> str:
     def consider(i: int, j: int) -> None:
         span = groups[i:j + 1]
         digits = "".join(span)
-        if not 13 <= len(digits) <= 19 or _separate_numbers(span):
+        if not 13 <= len(digits) <= 19:
             return
         if _clock_or_date(_join_groups(groups, seps, i, j)):
             return
         luhn = _luhn(digits)
+        # The year/zip/fragment shape is not a card only when Luhn fails. A real PAN
+        # split as 5+11 (or 1–2 beside 7–12) still has to be redacted.
+        if not luhn and _separate_numbers(span):
+            return
         whole = i == 0 and j == n - 1
         # Non-Luhn 15+ digits count only for one number: a contiguous run, or the whole
         # separator run. A shorter window is a prefix and would leave a tail in clear.

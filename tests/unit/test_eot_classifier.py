@@ -15,6 +15,42 @@ def test_silence_has_no_evidence_and_scores_even():
     assert clf.score(np.zeros(16000, np.int16)) == 0.5
 
 
+def test_default_weights_score_a_pitch_fall_above_a_pitch_rise():
+    """Hand priors are applied to the same normalized cues as eot_prosody, not raw semitones/s."""
+    clf = EotClassifier()
+    fall = {"slope": -6.0, "decay": 0.75, "filler": 0, "voiced": 0}
+    rise = {"slope": 6.0, "decay": 0.75, "filler": 0, "voiced": 0}
+    assert clf.score_features(fall) > clf.score_features(rise)
+
+    def hand(feats: dict) -> float:
+        slope = float(feats.get("slope") or 0.0)
+        decay = float(feats.get("decay") or 0.0)
+        filler = 1.0 if feats.get("filler") else 0.0
+        pitched = float(np.clip(-slope / 6.0, -1.0, 1.0))
+        soft = float(np.clip((0.75 - decay) / 0.5, -1.0, 1.0))
+        z = 0.3 + 1.5 * pitched + 0.9 * soft - 1.8 * filler
+        return float(1.0 / (1.0 + np.exp(-z)))
+
+    samples = (
+        fall,
+        rise,
+        {"slope": 0.0, "decay": 0.25, "filler": 1, "voiced": 20},
+        {"slope": -12.0, "decay": 1.5, "filler": 0, "voiced": 4},
+    )
+    for feats in samples:
+        assert abs(clf.score_features(feats) - hand(feats)) < 1e-6
+
+
+def test_a_weight_that_cannot_be_a_float_keeps_the_hand_priors(monkeypatch, tmp_path):
+    path = tmp_path / "huge.json"
+    path.write_text(json.dumps({"bias": 10 ** 400}))
+    assert EotClassifier.load(str(path)).weights == DEFAULT_WEIGHTS
+    monkeypatch.setenv("VOX_EOT", "classifier")
+    monkeypatch.setenv("VOX_EOT_MODEL", str(path))
+    rt = Runtime(object(), lambda v: None, lambda: None, Store())
+    assert rt._eot_sync()(np.zeros(64, np.int16), []) == 0.5
+
+
 def test_negative_filler_weight_scores_an_um_below_even():
     clf = EotClassifier({"bias": 0.0, "slope": 0.0, "decay": 0.0, "filler": -40.0, "voiced": 0.0})
     assert clf.score_features({"slope": 1.0, "decay": 0.5, "filler": 1, "voiced": 12}) < 0.5

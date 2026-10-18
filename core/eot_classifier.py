@@ -41,17 +41,21 @@ class EotClassifier:
             if k in data and data[k] is not None:
                 try:
                     picked[k] = float(data[k])
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return cls()
         return cls(picked)
 
     def score_features(self, feats: dict) -> float:
-        """Sigmoid of the linear score. `filler` is 0/1; the other inputs are the prosody numbers."""
+        """Sigmoid of the linear score. slope and decay use the eot_prosody clips; filler is 0/1."""
         w = self.weights
         filler = 1.0 if feats.get("filler") else 0.0
+        slope = float(feats.get("slope") or 0.0)
+        decay = float(feats.get("decay") or 0.0)
+        fall = float(np.clip(-slope / 6.0, -1.0, 1.0))
+        soft = float(np.clip((0.75 - decay) / 0.5, -1.0, 1.0))
         z = (w["bias"]
-             + w["slope"] * float(feats.get("slope") or 0.0)
-             + w["decay"] * float(feats.get("decay") or 0.0)
+             + w["slope"] * fall
+             + w["decay"] * soft
              + w["filler"] * filler
              + w["voiced"] * float(feats.get("voiced") or 0.0))
         return float(1.0 / (1.0 + np.exp(-np.clip(z, -60.0, 60.0))))

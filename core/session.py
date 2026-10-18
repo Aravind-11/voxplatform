@@ -161,6 +161,7 @@ class Session:
         self._last_speech_clock = 0.0
         self._transcript_task: Optional[asyncio.Task] = None
         self._transcript_tasks: set[asyncio.Task] = set()
+        self._transcripts: list[tuple[int, asyncio.Task]] = []  # (history index, task), oldest first
         self._bg: set[asyncio.Task] = set()
         self._turn_lock = asyncio.Lock()  # feed holds this across its score so the frame is applied first
         self._overlapped = False          # this caller utterance started while the agent was playing
@@ -323,7 +324,9 @@ class Session:
             if self._gen:
                 await self._cancel(self._gen)
         finally:
-            # Hang-up can land while close() is still in _cancel. Finish transcripts either way.
+            # Hang-up can land while close() is still in _cancel. Finish every in-flight ASR,
+            # oldest included, so call.ended sees the lines. Shielded: cancelling close() must
+            # not cancel the transcript.
             await self._finish_transcripts()
 
     async def _finish_transcripts(self) -> None:
@@ -619,12 +622,21 @@ class Session:
         self.history.append({"role": "user", "content": "[caller audio]"})
         self.history.append({"role": "assistant", "content": ""})
         user_idx = len(self.history) - 2
-        task = asyncio.create_task(self._transcribe(gen.audio, user_idx, overlapped, speech_ms))
+        # Snapshot before this task is recorded, so it waits on earlier slots and not on itself.
+        # A faster later turn must not emit user_transcript before those earlier slots do.
+        prior = [t for _, t in self._transcripts]
+        task = asyncio.create_task(self._transcribe(gen.audio, user_idx, prior, overlapped, speech_ms))
+        self._transcripts.append((user_idx, task))
         self._transcript_tasks.add(task)
+
+        def _done(done: asyncio.Task) -> None:
+            self._transcript_tasks.discard(done)
+            self._transcripts = [(i, t) for i, t in self._transcripts if t is not done]
+
         if task.done():
-            self._transcript_tasks.discard(task)
+            _done(task)
         else:
-            task.add_done_callback(self._transcript_tasks.discard)
+            task.add_done_callback(_done)
         self._transcript_task = task
         gen.transcript_task = task   # so a later turn's task is not the one we await
         gen.user_idx = user_idx
@@ -645,8 +657,8 @@ class Session:
             self.stats["interruptions"] = max(0, self.stats["interruptions"] - 1)
         self._emit("backchannel", text=text, duration_ms=duration_ms)
 
-    async def _transcribe(self, audio: np.ndarray, idx: int, overlapped: bool = False,
-                          speech_ms: float = 0.0) -> None:
+    async def _transcribe(self, audio: np.ndarray, idx: int, prior: list[asyncio.Task],
+                          overlapped: bool = False, speech_ms: float = 0.0) -> None:
         failed = False
         raw = ""
         try:
@@ -656,6 +668,10 @@ class Session:
             failed = True
             text = "[inaudible]"
             self._emit("error", where="transcribe", error=repr(e))
+        # A faster later turn must not emit user_transcript before the earlier slot does.
+        for t in prior:
+            if not t.done():
+                await asyncio.shield(t)
         self.history[idx]["content"] = text
         try:
             self._emit("user_transcript", text=text)
@@ -690,12 +706,13 @@ class Session:
         # lives outside the loop so a model error can flush the round that failed.
         chunker = SentenceChunker()
         try:
-            # Previous turn only. Reading self._transcript_task here would wait on this turn's
-            # ASR when commit already replaced the pointer, and on 3.11+ cancelling this
-            # generation would cancel the task it is awaiting.
-            prior = gen.prior_transcript
-            if prior is not None and not prior.done():
-                await asyncio.shield(prior)
+            # Every older slot still in this request, not only the latest pointer. A newer task
+            # must not hide an older one that is still "[caller audio]". This turn's own task is
+            # past base_history, so cancelling the reply does not cancel it. Shield anyway.
+            pending = [t for idx, t in self._transcripts if idx < len(gen.base_history) and not t.done()]
+            if pending:
+                for t in pending:
+                    await asyncio.shield(t)
                 gen.base_history = list(self.history[: len(gen.base_history)])
             for round_i in range(self.cfg.max_tool_rounds + 1):
                 chunker = SentenceChunker()

@@ -78,6 +78,7 @@ class AgentIn(BaseModel):
     experiment: Optional[dict[str, Any]] = None     # optional A/B: {id, variants:[{id, weight, voice?, systemPrompt?, model?}]}
     bargeIn: Literal["high", "normal", "low"] = "normal"  # how easily the caller can talk over the agent
     confirmSlots: bool = False                      # read names, dates, times, numbers and amounts back before acting
+    restateSlots: bool = False                      # remind the model that earlier turns are transcripts, not audio
 
 
 class AgentPatch(BaseModel):
@@ -93,6 +94,7 @@ class AgentPatch(BaseModel):
     experiment: Optional[dict[str, Any]] = None
     bargeIn: Optional[Literal["high", "normal", "low"]] = None
     confirmSlots: Optional[bool] = None
+    restateSlots: Optional[bool] = None
 
 
 class NumberIn(BaseModel):
@@ -514,6 +516,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         exp = cfg0.pop("experiment", None)
         if not cfg0.get("confirmSlots"):
             cfg0.pop("confirmSlots", None)
+        if not cfg0.get("restateSlots"):
+            cfg0.pop("restateSlots", None)          # default off: do not store a false flag on every agent
         cfg0["voice"], cfg0["language"] = pick_voice("af_heart", None, body.voice, body.language, "voice" in body.model_fields_set)
         check_voice(cfg0["voice"], cfg0["language"])
         if exp is not None:
@@ -536,7 +540,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                                          "voice" in body.model_fields_set)
         check_voice(eff_voice, eff_lang)
         changed = []
-        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record", "bargeIn", "confirmSlots"):
+        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record", "bargeIn", "confirmSlots", "restateSlots"):
             v = getattr(body, k)
             if v is not None:
                 cfg[k] = v
@@ -552,6 +556,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             check_variant_voices(cfg.get("experiment"), eff_lang)
         if cfg.get("confirmSlots") is False:
             cfg.pop("confirmSlots", None)
+        if cfg.get("restateSlots") is False:
+            cfg.pop("restateSlots", None)           # a false patch clears the reminder; an omitted patch leaves it
         call_variables(cfg, None, strict=False)
         if eff_voice != cfg.get("voice"):
             cfg["voice"] = eff_voice

@@ -1,7 +1,10 @@
-"""Optional HTTP speech-to-text so a tool round does not spend another Ultravox pass on audio.
+"""OpenAI-compatible speech-to-text for caller transcripts.
 
-The vLLM server accepts one audio clip per request (`--limit-mm-per-prompt`). When `VOX_ASR_URL`
-is set, caller transcripts come from this client instead.
+Ultravox is served with one audio clip per prompt (`--limit-mm-per-prompt audio:1`),
+so earlier turns cannot be sent back as audio. When `VOX_ASR_URL` is set, caller
+transcripts come from this client instead of a second Ultravox pass, including the
+text a tool round sends once the clip has already been used. The URL includes `/v1`,
+same shape as `VOX_VLLM_URL`.
 """
 from __future__ import annotations
 
@@ -12,8 +15,33 @@ import wave
 import numpy as np
 
 
-def _wav_bytes(audio: np.ndarray, rate: int = 16000) -> bytes:
-    pcm = np.asarray(audio, dtype=np.int16)
+class HttpASR:
+    """OpenAI-compatible `POST {base_url}/audio/transcriptions` (multipart file + model)."""
+
+    def __init__(self, base_url: str, client, model: str = "whisper-1"):
+        self.base_url = base_url.rstrip("/")
+        self.client = client
+        self.model = model or "whisper-1"
+
+    async def transcribe(self, audio) -> str:
+        # The pooled client reads for 5s. A slower transcript must not become
+        # [inaudible], and timeout=None would stall the next turn that awaits it.
+        response = await self.client.post(
+            f"{self.base_url}/audio/transcriptions",
+            files={"file": ("audio.wav", _wav_bytes(audio), "audio/wav")},
+            data={"model": self.model},
+            timeout=60)
+        if hasattr(response, "raise_for_status"):
+            response.raise_for_status()
+        body = response.json()
+        if asyncio.iscoroutine(body):
+            body = await body
+        text = body.get("text") if isinstance(body, dict) else None
+        return text.strip() if isinstance(text, str) else ""
+
+
+def _wav_bytes(audio, rate: int = 16000) -> bytes:
+    pcm = np.asarray(audio, dtype=np.int16).reshape(-1)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
@@ -23,23 +51,25 @@ def _wav_bytes(audio: np.ndarray, rate: int = 16000) -> bytes:
     return buf.getvalue()
 
 
-class HttpASR:
-    """OpenAI-compatible `POST {base_url}/audio/transcriptions` (multipart file + model)."""
+class AsrLLM:
+    """Session-facing LLM: `transcribe` uses HttpASR; `stream` and `eot_score` stay on the inner client.
 
-    def __init__(self, base_url: str, client, model: str = "whisper-1") -> None:
-        self.base_url = base_url.rstrip("/")
-        self.client = client
-        self.model = model
+    Do not install this on `Runtime.llm`. End-of-turn looks up `eot_score` on the unwrapped
+    Ultravox client, and an unset `VOX_ASR_URL` must keep `VllmClient.transcribe`.
+    """
 
-    async def transcribe(self, audio: np.ndarray) -> str:
-        resp = await self.client.post(
-            f"{self.base_url}/audio/transcriptions",
-            files={"file": ("audio.wav", _wav_bytes(audio), "audio/wav")},
-            data={"model": self.model},
-        )
-        body = resp.json()
-        if asyncio.iscoroutine(body):
-            body = await body
-        if isinstance(body, dict):
-            return str(body.get("text") or "").strip()
-        return str(body or "").strip()
+    def __init__(self, inner, asr: HttpASR):
+        self._inner = inner
+        self._asr = asr
+
+    def stream(self, history, audio, followups, tools):
+        return self._inner.stream(history, audio, followups, tools)
+
+    def eot_score(self, history, audio):
+        return self._inner.eot_score(history, audio)
+
+    async def transcribe(self, audio) -> str:
+        return await self._asr.transcribe(audio)
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)

@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from core.asr import HttpASR
+from core.asr import AsrLLM, HttpASR
 from core.backchannel import BACKCHANNEL_MS
 from core.metrics import METRICS
 from core.recorder import CallRecorder, write_wav16
@@ -21,27 +21,8 @@ from .store import Store
 from .writebehind import MessageLog
 
 
-class _LlmWithASR:
-    """Use HttpASR for transcripts. `stream` and `eot_score` still go to the speech model.
-
-    Built only when VOX_ASR_URL is set, so VllmClient.transcribe is unchanged otherwise.
-    """
-
-    def __init__(self, inner, asr: HttpASR) -> None:
-        self._inner = inner
-        self._asr = asr
-
-    def stream(self, history, audio, followups, tools):
-        return self._inner.stream(history, audio, followups, tools)
-
-    def eot_score(self, history, audio):
-        return self._inner.eot_score(history, audio)
-
-    async def transcribe(self, audio) -> str:
-        return await self._asr.transcribe(audio)
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
+# Same wrapper tests import from this module. AsrLLM owns the behavior.
+_LlmWithASR = AsrLLM
 
 
 class LimitedTTS:
@@ -85,6 +66,12 @@ def _count(e: dict, variant: str = "") -> None:
             METRICS.inc("vox_turns_total")
     elif t == "error":
         METRICS.inc("vox_errors_total", where=str(e.get("where", "")))
+
+
+# History is text because the speech model accepts one audio clip. Ask the agent to repeat slots
+# before acting when the operator turned that reminder on.
+RESTATE_SLOTS = ("Earlier caller turns are transcripts and may not match the audio. "
+                 "Restate any name, date, or number before you act on it.")
 
 
 # Said when a phone call is reconnected after the media stream or its node was lost. Short phrases per language;
@@ -247,6 +234,26 @@ class Runtime:
             return eot_prosody
         return self.eot_fn
 
+    def _session_llm(self, variant=None):
+        """LLM handed to the Session. Transcripts use `VOX_ASR_URL` when that client is configured.
+
+        A variant model wraps first, then ASR, so tool rounds and history transcripts both hit
+        HttpASR while `stream` stays on that variant. The wrapper is not stored on `self.llm`:
+        `_eot_async` checks `eot_score` on the Ultravox client, and with no URL (or no shared HTTP
+        client) `VllmClient.transcribe` stays in place. Earlier audio still cannot be replayed
+        into Ultravox (`--limit-mm-per-prompt audio:1`); the separate transcript can diverge
+        from what the model heard.
+        """
+        llm = self.llm
+        model_name = str(variant.get("model") or "").strip() if variant else ""
+        if model_name and hasattr(self.llm, "model"):
+            llm = VariantLLM(self.llm, model_name)
+        url = os.environ.get("VOX_ASR_URL", "").strip().rstrip("/")
+        if not url or self.http is None:
+            return llm
+        model = os.environ.get("VOX_ASR_MODEL", "whisper-1").strip() or "whisper-1"
+        return AsrLLM(llm, HttpASR(url, self.http, model=model))
+
     def build_session(self, call: dict, transport, forward_events: bool = False) -> Session:
         cfg = call["config"]
         meta = call.get("metadata") or {}
@@ -323,6 +330,8 @@ class Runtime:
         lang = cfg.get("language") or "en"
         if ctx.guard_slots:
             prompt += "\n\n" + toolmod.READBACK_INSTRUCTION
+        if cfg.get("restateSlots"):
+            prompt += "\n\n" + RESTATE_SLOTS
         scfg = SessionConfig(system_prompt=prompt,
                              out_rate=transport.out_rate, tools_schema=schemas,
                              greeting=(RESUME_PHRASE.get(lang, RESUME_PHRASE["en"]) if resumed
@@ -360,13 +369,7 @@ class Runtime:
         lim = int(os.environ.get("VOX_TTS_CONCURRENCY", "4"))
         if lim > 0:
             tts = LimitedTTS(tts, lim)
-        llm = self.llm
-        model_name = str(variant.get("model") or "").strip() if variant else ""
-        if model_name and hasattr(self.llm, "model"):
-            llm = VariantLLM(self.llm, model_name)
-        asr_url = os.environ.get("VOX_ASR_URL", "").strip()
-        if asr_url:
-            llm = _LlmWithASR(llm, HttpASR(asr_url, self.http))
+        llm = self._session_llm(variant)
         eot_async = self._eot_async()
         if llm is not self.llm and eot_async is not None:
             eot_async = lambda audio, history, bound=llm: bound.eot_score(history, audio)

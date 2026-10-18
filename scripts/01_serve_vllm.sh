@@ -31,7 +31,9 @@ ARGS=(serve "$MODEL"
   --dtype bfloat16
   --max-model-len "$MAXLEN"
   --gpu-memory-utilization "$UTIL"
-  --limit-mm-per-prompt '{"audio": 1}')  # one audio clip per request; VOX_ASR_URL transcribes earlier turns without a second 32B pass
+  # One audio clip per prompt. Do not raise this. Earlier turns stay text; set VOX_ASR_URL
+  # (OpenAI-compatible /v1, see api/main.py) when those transcripts should not be a second Ultravox pass.
+  --limit-mm-per-prompt '{"audio": 1}')
 
 [ "$QUANT" != "none" ] && ARGS+=(--quantization "$QUANT")
 [ "${TOOLS:-1}" = "1" ] && ARGS+=(--enable-auto-tool-choice --tool-call-parser "${TOOL_PARSER:-hermes}")

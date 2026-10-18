@@ -142,6 +142,37 @@ async def test_limited_tts_follows_a_wav_sample_rate_change():
         LimitedTTS._sem = old
 
 
+async def test_limited_tts_releases_the_slot_after_the_utterance():
+    """A finished utterance with no detached worker must return the process-wide permit.
+
+    The next call shares that semaphore. Dropping the empty-pending release leaves it at zero
+    and this wait times out.
+    """
+    old = LimitedTTS._sem
+    LimitedTTS._sem = None
+
+    class Inner:
+        sample_rate = 8000
+
+        async def synthesize(self, text):
+            yield np.array([7], dtype=np.int16)
+
+    try:
+        lim = LimitedTTS(Inner(), 1)
+        first = [c async for c in lim.synthesize("one")]
+        assert first[0].tolist() == [7]
+        sem = LimitedTTS._sem
+
+        async def second():
+            got = [c async for c in lim.synthesize("two")]
+            return got[0].tolist()
+
+        assert await asyncio.wait_for(second(), 1) == [7]
+        assert LimitedTTS._sem is sem
+    finally:
+        LimitedTTS._sem = old
+
+
 async def test_http_tts_does_not_play_an_error_document_as_pcm():
     class _Err:
         def __init__(self, status, content, content_type=None):

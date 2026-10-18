@@ -221,7 +221,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             while True:
                 try:
                     await asyncio.get_running_loop().run_in_executor(None, lambda: retention.purge_expired(
-                        store, settings.record_dir or os.environ.get("VOX_RECORD_DIR", ""), settings.retention_default_days or None))
+                        store, settings.record_dir or os.environ.get("VOX_RECORD_DIR", ""),
+                        settings.retention_default_days or None, setups=app.state.sip_setups))
                 except Exception:  # noqa: BLE001  (try again next hour)
                     METRICS.inc("vox_errors_total", where="retention")
                 await asyncio.sleep(3600)
@@ -373,7 +374,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """Runs the retention purge now (the API also runs it hourly). Handy for cron or after changing a limit."""
         admin_only(x_admin_key)
         return {"erased": retention.purge_expired(store, settings.record_dir or os.environ.get("VOX_RETENTION_DIR", os.environ.get("VOX_RECORD_DIR", "")),
-                                                  settings.retention_default_days or None)}
+                                                  settings.retention_default_days or None, setups=app.state.sip_setups)}
 
     @app.put("/v1/webhook")
     async def set_webhook(body: WebhookIn, t: dict = Depends(tenant_admin)):
@@ -472,6 +473,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if c["status"] == "active":
             raise HTTPException(409, "call is still active")
         retention.delete_call_files(settings.record_dir or os.environ.get("VOX_RECORD_DIR", ""), call_id)
+        drop_sip_setup(c)
         store.delete_call(t["id"], call_id)
         log(t, "call.delete", call_id)
         return {"deleted": call_id}
@@ -748,6 +750,17 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         webhook(t, "call.started", store.get_call_any(call["id"]))
         return t
 
+    def drop_sip_setup(call: Optional[dict]) -> None:
+        """The setup row is only how the caller id reaches the call. It is not kept after the call is over."""
+        meta = (call or {}).get("metadata") or {}
+        if isinstance(meta, str):
+            meta = json.loads(meta or "{}")
+        uid = str(meta.get("callSid") or "")
+        if not uid:
+            return
+        store.delete_sip_setup(uid)
+        app.state.sip_setups.pop(uid, None)
+
     def finish(call: dict, t: dict, reason: str) -> None:
         limiter.release(call["tenant_id"], call["id"])
         cur = store.get_call_any(call["id"])
@@ -759,6 +772,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         except Exception:  # noqa: BLE001  (a failed recording write must not break call teardown)
             METRICS.inc("vox_errors_total", where="finalize")
         done = store.get_call_any(call["id"])
+        drop_sip_setup(done or call)
         secs = round((done["ended"] - done["joined"]), 2) if done.get("joined") and done.get("ended") else 0.0
         webhook(t, "call.ended", done, durationSeconds=secs,
                 transcript=[{"role": m["role"], "text": m["text"], "t": m["t"]} for m in store.messages(call["id"])[:500]])
@@ -905,6 +919,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         finally:
             if "t" in state:
                 finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+            else:
+                drop_sip_setup(call)   # admitted calls drop the row in finish; a rejected one never gets there
 
     @app.on_event("startup")
     async def _start_audiosocket():

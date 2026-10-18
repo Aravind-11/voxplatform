@@ -212,10 +212,15 @@ class Store:
         return self.get_tenant(tenant_id)
 
     def delete_call(self, tenant_id: str, call_id: str) -> bool:
-        if self.get_call(tenant_id, call_id) is None:
+        call = self.get_call(tenant_id, call_id)
+        if call is None:
             return False
+        uid = str((call.get("metadata") or {}).get("callSid") or "")
         self._x("DELETE FROM messages WHERE call_id=?", (call_id,))
-        return self._x("DELETE FROM calls WHERE id=? AND tenant_id=?", (call_id, tenant_id)) > 0
+        ok = self._x("DELETE FROM calls WHERE id=? AND tenant_id=?", (call_id, tenant_id)) > 0
+        if ok and uid:
+            self.delete_sip_setup(uid)   # the staging copy of the caller id is not the call record
+        return ok
 
     def get_tenant(self, tenant_id: str) -> Optional[dict]:
         return self._one("SELECT * FROM tenants WHERE id=?", (tenant_id,))
@@ -410,3 +415,11 @@ class Store:
     def get_sip_setup(self, uuid: str) -> Optional[dict]:
         r = self._one("SELECT uuid, caller, callee, created FROM sip_setup WHERE uuid=?", (uuid,))
         return dict(r) if r else None
+
+    def delete_sip_setup(self, uuid: str) -> None:
+        if uuid:
+            self._x("DELETE FROM sip_setup WHERE uuid=?", (uuid,))
+
+    def purge_sip_setups(self, cutoff: float) -> int:
+        """Drops setup rows posted before `cutoff`, including ones that never became a call."""
+        return self._x("DELETE FROM sip_setup WHERE created < ?", (cutoff,))

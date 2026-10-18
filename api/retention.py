@@ -24,7 +24,8 @@ def delete_call_files(record_dir: str, call_id: str) -> None:
                 os.remove(os.path.join(udir, f))
 
 
-def purge_expired(store: Store, record_dir: str, default_days: Optional[int] = None, now: Optional[float] = None) -> dict:
+def purge_expired(store: Store, record_dir: str, default_days: Optional[int] = None, now: Optional[float] = None,
+                  setups: Optional[dict] = None) -> dict:
     """Returns {tenant_id: number_of_calls_erased}. Never touches calls that are still live."""
     now = time.time() if now is None else now
     out: dict[str, int] = {}
@@ -32,10 +33,22 @@ def purge_expired(store: Store, record_dir: str, default_days: Optional[int] = N
         days = t.get("retention_days") or default_days
         if not days:
             continue
-        ids = store.expired_calls(t["id"], now - days * 86400)
+        cutoff = now - days * 86400
+        ids = store.expired_calls(t["id"], cutoff)
         for cid in ids:
+            uid = str(((store.get_call(t["id"], cid) or {}).get("metadata") or {}).get("callSid") or "")
             delete_call_files(record_dir, cid)
             store.delete_call(t["id"], cid)
+            if setups is not None and uid:
+                setups.pop(uid, None)
+        # No tenant on sip_setup: a row that never became a call is still caller-id PII.
+        # The same cutoff as this tenant's calls applies, and the shortest window in the run wins.
+        if setups is not None:
+            for uid, row in list(setups.items()):
+                created = row.get("created") if isinstance(row, dict) else None
+                if created is not None and float(created) < cutoff:
+                    setups.pop(uid, None)
+        store.purge_sip_setups(cutoff)
         if ids:
             out[t["id"]] = len(ids)
             store.audit(t["id"], "system", "retention.purge", f"{len(ids)} calls", {"olderThanDays": days})

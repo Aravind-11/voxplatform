@@ -2,6 +2,7 @@
 <Redirect> after <Connect>; the server then hangs up (agent ended it) or reconnects the caller with the conversation."""
 import base64
 import json
+import pathlib
 import time
 
 import numpy as np
@@ -110,6 +111,14 @@ def test_failed_warm_transfer_keeps_history_and_the_apology():
     assert [m["content"] for m in sess.history[1:]] == ["Hello, how can I help?", "I want Tuesday at eleven."]
     assert [m["role"] for m in sess.history[1:]] == ["assistant", "user"]
     assert "not available" in sess.cfg.greeting and "cut off" not in sess.cfg.greeting
+
+
+def test_tools_doc_does_not_say_a_failed_warm_transfer_starts_fresh():
+    """docs/TOOLS.md is what an integrator follows. It must describe the returned session, not a blank one."""
+    text = (pathlib.Path(__file__).resolve().parents[2] / "docs" / "TOOLS.md").read_text()
+    line = next(ln for ln in text.splitlines() if '"mode":"warm"' in ln)
+    assert "fresh conversation" not in line
+    assert "earlier transcript" in line and "not-available apology" in line
 
 
 def test_stream_loss_after_a_failed_transfer_is_not_labeled_transfer():

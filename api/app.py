@@ -949,10 +949,19 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             meta["variables"] = given_vars
         if body.voicemailMessage:
             meta["voicemail"] = body.voicemailMessage
-        with outbound_cap.hold(t["id"], settings.outbound_per_day) as allowed:
-            if not allowed:
-                raise HTTPException(429, f"outbound limit reached ({settings.outbound_per_day} per 24 h)")
-            call = store.create_call(t["id"], body.agentId, "twilio", cfg, meta)
+        tenant_id = t["id"]
+
+        def _admit():
+            # hold() sleeps while another node inserts; that wait must not block this event loop.
+            with outbound_cap.hold(tenant_id, settings.outbound_per_day) as allowed:
+                if not allowed:
+                    return None
+                return store.create_call(tenant_id, body.agentId, "twilio", cfg, meta)
+
+        import asyncio
+        call = await asyncio.get_running_loop().run_in_executor(None, _admit)
+        if call is None:
+            raise HTTPException(429, f"outbound limit reached ({settings.outbound_per_day} per 24 h)")
         ws = settings.public_base_url.replace("http", "ws", 1)
         twiml = stream_twiml(call)
         data = {"To": body.to, "From": caller_id, "Twiml": twiml,

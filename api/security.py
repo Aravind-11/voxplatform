@@ -139,55 +139,70 @@ return 1
 
 
 class OutboundCap:
-    """Outbound cap over a rolling 24 hours, shared by every node when Redis is configured.
+    """Rolling 24 hour outbound cap. The count is always SQL, so a Redis flush is not a new day.
 
-    The Redis key is one sorted set, ``vox:outbound:{tenant}``, scored by time. The script drops
-    entries older than 24 hours, then adds this attempt only when the set is still under the cap.
-    Without Redis the same window is a SQL count under ``store.lock``.
+    Redis is only a per-tenant mutex around ``hold`` (the caller inserts before the block ends).
+    The mutex TTL is short because this Redis is not durable and a dead holder must not pin the cap
+    shut. If the lock cannot be taken, the attempt is refused. Without Redis, ``store.lock`` covers
+    the same section inside one process. A call placed exactly 24 hours ago still counts
+    (``created >= now - 24h``).
     """
 
-    LUA = """
-local now = tonumber(ARGV[1])
-local window = ARGV[2]
-local cap = tonumber(ARGV[3])
-local member = ARGV[4]
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[5])
-local n = redis.call('ZCARD', KEYS[1])
-if n >= cap then
-  redis.call('EXPIRE', KEYS[1], window)
-  return 0
-end
-redis.call('ZADD', KEYS[1], now, member)
-redis.call('EXPIRE', KEYS[1], window)
-return 1
-"""
     WINDOW_S = 24 * 60 * 60
+    LOCK_TTL_S = 10
+    LOCK_WAIT_S = 12
+    _POLL_S = 0.02
+    # Delete only our token. A late release after TTL must not drop the next holder's lock.
+    _RELEASE = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
 
     def __init__(self, limiter, store):
-        self.limiter, self.store = limiter, store
-        self._script = limiter.r.register_script(self.LUA) if isinstance(limiter, RedisLimiter) else None
+        self.store = store
+        self._redis = limiter.r if isinstance(limiter, RedisLimiter) else None
+
+    def _lock_key(self, tenant_id: str) -> str:
+        return f"vox:outbound-lock:{tenant_id}"
 
     def allow(self, tenant_id: str, per_day: int) -> bool:
         """True if this tenant may place another outbound call inside the rolling 24 hour window."""
-        if self._script is not None:
-            now = time.time()
-            window = self.WINDOW_S
-            # "(" is Redis' exclusive bound: a call placed exactly 24h ago still counts.
-            cutoff = f"({now - window:.6f}"
-            member = secrets.token_hex(8)
-            key = f"vox:outbound:{tenant_id}"
-            return int(self._script(keys=[key], args=[f"{now:.6f}", str(window), str(int(per_day)), member, cutoff])) == 1
         since = time.time() - self.WINDOW_S
         return self.store.count_outbound(tenant_id, since) < int(per_day)
 
+    def _acquire_lock(self, tenant_id: str) -> Optional[str]:
+        token = secrets.token_hex(16)
+        key = self._lock_key(tenant_id)
+        deadline = time.monotonic() + self.LOCK_WAIT_S
+        while True:
+            try:
+                acquired = self._redis.set(key, token, nx=True, ex=self.LOCK_TTL_S)
+            except Exception:  # noqa: BLE001  (Redis down: fail closed, never admit on an empty key)
+                return None
+            if acquired:
+                return token
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(self._POLL_S)  # caller must not run this wait on the event loop
+
+    def _release_lock(self, tenant_id: str, token: str) -> None:
+        try:
+            self._redis.eval(self._RELEASE, 1, self._lock_key(tenant_id), token)
+        except Exception:  # noqa: BLE001  (TTL drops a lock we could not release)
+            return
+
     @contextmanager
     def hold(self, tenant_id: str, per_day: int):
-        """Yield the allow() result. No Redis: hold store.lock across the yield so create_call cannot race the count."""
-        if self._script is not None:
-            yield self.allow(tenant_id, per_day)
+        """Yield whether one more outbound row may be inserted. Insert before the block ends, or the slot is not taken."""
+        if self._redis is None:
+            with self.store.lock:
+                yield self.allow(tenant_id, per_day)
             return
-        with self.store.lock:
+        token = self._acquire_lock(tenant_id)
+        if token is None:
+            yield False
+            return
+        try:
             yield self.allow(tenant_id, per_day)
+        finally:
+            self._release_lock(tenant_id, token)
 
 
 # ------------------------------------------------------- Twilio signatures

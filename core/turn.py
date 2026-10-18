@@ -8,9 +8,10 @@ Events
   SPEECH_RESUME  caller resumed before the turn ended: cancel the speculative reply
   END_OF_TURN    silence long enough: commit the reply and let it play
   SPEECH_ABORT   a started "turn" was too short to be real speech (noise): discard
-  OVERLAP_CHECK  while the agent talks, a burst ended before backchannel_ms: transcribe it
-                 before deciding whether it takes the floor. Not emitted when backchannel_ms
-                 is at or under the barge floor, so high sensitivity still interrupts at once.
+  OVERLAP_CHECK  while the agent talks, a burst past the barge floor ended before
+                 backchannel_ms. Emitted after speculate_ms of silence, so one non-speech
+                 frame does not split the burst. Not emitted when backchannel_ms is at or
+                 under the barge floor, so high sensitivity still interrupts at once.
 
 An optional end-of-turn scorer (e.g. UltraVAD) is consulted once per pause. If it is
 confident the caller is done, the turn ends after `fast_end_ms` of silence instead of
@@ -77,6 +78,7 @@ class TurnManager:
         self._end_target = self.cfg.end_ms
         self._onset_ms = 0.0
         self._run_start_ms = 0.0
+        self._hole_ms = 0.0
 
     def apply_eot(self, score: float) -> list[TurnEvent]:
         """Feed a late end-of-turn verdict (P(caller is done), 0..1) from an async scorer.
@@ -112,6 +114,22 @@ class TurnManager:
     def in_turn(self) -> bool:
         return self._speaking
 
+    @property
+    def pending_run(self) -> bool:
+        """Speech accumulated toward a turn that has not opened yet."""
+        return self._run_ms > 0.0
+
+    def _begin_turn(self, out: list[TurnEvent], t: float) -> None:
+        self._speaking = True
+        self._onset_ms = self._run_start_ms
+        self._speech_ms = self._run_ms
+        self._silence_ms = 0.0
+        self._speculated = False
+        self._end_target = self.cfg.end_ms
+        self._run_ms = 0.0
+        self._hole_ms = 0.0
+        out.append(TurnEvent(Ev.SPEECH_START, t, self._onset_ms))
+
     def process(self, speech_prob: float) -> list[TurnEvent]:
         c = self.cfg
         t = self._frame * c.frame_ms
@@ -124,6 +142,7 @@ class TurnManager:
                 if self._run_ms == 0.0:
                     self._run_start_ms = t
                 self._run_ms += c.frame_ms
+                self._hole_ms = 0.0
                 if self.agent_speaking:
                     # Hold SPEECH_START until backchannel_ms so "yeah" (~300 ms) never opens a turn.
                     # A smaller backchannel_ms must not undercut start_ms_agent_speaking.
@@ -131,20 +150,41 @@ class TurnManager:
                 else:
                     need = c.start_ms
                 if self._run_ms >= need:
-                    self._speaking = True
-                    self._onset_ms = self._run_start_ms
-                    self._speech_ms = self._run_ms
-                    self._silence_ms = 0.0
-                    out.append(TurnEvent(Ev.SPEECH_START, t, self._onset_ms))
-            else:
-                # A burst that ends before backchannel_ms never opens a turn, so "stop" would
-                # be thrown away with "yeah". Hand the audio to the session instead. When the
-                # backchannel gate is not above the barge floor this branch cannot run.
+                    self._begin_turn(out, t)
+                return out
+
+            # Silence before a turn exists. A run already past the barge floor stays open
+            # across a short hole so one VAD miss does not classify "yeah" and drop the rest.
+            if self._run_ms > 0.0 and self.agent_speaking:
                 need = max(c.start_ms_agent_speaking, c.backchannel_ms)
-                if self.agent_speaking and c.start_ms_agent_speaking <= self._run_ms < need:
-                    out.append(TurnEvent(Ev.OVERLAP_CHECK, t, self._run_start_ms, self._run_ms))
+                if c.start_ms_agent_speaking <= self._run_ms < need:
+                    self._hole_ms += c.frame_ms
+                    if self._hole_ms >= c.speculate_ms:
+                        out.append(TurnEvent(Ev.OVERLAP_CHECK, t, self._run_start_ms, self._run_ms))
+                        self._run_ms = 0.0
+                        self._hole_ms = 0.0
+                    return out
                 self._run_ms = 0.0
-            return out
+                self._hole_ms = 0.0
+                return out
+
+            # Playback ended on a run the normal start gate would already have kept.
+            # Open the turn, including on this silent frame. Do not send it through the
+            # backchannel check just because the hold used to be active.
+            if self._run_ms >= c.start_ms:
+                self._speech_ms = self._run_ms
+                self._silence_ms = self._hole_ms
+                self._onset_ms = self._run_start_ms
+                self._speaking = True
+                self._speculated = False
+                self._end_target = c.end_ms
+                self._run_ms = 0.0
+                self._hole_ms = 0.0
+                out.append(TurnEvent(Ev.SPEECH_START, t, self._onset_ms))
+            else:
+                self._run_ms = 0.0
+                self._hole_ms = 0.0
+                return out
 
         # speaking
         if is_speech:

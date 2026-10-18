@@ -39,6 +39,10 @@ def test_classifier_accepts_the_fixed_set_only_when_short():
     assert is_backchannel("   ", 0) is True
     assert is_backchannel("", 320) is False          # empty only under 320 ms
     assert is_backchannel("", 450) is False
+    assert is_backchannel("no", 200) is False        # a short refusal still takes the floor
+    assert is_backchannel("no", 450) is False
+    assert is_backchannel("stop", 200) is False
+    assert is_backchannel("stop", 450) is False
     assert is_backchannel("yeah yeah", 200) is False
     assert is_backchannel("I need to move the appointment", 300) is False
     assert is_backchannel("yeah", 500, max_ms=700) is True
@@ -48,7 +52,7 @@ def test_turn_holds_speech_start_for_backchannel_ms_while_agent_speaks():
     tm = TurnManager()
     tm.set_agent_speaking(True)
     ev = feed(tm, [(True, 14), (False, 12)])                         # 448 ms, then silence
-    assert kinds(ev) == [Ev.OVERLAP_CHECK] and ev[0][1] == 14 * F    # transcribed, not a turn yet
+    assert kinds(ev) == [Ev.OVERLAP_CHECK] and ev[0][1] == (14 + 5) * F  # after speculate_ms
     fresh = TurnManager()
     fresh.set_agent_speaking(True)
     ev = feed(fresh, [(True, 16)])
@@ -57,7 +61,7 @@ def test_turn_holds_speech_start_for_backchannel_ms_while_agent_speaks():
     low = TurnManager(TurnConfig(backchannel_ms=BACKCHANNEL_MS["low"]))
     low.set_agent_speaking(True)
     ev = feed(low, [(True, 21), (False, 8)])                         # 672 ms < 700
-    assert kinds(ev) == [Ev.OVERLAP_CHECK] and ev[0][1] == 21 * F
+    assert kinds(ev) == [Ev.OVERLAP_CHECK] and ev[0][1] == (21 + 5) * F
     # not speaking: backchannel_ms does not move the normal 96 ms start
     ev = feed(TurnManager(TurnConfig(backchannel_ms=700)), [(True, 4)])
     assert kinds(ev) == [Ev.SPEECH_START] and ev[0][1] == 2 * F
@@ -139,28 +143,29 @@ async def test_short_overlap_does_not_barge_and_a_yeah_after_a_real_cut_is_marke
 
 
 async def test_short_real_request_during_playback_interrupts():
-    """384 ms is under the 450 ms gate. "stop" still takes the floor; the reply is cleared."""
-    llm = FakeLLM([
-        ["Hold on, I am still talking through this whole reply with you right now."],
-        ["Sure, I stopped."],
-    ])
+    """384 ms is under the 450 ms gate. "stop" and "no" still take the floor."""
+    for word in ("stop", "no"):
+        llm = FakeLLM([
+            ["Hold on, I am still talking through this whole reply with you right now."],
+            ["Sure, I stopped."],
+        ])
 
-    async def transcribe(audio):
-        return "stop"
+        async def transcribe(audio, word=word):
+            return word
 
-    llm.transcribe = transcribe
-    r = Rig(llm, tts=FakeTTS(word_ms=300))
-    await r.frames("s", 15)
-    await r.frames("q", 22)
-    await r.settle()
-    assert r.sent and len(llm.calls) == 1
-    await r.frames("s", 12)                                      # 384 ms < 450
-    await r.frames("q", 10)
-    await r.settle()
-    assert r.clears >= 1 and r.s.stats["interruptions"] >= 1
-    assert "user_interrupted" in r.types()
-    assert any(m.get("role") == "user" and m.get("content") == "stop" for m in r.s.history)
-    assert len(llm.calls) >= 2
+        llm.transcribe = transcribe
+        r = Rig(llm, tts=FakeTTS(word_ms=300))
+        await r.frames("s", 15)
+        await r.frames("q", 22)
+        await r.settle()
+        assert r.sent and len(llm.calls) == 1
+        await r.frames("s", 12)                                  # 384 ms < 450
+        await r.frames("q", 10)
+        await r.settle()
+        assert r.clears >= 1 and r.s.stats["interruptions"] >= 1
+        assert "user_interrupted" in r.types()
+        assert any(m.get("role") == "user" and m.get("content") == word for m in r.s.history)
+        assert len(llm.calls) >= 2
 
 
 async def test_yeah_after_a_dropped_cough_is_not_glued_into_a_barge():
@@ -254,6 +259,188 @@ async def test_stop_overlap_waits_for_the_transcript_already_in_flight():
         hist = llm.calls[1]["history"]
         assert any(m.get("role") == "user" and m.get("content") == "move my appointment" for m in hist)
         assert all(m.get("content") != "[caller audio]" for m in hist)
+    finally:
+        gate.set()
+
+
+async def _agent_playing(transcribe, replies=None):
+    llm = FakeLLM(replies or [
+        ["Hold on, I am still talking through this whole reply with you right now."],
+        ["Okay, go on."],
+    ])
+    llm.transcribe = transcribe
+    r = Rig(llm, tts=FakeTTS(word_ms=1000))
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    assert r.sent and len(llm.calls) == 1
+    return r
+
+
+async def _feed_value(r, frame, n):
+    for _ in range(n):
+        await r.s.feed(frame)
+        await r.settle(5)
+        r.clk.t += 32
+
+
+async def test_vad_dip_during_hold_keeps_the_rest_of_the_phrase():
+    """13 continuous frames of "yeah I need" clear playback. The same audio with one
+    silent frame between "yeah" and "I need" must do the same: the tail is under the
+    192 ms floor, so splitting on the dip drops it."""
+    prefix = np.full(512, 8000, np.int16)
+    tail = np.full(512, 3000, np.int16)
+
+    async def transcribe(audio):
+        if len(audio) == 0:
+            return ""
+        has_prefix = bool((audio == 8000).any())
+        has_tail = bool((audio == 3000).any())
+        if has_prefix and has_tail:
+            return "yeah I need"
+        if has_prefix:
+            return "yeah"
+        if has_tail:
+            return "I need"
+        return "hello"
+
+    async def run(split):
+        r = await _agent_playing(transcribe)
+        if split:
+            await _feed_value(r, prefix, 8)
+            await r.frames("q", 1)
+            await _feed_value(r, tail, 5)
+        else:
+            await _feed_value(r, prefix, 8)
+            await _feed_value(r, tail, 5)
+        await r.frames("q", 8)
+        await r.settle()
+        assert r.clears >= 1
+        assert any(m.get("role") == "user" and m.get("content") == "yeah I need"
+                   for m in r.s.history)
+
+    await run(False)
+    await run(True)
+
+
+async def test_stop_becomes_a_turn_when_playback_ends_before_the_pause():
+    """384 ms of "stop" while the agent is playing, then playback ends, then silence.
+    The pause must open a user turn. It must not be deleted with the overlap buffer."""
+    n = {"n": 0}
+
+    async def transcribe(audio):
+        n["n"] += 1
+        return "hello" if n["n"] == 1 else "no"
+
+    r = await _agent_playing(transcribe, [
+        ["Hold on, I am still talking through this whole reply with you right now."],
+        ["Sure, I stopped."],
+    ])
+    await r.frames("s", 12)                                      # 384 ms, gate is 450
+    r.s._gen.produce_done = True
+    r.s.tracker.reset()
+    assert r.s._agent_active() is False
+    await r.frames("q", 25)
+    await r.settle()
+    assert any(m.get("role") == "user" and m.get("content") == "no" for m in r.s.history)
+    assert len(r.llm.calls) >= 2
+
+
+async def test_barge_onset_survives_playback_ending():
+    """More than the 320 ms pre-roll is already buffered when playback stops. The first
+    frame has fallen out of _pre and must still reach the model."""
+
+    async def transcribe(audio):
+        return "hello"
+
+    r = await _agent_playing(transcribe)
+    audios = []
+    orig = r.llm.stream
+
+    async def stream(history, audio, followups, tools):
+        audios.append(np.array(audio, copy=True))
+        async for item in orig(history, audio, followups, tools):
+            yield item
+
+    r.llm.stream = stream
+    marker = np.full(512, 7000, np.int16)
+    rest = np.full(512, 5000, np.int16)
+    await _feed_value(r, marker, 1)
+    await _feed_value(r, rest, 11)                               # 384 ms total, past pre-roll
+    r.s._gen.produce_done = True
+    r.s.tracker.reset()
+    await _feed_value(r, rest, 6)
+    await r.frames("q", 25)
+    await r.settle()
+    assert audios and bool((audios[-1] == 7000).any())
+
+
+async def test_inflight_stop_is_kept_when_a_later_yeah_finishes_first():
+    """A later short "yeah" must not cancel the overlap check that is still transcribing
+    "stop". When that transcript arrives it still clears playback and is the user turn."""
+    gate = asyncio.Event()
+    stop = np.full(512, 7000, np.int16)
+    yeah = np.full(512, 4000, np.int16)
+
+    async def transcribe(audio):
+        if len(audio) and bool((audio == 7000).any()) and not bool((audio == 4000).any()):
+            await gate.wait()
+            return "stop"
+        if len(audio) and bool((audio == 4000).any()) and not bool((audio == 7000).any()):
+            return "yeah"
+        return "hello"
+
+    r = await _agent_playing(transcribe, [
+        ["Hold on, I am still talking through this whole reply with you right now."],
+        ["Sure, I stopped."],
+    ])
+    try:
+        await _feed_value(r, stop, 12)
+        await r.frames("q", 8)
+        await r.settle()
+        assert r.clears == 0
+        await _feed_value(r, yeah, 12)
+        await r.frames("q", 8)
+        await r.settle()
+        assert r.clears == 0
+        assert not any(m.get("content") == "stop" for m in r.s.history)
+        gate.set()
+        await r.settle()
+        assert r.clears >= 1
+        assert any(m.get("role") == "user" and m.get("content") == "stop" for m in r.s.history)
+    finally:
+        gate.set()
+
+
+async def test_real_turn_keeps_audio_from_an_inflight_overlap_check():
+    """Speech that resumes into a real turn must still contain the samples already handed
+    to an in-flight overlap check. Dropping that result must not drop the onset."""
+    gate = asyncio.Event()
+    audios = []
+
+    async def transcribe(audio):
+        if len(audio) and bool((audio == 7000).any()) and not bool((audio == 4000).any()):
+            await gate.wait()
+            return "stop"
+        return "hello"
+
+    r = await _agent_playing(transcribe)
+    orig = r.llm.stream
+
+    async def stream(history, audio, followups, tools):
+        audios.append(np.array(audio, copy=True))
+        async for item in orig(history, audio, followups, tools):
+            yield item
+
+    r.llm.stream = stream
+    try:
+        await _feed_value(r, np.full(512, 7000, np.int16), 12)
+        await r.frames("q", 8)
+        await r.settle()
+        await _feed_value(r, np.full(512, 4000, np.int16), 16)   # opens a real turn at 480 ms
+        await r.frames("q", 10)
+        await r.settle()
+        assert any(len(a) and bool((a == 7000).any()) for a in audios)
     finally:
         gate.set()
 

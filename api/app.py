@@ -48,7 +48,7 @@ class Settings:
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
     node_max_calls: int = 32           # this process; 0 = no node cap. Checked before the per-tenant cap.
     overflow_url: str = ""             # http(s) only; a full or draining node redirects Twilio here instead of speaking
-    sip_token: str = ""                # VOX_SIP_TOKEN; empty disables POST /internal/sip/setup (404)
+    sip_token: str = ""                # VOX_SIP_TOKEN; empty disables /internal/sip/setup and /sip/recover (404)
 
 
 def checked_overflow(url: str) -> str:
@@ -1190,10 +1190,12 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """One SIP call from Asterisk.
 
         A slot is reserved before the UUID read, so a second connection already sees a full node,
-        and no call row exists until that UUID arrives. The setup row maps the UUID to the dialed
-        number, and `numbers` picks the agent. Caller id is copied onto the call before the session
-        is built, so {{caller}} and {{callee}} are filled. No fresh setup, or no mapping, falls back
-        to settings.audiosocket_agent. If neither resolves, the socket is closed and the slot is released.
+        and no call row exists until that UUID arrives. A uuid that already belongs to a SIP call
+        is resumed instead of minting a blank row; that path can run even when the placeholder
+        reservation was refused, because continuing a dead leg frees its slot. The setup row maps
+        the UUID to the dialed number, and `numbers` picks the agent. Caller id is copied onto the
+        call before the session is built. No fresh setup, or no mapping, falls back to
+        settings.audiosocket_agent.
         """
         from transports.audiosocket import AudioSocketTransport
         app.state.audiosocket_writers.add(writer)
@@ -1209,14 +1211,43 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 return
             # Reserve before reading the UUID. The read awaits, and a second connection must already see a full node.
             cid, decision = reserve_slot(default["tenant_id"])
-            if decision != "ok":
+            if decision == "ok":
+                holder = default
+            else:
+                # Still read the UUID. A new call gets no row. A dead leg with this uuid can be resumed,
+                # and sip_resume releases the slot that made this reservation fail.
                 cid = ""
-                return
-            holder = default
 
             async def factory(transport, custom):
                 nonlocal cid, holder
-                uid = str(custom.get("uuid", ""))
+                uid = str(custom.get("uuid", "") or "")
+                existing = store.find_call_by_sid(uid, medium="sip") if uid else None
+                if existing is not None and sip_socket_reuses(existing):
+                    resumed = sip_resume(existing)
+                    if resumed["action"] != "continue":
+                        writer.close()
+                        raise _Reject(4401, resumed.get("reason") or "sip call is not attachable")
+                    call = resumed["call"]
+                    # The placeholder is not this continuation. Free it before admit so a node cap of 1
+                    # can take the continuation's own id.
+                    if cid and holder is not None and call["id"] != cid:
+                        limiter.release(holder["tenant_id"], cid)
+                        cid = ""
+                        holder = None
+                    state["call"] = call
+                    try:
+                        state["t"] = admit(call)
+                    except _Reject:
+                        # admit marks the row ended before raising. A continuation that never joined holds no
+                        # slot; leaving it ended spends a resume and the next socket mints a blank call.
+                        fresh = store.get_call_any(call["id"])
+                        if fresh is not None and never_joined_continuation(fresh, sip_meta(fresh)):
+                            restore_continuation(fresh)
+                        raise
+                    return runtime.build_session(call, transport)
+                if not cid or holder is None:
+                    writer.close()
+                    raise EOFError("node full")
                 setup = sip_setup_for(uid) if uid else None
                 chosen = None
                 dialed = ""
@@ -1345,6 +1376,117 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         METRICS.inc("vox_call_resumes_total")
         store.audit(call["tenant_id"], "system", "call.resume", nxt["id"], {"from": call_id, "attempt": n + 1})
         return Response(stream_twiml(nxt), media_type="text/xml")
+
+    SIP_OURS = ("agent_hangup", "transfer", "no_credit")
+    SIP_LOST = ("stream_closed", "stream_lost")
+
+    def sip_meta(call: dict) -> dict:
+        meta = call.get("metadata") or {}
+        return json.loads(meta or "{}") if isinstance(meta, str) else meta
+
+    def never_joined_continuation(call: dict, meta: dict) -> bool:
+        """Continuation admit rejected before join. It holds no slot and is not a used resume."""
+        if not meta.get("resumedFrom") or call.get("joined"):
+            return False
+        if call["status"] == "created":
+            return True
+        return call.get("end_reason") in ("concurrency_limit", "draining")
+
+    def restore_continuation(call: dict) -> dict:
+        if call["status"] == "created" and not call.get("ended") and not call.get("end_reason"):
+            return call
+        store.update_call(call["id"], status="created", ended=None, end_reason=None)
+        return store.get_call_any(call["id"])
+
+    def end_dead_sip(call: dict, end_reason: Optional[str] = None) -> None:
+        """Hangup of a row this process is not running. finish still owns a live socket."""
+        if call["id"] in runtime.live or call["status"] not in ("created", "active"):
+            return
+        fields: dict[str, Any] = {"status": "ended", "ended": time.time()}
+        if end_reason is not None:
+            fields["end_reason"] = end_reason
+        store.update_call(call["id"], **fields)
+        limiter.release(call["tenant_id"], call["id"])
+
+    def sip_resume(call: dict) -> dict:
+        """What POST /sip/recover and the next AudioSocket do with the newest row for a uuid.
+
+        action is hangup (no new row), busy (this process or another node still has the slot), or continue
+        (call is the row to admit). A never-joined continuation is returned as-is.
+        A hangup of a dead created/active row ends it so the slot is not kept.
+        """
+        # runtime.live is only this process. A Redis member another node still refreshes is that node's call.
+        if limiter.held_elsewhere(call["tenant_id"], call["id"]):
+            return {"action": "busy"}
+        if call.get("end_reason") in SIP_OURS:
+            end_dead_sip(call)                                 # keep the reason finish or mark_hangup stored
+            return {"action": "hangup"}
+        # Ending a call this process is still running frees the slot under the session and the
+        # next socket opens a second call on the same caller.
+        if call["id"] in runtime.live:
+            return {"action": "busy"}
+        meta = sip_meta(call)
+        if never_joined_continuation(call, meta):
+            return {"action": "continue", "call": restore_continuation(call)}
+        n = int(meta.get("resumes", 0))
+        if n >= MAX_RESUMES:
+            METRICS.inc("vox_call_resume_refused_total")
+            # stream_lost, same as a resume that is still allowed, so the next socket does not mint a blank call
+            end_dead_sip(call, "stream_lost")
+            return {"action": "hangup", "reason": "resume cap"}
+        if call["status"] in ("created", "active"):
+            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="stream_lost")
+            limiter.release(call["tenant_id"], call["id"])
+        nxt = store.create_call(call["tenant_id"], call["agent_id"], "sip", call["config"],
+                                {**meta, "resumedFrom": call["id"], "resumes": n + 1})
+        METRICS.inc("vox_call_resumes_total")
+        store.audit(call["tenant_id"], "system", "call.resume", nxt["id"],
+                    {"from": call["id"], "attempt": n + 1, "channel": "sip"})
+        return {"action": "continue", "call": nxt}
+
+    def sip_socket_reuses(call: dict) -> bool:
+        """True when a new AudioSocket must not mint a blank row for this uuid."""
+        if call["id"] in runtime.live or call.get("end_reason") in SIP_OURS:
+            return True
+        if call.get("end_reason") in SIP_LOST or call["status"] == "active":
+            return True
+        return never_joined_continuation(call, sip_meta(call))
+
+    @app.post("/sip/recover")
+    async def sip_recover(request: Request, x_vox_sip_token: str = Header(default="")):
+        """Lost AudioSocket call. Body `uuid` is the AudioSocket id (metadata callSid), not our call id:
+        a re-dial does not know the id. Same history rules as /twilio/resume, but JSON instead of TwiML.
+        When the socket EOF was not our hang-up, finish has already stored end_reason=stream_closed."""
+        if not settings.sip_token:
+            raise HTTPException(404, "not found")
+        if not hmac.compare_digest(x_vox_sip_token or "", settings.sip_token):
+            raise HTTPException(403, "bad sip token")
+        if app.state.draining:
+            raise HTTPException(503, "node is draining")
+        if "json" in request.headers.get("content-type", ""):
+            try:
+                data = await request.json()
+            except Exception:  # noqa: BLE001
+                data = {}
+            uid = str(data.get("uuid", "")).strip() if isinstance(data, dict) else ""
+        else:
+            form = {k: str(v) for k, v in (await request.form()).items()}
+            uid = form.get("uuid", "").strip()
+        if not uid:
+            raise HTTPException(422, "uuid is required")
+        call = store.find_call_by_sid(uid, medium="sip")
+        if not call:
+            raise HTTPException(404, "call not found")
+        decision = sip_resume(call)
+        if decision["action"] == "hangup":
+            body = {"action": "hangup"}
+            if decision.get("reason"):
+                body["reason"] = decision["reason"]
+            return body
+        if decision["action"] == "busy":
+            raise HTTPException(409, "call is still connected")
+        nxt = decision["call"]
+        return {"callId": nxt["id"], "agentId": nxt["agent_id"]}
 
     # ----------------------------------------------------- outbound calls
     def twilio_check(request: Request, form: dict) -> None:

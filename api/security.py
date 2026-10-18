@@ -110,6 +110,10 @@ class ConcurrencyLimiter:
         with self._lock:
             self._active.get(tenant_id, set()).discard(call_id)
 
+    def held_elsewhere(self, tenant_id: str, call_id: str) -> bool:
+        """No other node shares this limiter. A slot it holds is this process's own dead leg."""
+        return False
+
     def active(self, tenant_id: str) -> int:
         with self._lock:
             return len(self._active.get(tenant_id, ()))
@@ -210,6 +214,19 @@ return 1
         finally:
             with self._lock:
                 self._held.get(tenant_id, set()).discard(call_id)
+
+    def held_elsewhere(self, tenant_id: str, call_id: str) -> bool:
+        """True when a different node still has an unexpired member. This node's _held is a dead leg to release."""
+        with self._lock:
+            if call_id in self._held.get(tenant_id, ()):
+                return False
+        score = self.r.zscore(self._key(tenant_id), call_id)
+        if score is None:
+            return False
+        if isinstance(score, bytes):
+            score = score.decode()
+        import time
+        return float(score) >= time.time()
 
     def active(self, tenant_id: str) -> int:
         import time

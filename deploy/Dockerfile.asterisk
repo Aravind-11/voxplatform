@@ -2,6 +2,6 @@
 FROM debian:12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends asterisk asterisk-modules ca-certificates curl python3 \
     && rm -rf /var/lib/apt/lists/*
-COPY sip/pjsip.conf sip/extensions.conf sip/modules.conf sip/rtp.conf sip/sip_setup.py /etc/asterisk/
+COPY sip/pjsip.conf sip/pjsip.register.conf sip/extensions.conf sip/modules.conf sip/rtp.conf sip/sip_setup.py /etc/asterisk/
 EXPOSE 5060/udp 10000-10100/udp
 CMD ["asterisk", "-f", "-U", "asterisk", "-G", "asterisk"]

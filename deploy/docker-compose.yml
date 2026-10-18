@@ -37,7 +37,7 @@ x-api: &api
     VOX_AUDIOSOCKET_PORT: ${VOX_AUDIOSOCKET_PORT:-0}          # SIP path (docs/SIP.md): 0 = off
     VOX_AUDIOSOCKET_AGENT: ${VOX_SIP_AGENT:-}
     VOX_AUDIOSOCKET_HOST: 0.0.0.0                              # private compose network only; never publish this port
-    VOX_SIP_TOKEN: ${VOX_SIP_TOKEN:-}                          # POST /internal/sip/setup (caller id and dialed number); empty = endpoint off (404)
+    VOX_SIP_TOKEN: ${VOX_SIP_TOKEN:-}                          # /internal/sip/setup and /sip/recover; empty = both endpoints off (404)
   volumes: [ "models:/models", "recordings:/data/recordings" ]
   deploy: { resources: { reservations: { devices: [ { driver: nvidia, count: 1, capabilities: [ gpu ] } ] } } }
   stop_grace_period: 1h          # live calls finish after the drain (see deploy/drain.py)
@@ -65,6 +65,8 @@ services:
 
   asterisk:
     # SIP front end for VoxSun or any SIP provider: `docker compose --profile sip up -d`. Configure deploy/sip/pjsip.conf first.
+    # One Asterisk is a single point of failure. This node registers the trunk and dials api1.
+    # Put Kamailio (deploy/sip/kamailio.cfg) or carrier failover in front of both. See docs/SIP.md.
     profiles: [ sip ]
     build: { context: ., dockerfile: Dockerfile.asterisk }
     hostname: asterisk
@@ -72,6 +74,21 @@ services:
     environment:
       SIP_SETUP_TOKEN: ${VOX_SIP_TOKEN:-}                      # dialplan reads this; must match the api VOX_SIP_TOKEN. Not a secret in the image.
     ports: [ "5060:5060/udp", "10000-10100:10000-10100/udp" ]
+    restart: unless-stopped
+
+  asterisk2:
+    # Same image, profile sip, inbound only. It does not register, so it does not fight `asterisk` for one contact.
+    # Kamailio reaches it on the compose network; do not publish 5060 (that host port belongs to `asterisk`).
+    # AudioSocket goes to api2. The primary dialplan still dials api1.
+    profiles: [ sip ]
+    build: { context: ., dockerfile: Dockerfile.asterisk }
+    hostname: asterisk2
+    depends_on: [ api2 ]
+    environment:
+      SIP_SETUP_TOKEN: ${VOX_SIP_TOKEN:-}                      # same secret as api2's VOX_SIP_TOKEN
+    volumes:
+      - ./sip/extensions.api2.conf:/etc/asterisk/extensions.conf:ro
+      - ./sip/pjsip.no-register.conf:/etc/asterisk/pjsip.register.conf:ro
     restart: unless-stopped
 
   postgres:

@@ -77,6 +77,17 @@ def test_midline_cut_keeps_list_shaped_tokens():
         assert " ".join(run(split_every(clause, n))) == clause
 
 
+def test_buffer_start_list_marker_is_not_spoken():
+    # No earlier newline: the opener is a source line, so flush still drops the marker.
+    for text, spoken in (
+        ("- item one is here.", "item one is here."),
+        ("+ item one is here.", "item one is here."),
+        ("1) red and blue here.", "red and blue here."),
+    ):
+        for n in (1, 3, len(text)):
+            assert run(split_every(text, n)) == [spoken]
+
+
 def test_short_clause_is_not_split_early():
     out = run(["Well, I think so. Okay."])
     assert out == ["Well, I think so.", "Okay."]

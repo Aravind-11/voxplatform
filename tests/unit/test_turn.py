@@ -60,14 +60,38 @@ def test_burst_just_over_start_threshold_is_aborted_as_noise():
 
 
 def test_barge_in_needs_longer_speech_while_agent_speaks():
+    # While the agent talks, SPEECH_START waits for backchannel_ms (450), not the old 192 ms
+    # barge floor, so a short "yeah" never opens a turn (no start, and therefore no abort).
     tm = TurnManager()
     tm.set_agent_speaking(True)
-    assert feed(tm, [(True, 4), (False, 3)]) == []          # 128 ms burst: ignored
+    # 448 ms ends before the 450 ms gate: not a turn yet, but the session must hear the words.
+    ev = feed(tm, [(True, 14), (False, 10)])
+    # The check waits out speculate_ms (6 frames), not the first silent frame.
+    assert kinds(ev) == [Ev.OVERLAP_CHECK] and ev[0][1] == (14 + 5) * F
     tm2 = TurnManager()
     tm2.set_agent_speaking(True)
-    ev = feed(tm2, [(True, 7)])                              # 224 ms: interrupts
+    ev = feed(tm2, [(True, 16)])                            # 512 ms: real interruption
     assert kinds(ev) == [Ev.SPEECH_START]
-    assert ev[0][1] == 5 * F                                 # 6th frame reaches 192 ms
+    assert ev[0][1] == 14 * F                               # 15th frame: 480 ms of speech >= 450
+
+
+def test_overlap_check_reports_how_long_the_burst_was():
+    tm = TurnManager()
+    tm.set_agent_speaking(True)
+    for _ in range(14):
+        assert tm.process(0.9) == []
+    for _ in range(5):
+        assert tm.process(0.1) == []
+    ev = tm.process(0.1)
+    assert len(ev) == 1 and ev[0].kind is Ev.OVERLAP_CHECK and ev[0].speech_ms == 14 * F
+    high = TurnManager(TurnConfig(backchannel_ms=192))
+    high.set_agent_speaking(True)
+    opened = []
+    for _ in range(8):
+        opened += high.process(0.9)
+    opened += high.process(0.1)
+    assert Ev.OVERLAP_CHECK not in [e.kind for e in opened]
+    assert opened[0].kind is Ev.SPEECH_START
 
 
 def test_onset_time_is_reported():
@@ -127,3 +151,43 @@ def test_verdict_after_speech_resumes_is_ignored():
     tm = TurnManager()
     feed(tm, [(True, 20), (False, 8), (True, 5)])           # caller resumed: speculation cancelled
     assert tm.apply_eot(0.99) == []
+
+
+def test_one_silent_frame_does_not_split_a_held_barge():
+    # 8 speech frames (256 ms) are already past the 192 ms floor. One silent frame is a VAD
+    # dip, not the end of the burst: the following speech is the same run.
+    tm = TurnManager()
+    tm.set_agent_speaking(True)
+    ev = feed(tm, [(True, 8), (False, 1), (True, 7)])       # 15 speech frames = 480 ms
+    assert kinds(ev) == [Ev.SPEECH_START] and ev[0][1] == 15 * F
+
+    tm = TurnManager()
+    tm.set_agent_speaking(True)
+    events = []
+    for p in [0.9] * 8 + [0.1] + [0.9] * 5 + [0.1] * 5:
+        events += tm.process(p)
+    assert events == []                                     # pause has not reached speculate_ms
+    events = tm.process(0.1)                                # 6th silent frame = 192 ms
+    assert len(events) == 1 and events[0].kind is Ev.OVERLAP_CHECK
+    assert events[0].speech_ms == 13 * F                    # 8 + 5 frames, the dip is not speech
+
+
+def test_subfloor_cough_is_not_glued_onto_the_next_burst():
+    tm = TurnManager()
+    tm.set_agent_speaking(True)
+    events = []
+    for p in [0.9] * 4 + [0.1] * 6 + [0.9] * 12 + [0.1] * 6:  # 128 ms cough, then 384 ms
+        events += tm.process(p)
+    assert [e.kind for e in events] == [Ev.OVERLAP_CHECK]
+    assert events[0].speech_ms == 12 * F
+
+
+def test_playback_ending_promotes_a_held_run_instead_of_dropping_it():
+    tm = TurnManager()
+    tm.set_agent_speaking(True)
+    assert feed(tm, [(True, 12)]) == []                     # 384 ms, still under the 450 ms gate
+    tm.set_agent_speaking(False)
+    ev = tm.process(0.1)
+    assert [e.kind for e in ev] == [Ev.SPEECH_START] and tm.in_turn
+    ev = feed(tm, [(False, 25)])
+    assert kinds(ev) == [Ev.SPECULATE, Ev.END_OF_TURN]

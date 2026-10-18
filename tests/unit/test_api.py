@@ -39,6 +39,20 @@ class FakeTTS:
 SETTINGS = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok")
 
 
+def _server_message(ws, timeout_s: float):
+    """One server frame, or a failure if the socket is still silent when the bound expires."""
+    import anyio
+
+    async def _read():
+        with anyio.fail_after(timeout_s):
+            return await ws._send_rx.receive()
+
+    try:
+        return ws.portal.call(_read)
+    except TimeoutError:
+        pytest.fail(f"no server frame within {timeout_s:g}s; the websocket stayed open")
+
+
 def make(settings=SETTINGS, dispatcher=None):
     store = Store()
     rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
@@ -173,11 +187,11 @@ def test_admit_write_error_releases_the_ceiling_and_ends_the_call():
     key, tid = tenant(c)
     call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers={"X-API-Key": key}).json()
     path = call["joinUrl"].replace("wss://vox.example.com", "")
-    try:
-        with c.websocket_connect(path) as ws:
-            ws.send_bytes(b"\x00\x00")
-    except Exception:
-        pass
+    with c.websocket_connect(path) as ws:
+        # A session that stays up (admit returns the tenant) never sends a frame, so an
+        # unbounded receive() would hang the suite. The close has to be this frame.
+        msg = _server_message(ws, timeout_s=2)
+    assert msg["type"] == "websocket.close" and msg.get("code") == 1011 and msg.get("reason") == "unavailable"
     row = store.get_call_any(call["id"])
     assert row["status"] == "ended" and row["end_reason"] == "error"
     assert lim.local_active() == 0

@@ -107,12 +107,31 @@ def test_deploy_sh_one_worker_per_port_and_health_on_every_port():
     assert branches
     one, multi = branches.group("one"), branches.group("multi")
     assert re.search(r'start_api 8080 api (?:"\$VOX_PROCS"|1)(?:\s|$)', one)
-    calls = re.findall(r"^[^#\n]*start_api[^\n#]*", multi, re.M)
-    assert calls and all(re.search(r"\s1\s*$", call) for call in calls)
-    assert "VOX_PROCS" not in "\n".join(calls)
+    # One process on each port 8080..8080+N-1. A single start_api, or every process on 8080, fails.
+    loop = re.search(
+        r'(?m)^[^#\n]*for _i in \$\(seq 0 \$\(\(VOX_PROCS - 1\)\)\); do(?P<body>.*?)\n\s*done',
+        multi,
+        re.S,
+    )
+    assert loop, "VOX_PROCS>1 must loop _i from 0 through VOX_PROCS-1"
+    loop_body = loop.group("body")
+    assert re.search(r'(?m)^\s*_port=\$\(\(8080 \+ _i\)\)\s*$', loop_body)
+    calls = re.findall(r'(?m)^[^#\n]*start_api[^\n#]*', loop_body)
+    assert len(calls) == 1 and re.search(r'start_api "\$_port" "api-\$_port" 1\s*$', calls[0]), calls
+    assert "VOX_PROCS" not in calls[0]
     ready = re.search(r"for _port in \$PORTS; do(?P<body>.*?)done", text, re.S)
     assert ready and "/healthz" in ready.group("body") and "${_port}" in ready.group("body")
     assert "127.0.0.1:8080/healthz" not in text
+    # Child gets the floor share, including 0. Unset stays unset. The raw node cap is not re-exported.
+    assert re.search(
+        r'(?m)^\s*\[ -n "\$PER_CAP" \] && cap_env="VOX_NODE_MAX_CALLS=\$PER_CAP"\s*$',
+        body,
+    )
+    assert '[ "$PER_CAP" -gt 0 ]' not in body
+    child = re.search(r'tmux new -d -s "\$session" "(?P<cmd>.*?)"', body, re.S)
+    assert child and "$cap_env" in child.group("cmd")
+    assert "VOX_NODE_MAX_CALLS=$VOX_NODE_MAX_CALLS" not in child.group("cmd")
+    assert "VOX_NODE_MAX_CALLS=$PER_CAP" not in child.group("cmd").replace("$cap_env", "")
 
 
 def test_exported_share_caps_each_process_and_is_not_divided_again():
@@ -186,8 +205,11 @@ def test_concurrent_acquires_do_not_pass_the_process_ceiling():
 
 
 def test_build_applies_the_exported_process_ceiling():
+    """build() must pass os.environ into make_limiter. A comment or an empty env does not."""
     text = Path(__file__).resolve().parents[2].joinpath("api/main.py").read_text()
-    assert "security.make_limiter(" in text.split("def build()", 1)[1]
+    build = text.split("def build()", 1)[1].split("\napp = build()", 1)[0]
+    calls = [line.split("#", 1)[0] for line in build.splitlines() if "make_limiter(" in line.split("#", 1)[0]]
+    assert len(calls) == 1 and "security.make_limiter(env," in calls[0]
 
 
 def test_several_processes_refuse_a_sqlite_file_before_they_start():

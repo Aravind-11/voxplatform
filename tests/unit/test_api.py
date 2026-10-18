@@ -279,6 +279,29 @@ def test_limiter_basic():
     assert l.acquire("u", "1")             # tenants independent
 
 
+def test_try_admit_node_cap_is_atomic_and_a_refusal_takes_no_slot():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    lim = security.ConcurrencyLimiter(10)
+    barrier = threading.Barrier(16)
+
+    def once(i):
+        barrier.wait()
+        return lim.try_admit("t", f"c{i}", 10, 1)
+
+    with ThreadPoolExecutor(16) as ex:
+        res = list(ex.map(once, range(16)))
+    ok = [i for i, r in enumerate(res) if r == "ok"]
+    assert len(ok) == 1 and res.count("node") == 15 and lim.local_active() == 1
+    assert lim.try_admit("t", f"c{ok[0]}", 10, 1) == "ok"          # already held, still one slot
+    assert lim.local_active() == 1
+    lim.release("t", f"c{ok[0]}")
+    assert lim.local_active() == 0
+    assert lim.try_admit("u", "x", 1, 5) == "ok"
+    assert lim.try_admit("u", "y", 1, 5) == "tenant"               # tenant cap, node cap still has room
+    assert lim.local_active() == 1 and lim.active("u") == 1
+
+
 # ---------------------------------------------------------------- tools through the API
 def test_agent_tools_are_validated_and_credentials_never_returned():
     c, store, _ = make()

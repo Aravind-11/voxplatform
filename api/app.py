@@ -764,15 +764,16 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if app.state.draining:
             store.update_call(call["id"], status="ended", ended=time.time(), end_reason="draining")
             raise _Reject(1013, "node is draining")
-        # Before the tenant cap, so a full process does not consume a tenant slot.
-        if at_node_cap():
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="node_full")
-            raise _Reject(1013, "node full")
         t = store.get_tenant(call["tenant_id"])
         cap = t["concurrency_limit"] or settings.default_concurrency
-        if not limiter.acquire(call["tenant_id"], call["id"], cap):
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="concurrency_limit")
-            raise _Reject(1013, "concurrency limit")
+        # Node cap and tenant cap are one locked check. A refusal takes no slot, and two
+        # admits cannot both pass a process that is one call under the cap.
+        decision = limiter.try_admit(call["tenant_id"], call["id"], cap, settings.node_max_calls)
+        if decision != "ok":
+            full = decision == "node"
+            store.update_call(call["id"], status="ended", ended=time.time(),
+                              end_reason="node_full" if full else "concurrency_limit")
+            raise _Reject(1013, "node full" if full else "concurrency limit")
         store.update_call(call["id"], status="active", joined=time.time())
         webhook(t, "call.started", store.get_call_any(call["id"]))
         return t
@@ -880,7 +881,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """One SIP call arriving from Asterisk over AudioSocket: create the call, admit it, run the agent."""
         from transports.audiosocket import AudioSocketTransport
         agent = store.get_agent_any(settings.audiosocket_agent)
-        if not agent or app.state.draining:
+        if not agent or app.state.draining or at_node_cap():
             writer.close()
             return
         call = store.create_call(agent["tenant_id"], agent["id"], "sip", agent["config"], {})
@@ -935,6 +936,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if call["status"] in ("created", "active"):
             store.update_call(call_id, status="ended", ended=time.time(), end_reason="stream_lost")
             limiter.release(call["tenant_id"], call_id)            # frees the dead node's slot at once
+        if at_node_cap():
+            return Response(busy_twiml(), media_type="text/xml")   # no new row while this process is full
         nxt = store.create_call(call["tenant_id"], call["agent_id"], "twilio", call["config"],
                                 {**meta, "resumedFrom": call_id, "resumes": n + 1})
         METRICS.inc("vox_call_resumes_total")
@@ -956,6 +959,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """Places a phone call through your Twilio account and connects the answered call to the agent."""
         if app.state.draining:
             raise HTTPException(503, "node is draining")
+        if at_node_cap():
+            raise HTTPException(503, "node full")
         if not (settings.twilio_account_sid and settings.twilio_auth_token):
             raise HTTPException(503, "outbound calling needs TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN on the server")
         if runtime.http is None:
@@ -1051,6 +1056,14 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>', media_type="text/xml")
         if app.state.draining:
             return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we cannot take your call right now.</Say><Hangup/></Response>', media_type="text/xml")
+        # The Dial already replaced this call's media stream. Drop a slot it still holds so the
+        # return leg is not refused for filling the cap by itself; if the node is still full, do
+        # not create another call.
+        if call["status"] == "active":
+            store.update_call(call_id, status="ended", ended=time.time(), end_reason="transfer_return")
+            limiter.release(call["tenant_id"], call_id)
+        if at_node_cap():
+            return Response(busy_twiml(), media_type="text/xml")
         who = re.sub(r"[^\w -]", "", to)[:40] or "that person"
         cfg = dict(call["config"])
         cfg["greeting"] = f"Sorry, {who} is not available right now. Is there anything else I can help you with?"

@@ -32,16 +32,28 @@ class ConcurrencyLimiter:
         self._active: dict[str, set[str]] = {}
         self._lock = threading.Lock()
 
-    def acquire(self, tenant_id: str, call_id: str, limit: Optional[int] = None) -> bool:
-        cap = limit if limit is not None else self.default_limit
+    def try_admit(self, tenant_id: str, call_id: str, limit: Optional[int] = None, node_limit: int = 0) -> str:
+        """Reserve one call under the tenant cap and the per-process cap, in one lock.
+
+        Returns "ok", "node", or "tenant". A refusal does not take a slot. A call that
+        already holds a slot is "ok" and is not counted twice. ``node_limit <= 0``
+        disables the per-process cap. Checking the node cap before inserting is what
+        keeps two concurrent admits from both passing a cap of N.
+        """
+        cap = self.default_limit if limit is None else limit
         with self._lock:
             calls = self._active.setdefault(tenant_id, set())
             if call_id in calls:
-                return True
+                return "ok"
+            if node_limit > 0 and sum(len(v) for v in self._active.values()) >= node_limit:
+                return "node"
             if len(calls) >= cap:
-                return False
+                return "tenant"
             calls.add(call_id)
-            return True
+            return "ok"
+
+    def acquire(self, tenant_id: str, call_id: str, limit: Optional[int] = None) -> bool:
+        return self.try_admit(tenant_id, call_id, limit, 0) == "ok"
 
     def release(self, tenant_id: str, call_id: str) -> None:
         with self._lock:
@@ -88,15 +100,46 @@ return 1
     def ping(self) -> None:
         self.r.ping()
 
-    def acquire(self, tenant_id: str, call_id: str, limit: Optional[int] = None) -> bool:
+    def try_admit(self, tenant_id: str, call_id: str, limit: Optional[int] = None, node_limit: int = 0) -> str:
+        """Same contract as ConcurrencyLimiter.try_admit, with the tenant cap in Redis.
+
+        The per-process cap is this node's ``_held`` set. The slot is reserved under the
+        lock before the Redis round trip and dropped again if Redis refuses, so two
+        admits cannot both pass ``node_limit``. ``node_limit <= 0`` keeps the old order
+        (Redis first) and does not apply a per-process cap.
+        """
         import time
         now = time.time()
-        cap = limit if limit is not None else self.default_limit
-        ok = self._script(keys=[self._key(tenant_id)], args=[now, now + self.ttl_s, call_id, cap]) == 1
-        if ok:
+        cap = self.default_limit if limit is None else limit
+        already = False
+        if node_limit > 0:
             with self._lock:
-                self._held.setdefault(tenant_id, set()).add(call_id)
-        return ok
+                held = self._held.setdefault(tenant_id, set())
+                if call_id in held:
+                    already = True
+                else:
+                    if sum(len(v) for v in self._held.values()) >= node_limit:
+                        return "node"
+                    held.add(call_id)
+        try:
+            ok = self._script(keys=[self._key(tenant_id)], args=[now, now + self.ttl_s, call_id, cap]) == 1
+        except Exception:
+            if node_limit > 0 and not already:
+                with self._lock:
+                    self._held.get(tenant_id, set()).discard(call_id)
+            raise
+        if ok:
+            if node_limit <= 0:
+                with self._lock:
+                    self._held.setdefault(tenant_id, set()).add(call_id)
+            return "ok"
+        if node_limit > 0 and not already:
+            with self._lock:
+                self._held.get(tenant_id, set()).discard(call_id)
+        return "tenant"
+
+    def acquire(self, tenant_id: str, call_id: str, limit: Optional[int] = None) -> bool:
+        return self.try_admit(tenant_id, call_id, limit, 0) == "ok"
 
     def release(self, tenant_id: str, call_id: str) -> None:
         self.r.zrem(self._key(tenant_id), call_id)

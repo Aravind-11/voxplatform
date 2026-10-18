@@ -148,11 +148,11 @@ kind: HorizontalPodAutoscaler
 metadata: { name: voice-node, namespace: voxplatform }
 spec:
   scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: voice-node }
-  minReplicas: 2
+  minReplicas: 2          # warm floor: a cold GPU takes minutes to load Ultravox, so do not scale voice nodes to zero
   maxReplicas: 8
   metrics:
     - type: Pods
       pods:
         metric: { name: vox_active_calls }          # exposed by prometheus-adapter from GET /metrics
         target: { type: AverageValue, averageValue: "20" }   # per-node gauge; measured comfortable limit is ~24 calls per H100 (docs/FINDINGS.md). Re-tune on your hardware.
-  behavior: { scaleDown: { stabilizationWindowSeconds: 900 } }
+  behavior: { scaleDown: { stabilizationWindowSeconds: 600 } }  # a brief dip does not delete a warm GPU

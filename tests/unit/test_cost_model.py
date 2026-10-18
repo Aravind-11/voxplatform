@@ -1,6 +1,11 @@
 import math
+import os
+import subprocess
+import sys
 
 from scripts import cost_model as cm
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def test_gpus_are_sized_for_peak_plus_spare_with_a_floor_of_two():
@@ -27,3 +32,52 @@ def test_render_has_a_row_per_scenario():
     t = cm.render(2.86, 24, 0.0085, 0.05)
     assert t.count("\n| ") >= 18 and "cheaper" in t
     assert "dearer" in cm.render(20.0, 24, 0.0085, 0.05)                 # an expensive GPU flips small scenarios
+    assert "$4,176" in t                                                 # 2 x $2.86 x 730h, unchanged by the default floor
+
+
+def test_spot_above_the_warm_floor_and_overflow_minutes_match_a_hand_calculation():
+    # peak 100 / 24 -> ceil 5 + 1 spare = 6. Floor 2 does not shrink that.
+    # 2 on-demand at $2/h + 4 spot at $1/h = $8/h * 730 = $5840. All-on-demand would be 6*2*730 = $8760.
+    s = cm.scenario(100, 50, gpu_hourly=2.0, calls_per_gpu=24, telephony=0.01, spot_hourly=1.0, warm_floor=2)
+    assert (s["gpus"], s["on_demand"], s["spot"], s["warm_floor"]) == (6, 2, 4, 2)
+    assert math.isclose(s["monthly_gpu"], (2 * 2.0 + 4 * 1.0) * 730)
+    # A floor above the peak sizing is extra idle GPUs, all on-demand (nothing sits above the floor).
+    small = cm.scenario(10, 4, gpu_hourly=2.0, calls_per_gpu=24, telephony=0.01, spot_hourly=1.0, warm_floor=4)
+    assert (small["gpus"], small["on_demand"], small["spot"]) == (4, 4, 0)
+    assert math.isclose(small["monthly_gpu"], 4 * 2.0 * 730)
+    # peak 100, floor holds 2*24=48, excess 52 calls. Load factor avg/peak = 0.5.
+    # 52 * 0.5 * 60 * 730 = 1,138,800 minutes, priced at the paid rate by the caller.
+    assert math.isclose(cm.overflow_minutes(100, 24, 2, 50), 52 * 0.5 * 60 * 730)
+    assert cm.overflow_minutes(40, 24, 2, 20) == 0                       # peak fits on the floor
+    plain = cm.scenario(24, 12, gpu_hourly=2.0, calls_per_gpu=24, telephony=0.01)
+    assert plain["gpus"] == 2 and math.isclose(plain["monthly_gpu"], 2 * 2.0 * 730)
+    # Do not pass warm_floor: render's own default must stay 2. The 100-call / 50% row is
+    # 2 on-demand at $2.86 plus 4 spot at $1 = $7,096. Dropping spot or zeroing the floor changes that dollar amount.
+    text = cm.render(2.86, 24, 0.0085, 0.05, spot_hourly=1.0)
+    row = next(line for line in text.splitlines() if line.startswith("| 100 | 50% |"))
+    assert "$7,096" in row
+    assert (
+        "Warm floor 2, on-demand nodes 2, spot nodes 20, "
+        "overflow minutes the warm floor cannot absorb 9,898,800 "
+        "priced at the paid rate $0.050/min ($494,940/month)"
+    ) in text
+
+
+def test_cli_warm_floor_default_bills_two_nodes_on_demand_when_spot_is_set():
+    # argparse's --warm-floor default is a separate literal from render's. Floor 0 would print
+    # "on-demand nodes 0, spot nodes 22".
+    r = subprocess.run(
+        [sys.executable, os.path.join(ROOT, "scripts", "cost_model.py"), "--spot-hourly", "1"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "on-demand nodes 2, spot nodes 20" in r.stdout
+
+
+def test_voice_node_hpa_keeps_the_warm_floor_and_a_ten_minute_scale_down():
+    import yaml
+    docs = yaml.safe_load_all(open(os.path.join(ROOT, "deploy/k8s/voxplatform.yaml")))
+    hpa = next(d for d in docs if d and d.get("kind") == "HorizontalPodAutoscaler"
+               and d.get("metadata", {}).get("name") == "voice-node")
+    assert hpa["spec"]["minReplicas"] == 2
+    assert hpa["spec"]["behavior"]["scaleDown"]["stabilizationWindowSeconds"] == 600

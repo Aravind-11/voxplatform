@@ -635,6 +635,78 @@ def test_outbound_holds_a_slot_while_dialing_and_releases_if_twilio_never_connec
     assert len(refused) == 1
 
 
+def test_outbound_failure_does_not_drop_a_leg_the_socket_already_adopted():
+    """A dial that fails after /ws/twilio has admitted must leave that leg active and keep the slot."""
+    import threading
+
+    def scenario(fail):
+        inside, release = threading.Event(), threading.Event()
+
+        async def handler(req):
+            inside.set()
+            for _ in range(500):
+                if release.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            return fail()
+
+        c, store, _ = make_outbound(handler, node_max_calls=1)
+        box: dict = {}
+
+        def post(agent_id, key):
+            try:
+                box["r"] = c.post("/v1/calls/outbound", json={"agentId": agent_id, "to": "+15551234567"}, headers=H(key))
+            except Exception as exc:  # noqa: BLE001
+                box["err"] = exc
+
+        with c:
+            k, tid = tenant(c, limit=10)
+            a = c.post("/v1/agents", json={"name": "a", "greeting": ""}, headers=H(k)).json()
+            th = threading.Thread(target=post, args=(a["id"], k))
+            th.start()
+            try:
+                assert inside.wait(5)
+                call = store.list_calls(tid)[0]
+                with c.websocket_connect(f"/ws/twilio/{call['id']}") as ws:
+                    ws.send_text(json.dumps({"event": "start", "streamSid": "MZ1", "start": {
+                        "streamSid": "MZ1", "callSid": "CA1",
+                        "customParameters": {"token": call["join_token"]}}}))
+                    adopted = False
+                    for _ in range(50):
+                        if store.get_call_any(call["id"])["status"] == "active":
+                            adopted = True
+                            break
+                        time.sleep(0.02)
+                    assert adopted
+                    release.set()
+                    th.join(5)
+                    assert not th.is_alive() and "err" not in box
+                    body = box["r"].json()
+                    assert box["r"].status_code == 200 and body["id"] == call["id"] and body["status"] == "active"
+                    row = store.get_call_any(call["id"])
+                    assert row["status"] == "active" and not row["end_reason"]
+                    assert c.app.state.limiter.local_active() == 1
+                    denied = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551234568"}, headers=H(k))
+                    assert denied.status_code == 503 and "node full" in denied.text
+                    assert c.app.state.limiter.local_active() == 1 and len(store.list_calls(tid)) == 1
+            finally:
+                release.set()
+                th.join(5)
+
+    def boom():
+        raise RuntimeError("twilio dropped")
+
+    def rejected():
+        return httpx.Response(400, json={"message": "nope"})
+
+    def html():
+        return httpx.Response(201, content=b"<html>queued</html>", headers={"content-type": "text/html"})
+
+    scenario(boom)
+    scenario(rejected)
+    scenario(html)
+
+
 def test_outbound_non_json_success_releases_the_slot_and_ends_the_row():
     """A 201 whose body is not JSON must not keep the reservation or leave /healthz failed."""
     def html(req):

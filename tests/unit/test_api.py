@@ -596,6 +596,69 @@ def test_failed_status_callback_does_not_hand_back_a_stream():
     assert lim2.local_active() == 0 and c2.get("/healthz").status_code == 200
 
 
+def test_failed_bind_keeps_a_leg_the_socket_already_adopted():
+    """A retry can open the stream while the first voice POST is still binding the status callback.
+
+    When that bind then fails, the adopted row must stay active and keep the only slot.
+    """
+    import asyncio
+    import threading
+    inside, release = threading.Event(), threading.Event()
+
+    async def handler(req: httpx.Request):
+        inside.set()
+        for _ in range(500):
+            if release.is_set():
+                break
+            await asyncio.sleep(0.01)
+        return httpx.Response(500, text="no")
+
+    c, store, lim = _make_twilio_rest(handler, node_max_calls=1)
+    box: dict = {}
+
+    def first(url, form):
+        try:
+            box["r"] = c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form))
+        except Exception as exc:  # noqa: BLE001
+            box["err"] = exc
+
+    with c:
+        k, tid = tenant(c, limit=10)
+        a = c.post("/v1/agents", json={"name": "n", "greeting": ""}, headers={"X-API-Key": k}).json()
+        url = f"https://vox.example.com/twilio/voice/{a['id']}"
+        form = twilio_form()
+        th = threading.Thread(target=first, args=(url, form))
+        th.start()
+        try:
+            assert inside.wait(5)
+            dup = c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form))
+            call = store.list_calls(tid)[0]
+            assert "<Stream" in dup.text and call["id"] in dup.text and lim.local_active() == 1
+            with c.websocket_connect(f"/ws/twilio/{call['id']}") as ws:
+                ws.send_text(json.dumps({"event": "start", "streamSid": "MZ1", "start": {
+                    "streamSid": "MZ1", "callSid": "CA1", "customParameters": {"token": call["join_token"]}}}))
+                adopted = False
+                for _ in range(50):
+                    if store.get_call_any(call["id"])["status"] == "active":
+                        adopted = True
+                        break
+                    time.sleep(0.02)
+                assert adopted and lim.local_active() == 1
+                release.set()
+                th.join(5)
+                assert not th.is_alive() and "err" not in box
+                assert "<Stream" in box["r"].text and call["id"] in box["r"].text and "<Hangup/>" not in box["r"].text
+                row = store.get_call_any(call["id"])
+                assert row["status"] == "active" and not row["end_reason"] and lim.local_active() == 1
+                other = {"CallSid": "CA2", "From": "+15550003", "To": "+15550004"}
+                busy = c.post(f"/twilio/voice/{a['id']}", data=other, headers=sign(url, other))
+                assert "all of our lines are busy" in busy.text and "<Stream" not in busy.text
+                assert lim.local_active() == 1 and len(store.list_calls(tid)) == 1
+        finally:
+            release.set()
+            th.join(5)
+
+
 def test_resume_terminal_status_releases_and_in_progress_still_reconnects():
     c, store, lim = make(Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
                                   node_max_calls=2))

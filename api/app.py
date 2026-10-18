@@ -906,9 +906,18 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         except Exception:  # noqa: BLE001
             return False
 
-    def _drop_unbound(call: dict) -> None:
-        """The status callback was not registered, so this reservation can never be freed by Twilio."""
-        release_open(call, "status_callback_failed")
+    def _drop_unbound(call: dict) -> Response:
+        """The status callback was not registered. Re-read: /ws/twilio may have admitted during the REST await.
+
+        The `call` argument is the pre-await row. Ending that snapshot marks a live leg ended and
+        releases its slot while the socket is still up, so the next caller takes the only seat.
+        """
+        cur = store.get_call_any(call["id"]) or call
+        if cur.get("status") == "active":
+            return Response(stream_twiml(cur), media_type="text/xml")
+        if cur.get("status") == "created":
+            release_open(cur, "status_callback_failed")
+        return Response(HANGUP_TWIML, media_type="text/xml")
 
     @app.post("/twilio/voice/{agent_id}")
     async def twilio_voice(agent_id: str, request: Request):
@@ -940,8 +949,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         call = create_reserved(cid, agent["tenant_id"], agent_id, "twilio", agent["config"],
                                {"from": form.get("From", ""), "to": form.get("To", ""), "callSid": call_sid})
         if not await bind_status_callback(call["id"], call_sid):
-            _drop_unbound(call)
-            return Response(HANGUP_TWIML, media_type="text/xml")
+            return _drop_unbound(call)
         return Response(stream_twiml(call), media_type="text/xml")
 
     @app.websocket("/ws/twilio/{call_id}")
@@ -1079,8 +1087,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                               {**meta, "resumedFrom": call_id, "resumes": n + 1})
         resumed_sid = str(form.get("CallSid", "") or (nxt["metadata"] or {}).get("callSid") or "")
         if not await bind_status_callback(nxt["id"], resumed_sid):
-            _drop_unbound(nxt)
-            return Response(HANGUP_TWIML, media_type="text/xml")
+            return _drop_unbound(nxt)
         METRICS.inc("vox_call_resumes_total")
         store.audit(call["tenant_id"], "system", "call.resume", nxt["id"], {"from": call_id, "attempt": n + 1})
         return Response(stream_twiml(nxt), media_type="text/xml")
@@ -1140,15 +1147,31 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if body.voicemailMessage:
             data.update({"MachineDetection": "DetectMessageEnd", "AsyncAmd": "true",
                          "AsyncAmdStatusCallback": f"{settings.public_base_url}/twilio/amd/{call['id']}"})
+
+        def adopted_call():
+            """Twilio can open /ws/twilio before this POST returns. That leg is live; finish() owns the slot."""
+            cur = store.get_call_any(call["id"])
+            if not cur or cur.get("status") != "active":
+                return None
+            meta_now = cur["metadata"] if isinstance(cur.get("metadata"), dict) else {}
+            log(t, "call.outbound", call["id"], to=body.to)
+            return {**public_call(cur), "callSid": str(meta_now.get("callSid") or "")}
+
         try:
             r = await runtime.http.post(
                 f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Calls.json",
                 auth=(settings.twilio_account_sid, settings.twilio_auth_token), data=data, timeout=15)
         except Exception as e:  # noqa: BLE001
+            live = adopted_call()
+            if live is not None:
+                return live
             limiter.release(t["id"], call["id"])
             store.update_call(call["id"], status="ended", ended=time.time(), end_reason="twilio_unreachable")
             raise HTTPException(502, f"could not reach Twilio: {type(e).__name__}") from e
         if r.status_code >= 300:
+            live = adopted_call()
+            if live is not None:
+                return live
             limiter.release(t["id"], call["id"])
             store.update_call(call["id"], status="ended", ended=time.time(), end_reason="twilio_rejected")
             try:
@@ -1161,6 +1184,9 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             sid = payload.get("sid", "") if isinstance(payload, dict) else ""
             store.update_call(call["id"], metadata={**meta, "callSid": sid})
         except Exception:  # noqa: BLE001
+            live = adopted_call()
+            if live is not None:
+                return live
             # 2xx we cannot record is the same as a dial that never took a slot. Release first:
             # a second write failure must not leave the node full.
             limiter.release(t["id"], call["id"])
@@ -1228,8 +1254,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         resumed = create_reserved(cid, call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
         resumed_sid = str(form.get("CallSid", "") or (resumed["metadata"] or {}).get("callSid") or "")
         if not await bind_status_callback(resumed["id"], resumed_sid):
-            _drop_unbound(resumed)
-            return Response(HANGUP_TWIML, media_type="text/xml")
+            return _drop_unbound(resumed)
         return Response(stream_twiml(resumed), media_type="text/xml")
 
     @app.post("/twilio/amd/{call_id}")

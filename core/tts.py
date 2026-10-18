@@ -146,10 +146,12 @@ class KokoroTTS:
 
 
 class HttpTTS:
-    """OpenAI-compatible `POST {url}/audio/speech` with JSON `{model, voice, input}`.
+    """OpenAI-compatible `POST {url}/audio/speech`.
 
-    A WAV response sets `sample_rate` from the header. A JSON or text body is refused
-    (an error document is not audio). Anything else is raw s16le at `rate`
+    The body is `{model, voice, input, response_format: "pcm"}`. OpenAI defines `pcm` as raw
+    24 kHz little-endian s16le, which is what a headerless body is decoded as. A WAV response
+    sets `sample_rate` from the header. JSON, text, and compressed audio (mpeg, opus, ogg,
+    flac, aac, mp4, or an ID3 tag) are refused. Anything else is raw s16le at `rate`
     (`VOX_TTS_RATE`, default 24000). One response is one chunk.
     """
 
@@ -167,7 +169,7 @@ class HttpTTS:
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
         response = await self.client.post(
             f"{self.url}/audio/speech",
-            json={"model": self.model, "voice": self.voice, "input": text},
+            json={"model": self.model, "voice": self.voice, "input": text, "response_format": "pcm"},
             headers=headers)
         if hasattr(response, "raise_for_status"):
             response.raise_for_status()
@@ -207,10 +209,17 @@ def _content_type(response) -> str:
     return str(value or "")
 
 
+# OpenAI speech defaults to mp3. These are not s16le; a bare 0xFFFB frame sync is left alone
+# because those two bytes are common in PCM.
+_COMPRESSED_MEDIA = frozenset({
+    "audio/mpeg", "audio/mp3", "audio/opus", "audio/ogg", "audio/flac", "audio/aac", "audio/mp4",
+})
+
+
 def _json_document(data: bytes) -> bool:
     """True when the whole body is a JSON object or array. A lone '{' byte is a PCM sample, not a document."""
     try:
-        text = data.decode("utf-8").strip()
+        text = data.decode("utf-8-sig").strip()  # a leading UTF-8 BOM is not whitespace
     except UnicodeDecodeError:
         return False
     if len(text) < 2 or text[0] not in "{[":
@@ -238,5 +247,9 @@ def _pcm_from_speech(data: bytes, default_rate: int, content_type: str = "") -> 
         return pcm, rate
     if _json_document(data):
         raise ValueError("TTS response is JSON, not audio")
+    if media in _COMPRESSED_MEDIA:
+        raise ValueError(f"TTS response is {media}, not PCM")
+    if data.startswith(b"ID3"):
+        raise ValueError("TTS response is an ID3 audio tag, not PCM")
     even = data[: len(data) - (len(data) % 2)]
     return np.frombuffer(even, dtype=np.int16).copy(), default_rate

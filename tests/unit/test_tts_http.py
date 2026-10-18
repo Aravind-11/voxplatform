@@ -22,8 +22,8 @@ def _wav(pcm: np.ndarray, rate: int) -> bytes:
 
 
 class _Resp:
-    def __init__(self, content: bytes, status: int = 200):
-        self.content, self.status = content, status
+    def __init__(self, content: bytes, status: int = 200, headers=None):
+        self.content, self.status, self.headers = content, status, headers
 
     def raise_for_status(self):
         if self.status >= 400:
@@ -31,12 +31,12 @@ class _Resp:
 
 
 class _Client:
-    def __init__(self, content: bytes):
-        self.content, self.posts = content, []
+    def __init__(self, content: bytes, headers=None):
+        self.content, self.headers, self.posts = content, headers, []
 
     async def post(self, url, json=None, headers=None):
         self.posts.append({"url": url, "json": json, "headers": headers})
-        return _Resp(self.content)
+        return _Resp(self.content, headers=self.headers)
 
 
 async def test_http_tts_decodes_a_wav_to_int16():
@@ -48,7 +48,8 @@ async def test_http_tts_decodes_a_wav_to_int16():
     assert tts.sample_rate == 22050
     post = client.posts[0]
     assert post["url"] == "http://tts.local/v1/audio/speech"
-    assert post["json"] == {"model": "tts-1", "voice": "af_heart", "input": "hello"}
+    assert post["json"] == {
+        "model": "tts-1", "voice": "af_heart", "input": "hello", "response_format": "pcm"}
     assert post["headers"]["Authorization"] == "Bearer sk-test"
 
 
@@ -71,6 +72,51 @@ async def test_http_tts_does_not_play_a_json_error_body():
         async for chunk in tts.synthesize("hello"):
             got.append(chunk)
     assert got == []
+
+
+async def test_http_tts_does_not_play_a_bom_prefixed_json_error():
+    client = _Client(b'\xef\xbb\xbf{"error":"nope"}')
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client)
+    got = []
+    with pytest.raises(ValueError):
+        async for chunk in tts.synthesize("hello"):
+            got.append(chunk)
+    assert got == []
+
+
+@pytest.mark.parametrize("media", [
+    "audio/mpeg", "audio/mp3", "audio/opus", "audio/ogg", "audio/flac", "audio/aac", "audio/mp4",
+    "audio/mpeg; charset=binary",
+])
+async def test_http_tts_does_not_play_compressed_audio(media):
+    # No ID3 tag: the media type alone must refuse the body. A bare frame sync is valid PCM.
+    client = _Client(b"\xff\xfb\x00\x01" * 8, headers={"Content-Type": media})
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client)
+    got = []
+    with pytest.raises(ValueError):
+        async for chunk in tts.synthesize("hello"):
+            got.append(chunk)
+    assert got == []
+
+
+async def test_http_tts_does_not_play_an_id3_body_without_a_media_type():
+    client = _Client(b"ID3" + b"\x00" * 40)
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client)
+    got = []
+    with pytest.raises(ValueError):
+        async for chunk in tts.synthesize("hello"):
+            got.append(chunk)
+    assert got == []
+
+
+async def test_http_tts_keeps_pcm_that_starts_like_an_mp3_frame():
+    pcm = np.array([-1025, 256], np.int16)  # ff fb 00 01, a common MP3 frame sync in s16le
+    assert pcm.tobytes()[:2] == b"\xff\xfb"
+    client = _Client(pcm.tobytes())
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client, rate=24000)
+    out = [x async for x in tts.synthesize("hi")]
+    assert out[0].dtype == np.int16 and out[0].tolist() == [-1025, 256]
+    assert tts.sample_rate == 24000
 
 
 async def test_wrapped_http_tts_is_resampled_at_the_wav_rate():

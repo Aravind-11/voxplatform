@@ -100,6 +100,9 @@ class _Generation:
         self.first_audio_sent = False
         self.cancelled = False
         self.after: Optional[ToolResult] = None   # deferred call action requested by a tool this reply
+        # Transcript already running when this generation was created. Not this turn's task:
+        # _commit may replace the session pointer before _produce is scheduled.
+        self.prior_transcript: Optional[asyncio.Task] = None
 
 
 class Session:
@@ -201,6 +204,7 @@ class Session:
         base = list(self.history)
         self.history.append({"role": "assistant", "content": ""})
         gen = _Generation(np.zeros(0, np.int16), base, self.clock())
+        gen.prior_transcript = self._transcript_task
         gen.committed = True
         gen.commit.set()
         gen.tasks = [asyncio.create_task(self._produce(gen)), asyncio.create_task(self._synth(gen)),
@@ -291,6 +295,7 @@ class Session:
     def _start_generation(self) -> None:
         audio = np.concatenate(self._utt) if self._utt else np.zeros(0, np.int16)
         gen = _Generation(audio, list(self.history), self._last_speech_clock)
+        gen.prior_transcript = self._transcript_task
         gen.tasks = [asyncio.create_task(self._produce(gen)), asyncio.create_task(self._synth(gen)),
                      asyncio.create_task(self._drain(gen))]
         self._gen = gen
@@ -335,8 +340,12 @@ class Session:
     async def _produce(self, gen: _Generation) -> None:
         followups: list[dict] = []
         try:
-            if self._transcript_task and not self._transcript_task.done():
-                await self._transcript_task  # previous turn's transcript must be in history
+            # Previous turn only. Reading self._transcript_task here would wait on this turn's
+            # ASR when commit already replaced the pointer, and on 3.11+ cancelling this
+            # generation would cancel the task it is awaiting.
+            prior = gen.prior_transcript
+            if prior is not None and not prior.done():
+                await asyncio.shield(prior)
                 gen.base_history = list(self.history[: len(gen.base_history)])
             for round_i in range(self.cfg.max_tool_rounds + 1):
                 chunker = SentenceChunker()
@@ -367,8 +376,9 @@ class Session:
                 task = getattr(gen, "transcript_task", None)
                 # Await this generation's transcript even when a newer turn has replaced the
                 # pointer. Skipping it sends the tool round "[inaudible]" instead of the words.
+                # Shielded: a barge-in cancels this reply and must not cancel the transcript.
                 if task is not None and not task.done():
-                    await task
+                    await asyncio.shield(task)
                 followups.append({"role": "assistant", "content": "".join(text_parts) or None,
                                   "tool_calls": [{"id": c.id, "type": "function",
                                                   "function": {"name": c.name,

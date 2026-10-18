@@ -258,6 +258,113 @@ async def test_tool_round_sends_transcript_instead_of_reprefilling_audio():
     assert all(m.get("role") != "user" for m in llm.calls[1]["followups"])
 
 
+def _contents(history):
+    return [m.get("content") for m in history]
+
+
+async def test_barge_in_while_tool_round_waits_keeps_the_transcript():
+    """Cancelling the produce task must not cancel ASR, or the turn stays '[caller audio]'."""
+    release = asyncio.Event()
+    ran = []
+
+    async def lookup(args):
+        ran.append(args)
+        return {"ok": True}
+
+    llm = FakeLLM([["Let ", "me ", "check. ", ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["Okay."]])
+
+    async def slow(audio):
+        await release.wait()
+        return "tuesday at eleven"
+
+    llm.transcribe = slow
+    r = Rig(llm, tools={"lookup": lookup})
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    assert llm.calls[0]["n_audio"] > 0 and ran == []
+    assert _contents(llm.calls[0]["history"]) == [r.s.cfg.system_prompt]
+    await r.frames("s", 8)             # barge-in while the tool round is blocked on this turn's ASR
+    await r.settle()
+    assert r.clears == 1 and ran == []
+    release.set()
+    await r.settle()
+    assert _contents(r.s.history)[1] == "tuesday at eleven"
+    assert "[caller audio]" not in _contents(r.s.history)
+    await r.frames("s", 10)
+    await r.frames("q", 30)
+    await r.settle()
+    later = llm.calls[-1]["history"]
+    assert "tuesday at eleven" in _contents(later)
+    assert "[caller audio]" not in _contents(later)
+
+
+async def test_speech_resume_does_not_cancel_the_previous_transcript():
+    """A resumed pause cancels the speculative reply, not the previous turn's ASR."""
+    release = asyncio.Event()
+    llm = FakeLLM([["Hello ", "there."], ["Second ", "reply."]])
+
+    async def slow(audio):
+        await release.wait()
+        return "the first thing I said"
+
+    llm.transcribe = slow
+    r = Rig(llm)
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    assert r.s.history[1]["content"] == "[caller audio]"
+    assert r.s.history[-1]["content"] == "Hello there."
+    await r.frames("s", 15)
+    await r.frames("q", 8)             # speculate: produce is blocked on the previous transcript
+    await r.settle()
+    await r.frames("s", 10)            # caller continues: cancel that speculation
+    await r.settle()
+    release.set()
+    await r.settle()
+    assert r.s.history[1]["content"] == "the first thing I said"
+    await r.frames("q", 30)
+    await r.settle()
+    call = llm.calls[1]
+    assert call["n_audio"] > 0
+    assert "the first thing I said" in _contents(call["history"])
+    assert "[caller audio]" not in _contents(call["history"])
+
+
+async def test_noyield_burst_does_not_block_round0_on_this_turns_asr():
+    """Speculate and end-of-turn in one drain must not make round 0 wait on this turn's ASR."""
+    release = asyncio.Event()
+    llm = FakeLLM([["Hello ", "there."], ["Next ", "reply."]])
+
+    async def slow(audio):
+        await release.wait()
+        return "burst transcript"
+
+    llm.transcribe = slow
+    r = Rig(llm, tts=FakeTTS(word_ms=500))
+    for kind in "s" * 15 + "q" * 25:   # no settle: commit can replace the pointer before produce runs
+        await r.s.feed(SPEECH if kind == "s" else SILENCE)
+        r.clk.t += 32
+    await r.settle()
+    assert len(llm.calls) == 1 and llm.calls[0]["n_audio"] > 0
+    assert "[caller audio]" not in _contents(llm.calls[0]["history"])
+    await r.frames("s", 8)             # interrupt this still-active generation before ASR returns
+    await r.settle()
+    release.set()
+    await r.settle()
+    assert "burst transcript" in _contents(r.s.history)
+    assert "[caller audio]" not in _contents(r.s.history)
+    await r.frames("s", 10)
+    await r.frames("q", 30)
+    await r.settle()
+    later = llm.calls[-1]["history"]
+    assert later is not llm.calls[0]["history"]
+    assert "burst transcript" in _contents(later)
+    assert "[caller audio]" not in _contents(later)
+    assert llm.calls[0]["n_audio"] > 0
+
+
 async def test_tool_call_cancelled_speculation_never_runs_tool():
     calls = []
 

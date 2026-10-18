@@ -24,8 +24,10 @@
   VOX_PROCS                API processes on one host (default 1). Unset or 1: a single uvicorn with --workers 1.
                            Above 1, scripts/deploy.sh starts one process per port 8080..8080+N-1, not uvicorn's
                            shared --workers model: a WebSocket stays on the process that accepted it, and live
-                           calls / VAD are per process. Split the node cap as max(1, VOX_NODE_MAX_CALLS // VOX_PROCS)
-                           on each process (scripts/deploy_procs.py). Inside one container, do not raise --workers.
+                           calls / VAD are per process. Split the node cap as VOX_NODE_MAX_CALLS // VOX_PROCS
+                           on each process so the processes together do not admit more than the node cap
+                           (scripts/deploy_procs.py). A cap of 0 stays 0. A positive cap smaller than VOX_PROCS
+                           is rejected, not rounded up. Inside one container, do not raise --workers.
   VOX_ALLOW_UNSIGNED_TWILIO=1   development only
   VOX_EOT, VOX_EOT_THRESHOLD, VOX_END_MS, VOX_PATIENT_MS, VOX_TTS_CONCURRENCY, VOX_LOG_EVENTS: see docs/TUNING.md
 Run: uvicorn api.main:app --host 0.0.0.0 --port 8080   (put TLS in front; Twilio needs wss)."""

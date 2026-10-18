@@ -8,7 +8,8 @@
 #               separate processes on ports 8080..8080+N-1 (not uvicorn's shared worker model).
 #               Caddy or the tunnel must list every port. WebSockets stick to the process that
 #               accepted them; in-process state (live calls, VAD) is per process. Split
-#               VOX_NODE_MAX_CALLS with scripts/deploy_procs.py (integer floor, at least 1).
+#               VOX_NODE_MAX_CALLS with scripts/deploy_procs.py (integer floor; the sum of the
+#               per-process caps does not exceed the node cap).
 set -euo pipefail
 FS="${FS:-/lambda/nfs/arvi}"
 cd "$(dirname "$0")/.."
@@ -46,7 +47,8 @@ done
 # 3. API
 # WebSockets stick to the process that accepted them. In-process state (live calls, VAD) is per
 # process, so VOX_PROCS>1 is N uvicorn processes on consecutive ports — not `uvicorn --workers N`,
-# which shares one listener. Each process gets max(1, VOX_NODE_MAX_CALLS / VOX_PROCS).
+# which shares one listener. Each process gets VOX_NODE_MAX_CALLS // VOX_PROCS, and that
+# split is rejected when rounding each process up to 1 would exceed the node cap.
 VOX_PROCS="${VOX_PROCS:-1}"
 if ! [[ "$VOX_PROCS" =~ ^[0-9]+$ ]] || [ "$VOX_PROCS" -lt 1 ]; then
   echo "VOX_PROCS must be an integer >= 1 (got ${VOX_PROCS})"; exit 1
@@ -91,9 +93,9 @@ else
   echo "Caddy (or the tunnel) must list every port. The quick tunnel above only reaches :8080."
   echo "WebSockets stick to the process that accepted them; live calls and VAD are not shared."
   if [ -n "$PER_CAP" ]; then
-    echo "VOX_NODE_MAX_CALLS=$VOX_NODE_MAX_CALLS split to $PER_CAP per process (floor, at least 1)."
+    echo "VOX_NODE_MAX_CALLS=$VOX_NODE_MAX_CALLS split to $PER_CAP per process (floor; processes together stay within the node cap)."
   else
-    echo "Set VOX_NODE_MAX_CALLS so each process takes max(1, VOX_NODE_MAX_CALLS / VOX_PROCS)."
+    echo "Set VOX_NODE_MAX_CALLS so each process takes VOX_NODE_MAX_CALLS // VOX_PROCS (the sum does not exceed the node cap)."
   fi
 fi
 _ok=0

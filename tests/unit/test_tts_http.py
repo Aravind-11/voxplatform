@@ -8,16 +8,20 @@ import pytest
 from api.runtime import LimitedTTS
 from core.audio import resample
 from core.session import Session, SessionConfig
-from core.tts import HttpTTS, make_tts_factory
+from core.tts import HttpTTS, KokoroTTS, make_tts_factory
 
 
 def _wav(pcm: np.ndarray, rate: int) -> bytes:
+    return _wave_bytes(np.asarray(pcm, dtype=np.int16).tobytes(), rate, channels=1, width=2)
+
+
+def _wave_bytes(frames: bytes, rate: int, channels: int, width: int) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
+        w.setnchannels(channels)
+        w.setsampwidth(width)
         w.setframerate(rate)
-        w.writeframes(np.asarray(pcm, dtype=np.int16).tobytes())
+        w.writeframes(frames)
     return buf.getvalue()
 
 
@@ -26,17 +30,18 @@ class _Resp:
         self.content, self.status, self.headers = content, status, headers
 
     def raise_for_status(self):
-        if self.status >= 400:
+        # httpx raises for every status outside 2xx, including redirects.
+        if self.status < 200 or self.status >= 300:
             raise RuntimeError(f"status {self.status}")
 
 
 class _Client:
-    def __init__(self, content: bytes, headers=None):
-        self.content, self.headers, self.posts = content, headers, []
+    def __init__(self, content: bytes, headers=None, status: int = 200):
+        self.content, self.headers, self.status, self.posts = content, headers, status, []
 
     async def post(self, url, json=None, headers=None, **kwargs):
         self.posts.append({"url": url, "json": json, "headers": headers, **kwargs})
-        return _Resp(self.content, headers=self.headers)
+        return _Resp(self.content, status=self.status, headers=self.headers)
 
 
 def _read_timeout_s(timeout) -> float:
@@ -238,3 +243,131 @@ async def test_empty_speech_body_is_not_stored_as_spoken_and_the_next_sentence_p
     assert sess.history[-1] == {"role": "assistant", "content": "Second sentence is fine."}
     errors = [e for e in events if e["type"] == "error"]
     assert len(errors) == 1 and errors[0]["where"] == "tts"
+
+
+class _PipelineSet:
+    """Stands in for Kokoro's PipelineSet. A real one imports kokoro, which is not installed."""
+
+    instances: list["_PipelineSet"] = []
+
+    def __init__(self, factory=None, preload: str = "a"):
+        self.factory, self.preload, self.sentinels = factory, preload, {}
+        _PipelineSet.instances.append(self)
+
+    def for_voice(self, voice: str):
+        self.sentinels.setdefault(voice, object())
+        return self.sentinels[voice]
+
+
+@pytest.mark.parametrize("env", [
+    {},
+    {"VOX_TTS_URL": ""},
+    {"VOX_TTS_URL": " \t "},
+], ids=["missing", "empty", "whitespace"])
+def test_blank_tts_url_keeps_one_shared_kokoro_pipeline(env, monkeypatch):
+    """An unset, blank, or whitespace URL stays on Kokoro. Every voice shares that one set."""
+    monkeypatch.setattr("core.tts.PipelineSet", _PipelineSet)
+    _PipelineSet.instances.clear()
+    factory = make_tts_factory(dict(env), object())
+    heart, bella = factory("af_heart"), factory("af_bella")
+    assert isinstance(heart, KokoroTTS) and isinstance(bella, KokoroTTS)
+    assert len(_PipelineSet.instances) == 1
+    pipelines = _PipelineSet.instances[0]
+    assert pipelines.preload == "a"
+    assert heart.pipeline is pipelines.sentinels["af_heart"]
+    assert bella.pipeline is pipelines.sentinels["af_bella"]
+    assert heart.pipeline is not bella.pipeline
+
+
+@pytest.mark.parametrize("model", [None, "", " \t"])
+async def test_factory_posts_tts_1_when_model_is_omitted_or_blank(model):
+    client = _Client(np.array([7, -7], np.int16).tobytes())
+    env = {"VOX_TTS_URL": "http://tts.local/v1"}
+    if model is not None:
+        env["VOX_TTS_MODEL"] = model
+    tts = make_tts_factory(env, client)("af_heart")
+    assert isinstance(tts, HttpTTS) and tts.model == "tts-1"
+    out = [x async for x in tts.synthesize("hi")]
+    assert out[0].tolist() == [7, -7]
+    assert client.posts[0]["json"]["model"] == "tts-1"
+
+
+async def test_blank_model_argument_posts_tts_1():
+    """HttpTTS(model='') is the same default the factory passes through after strip()."""
+    client = _Client(np.array([1, -1], np.int16).tobytes())
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client, model="")
+    assert tts.model == "tts-1"
+    out = [x async for x in tts.synthesize("hi")]
+    assert out[0].tolist() == [1, -1]
+    assert client.posts[0]["json"]["model"] == "tts-1"
+
+
+async def test_factory_posts_the_configured_model():
+    client = _Client(np.array([3], np.int16).tobytes())
+    tts = make_tts_factory(
+        {"VOX_TTS_URL": "http://tts.local/v1/", "VOX_TTS_MODEL": "licensed-voice"}, client)("af_bella")
+    assert isinstance(tts, HttpTTS) and tts.model == "licensed-voice"
+    out = [x async for x in tts.synthesize("yo")]
+    assert out[0].tolist() == [3]
+    assert client.posts[0]["json"]["model"] == "licensed-voice"
+    assert client.posts[0]["json"]["voice"] == "af_bella"
+    assert client.posts[0]["json"]["input"] == "yo"
+
+
+@pytest.mark.parametrize("rate", [None, ""])
+def test_factory_default_sample_rate_is_24000(rate):
+    env = {"VOX_TTS_URL": "http://tts.local/v1"}
+    if rate is not None:
+        env["VOX_TTS_RATE"] = rate
+    tts = make_tts_factory(env, _Client(b""))("af_heart")
+    assert isinstance(tts, HttpTTS) and tts.sample_rate == 24000
+
+
+@pytest.mark.parametrize("media,body", [
+    ("text/plain", b"this is not audio!!"),
+    ("text/html", b"<html>nope</html>!!"),
+    ("application/json", b"not-json"),
+])
+async def test_http_tts_does_not_play_text_or_a_non_document_json_body(media, body):
+    client = _Client(body, headers={"Content-Type": media})
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client)
+    got = []
+    with pytest.raises(ValueError):
+        async for chunk in tts.synthesize("hello"):
+            got.append(chunk)
+    assert got == []
+
+
+@pytest.mark.parametrize("status", [302, 500])
+async def test_http_tts_does_not_play_a_non_success_status(status):
+    pcm = np.array([9, -9, 8, -8], np.int16)
+    client = _Client(pcm.tobytes(), status=status)
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client)
+    got = []
+    with pytest.raises(RuntimeError):
+        async for chunk in tts.synthesize("hello"):
+            got.append(chunk)
+    assert got == []
+
+
+async def test_http_tts_refuses_an_8bit_wav():
+    client = _Client(_wave_bytes(bytes([0, 255, 128, 64]), 22050, channels=1, width=1))
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client, rate=24000)
+    got = []
+    with pytest.raises(ValueError):
+        async for chunk in tts.synthesize("hello"):
+            got.append(chunk)
+    assert got == []
+
+
+async def test_http_tts_keeps_channel_0_of_a_stereo_wav():
+    left = np.array([1, 2, 3, 4], np.int16)
+    right = np.array([-100, -200, -300, -400], np.int16)
+    stereo = np.empty(left.size * 2, dtype=np.int16)
+    stereo[0::2] = left
+    stereo[1::2] = right
+    client = _Client(_wave_bytes(stereo.tobytes(), 16000, channels=2, width=2))
+    tts = HttpTTS("af_heart", "http://tts.local/v1", client, rate=24000)
+    out = [x async for x in tts.synthesize("hello")]
+    assert len(out) == 1 and out[0].dtype == np.int16 and out[0].tolist() == left.tolist()
+    assert tts.sample_rate == 16000

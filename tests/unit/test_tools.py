@@ -334,9 +334,16 @@ async def test_runtime_confirms_from_the_latest_user_line_and_writes_audit():
     fn = sess.tools["book_slot"]
     assert (await fn({"day": "tuesday", "time": "11:00"}))["executed"] is False
     sess.stats["turns"] = 1
+    sess.history.append({"role": "user", "content": "yes"})
     sess.history.append({"role": "user", "content": "um"})
     assert (await fn({"day": "tuesday", "time": "11:00", "confirmed": True}))["executed"] is False
+    assert store.list_audit(tid) == []
     sess.stats["turns"] = 2
+    sess.history.append({"role": "user", "content": "yes"})
+    sess.history.append({"role": "user", "content": "[caller audio]"})
+    assert (await fn({"day": "tuesday", "time": "11:00", "confirmed": True}))["executed"] is False
+    assert store.list_audit(tid) == []
+    sess.stats["turns"] = 3
     sess.history.append({"role": "user", "content": "yes, that's right"})
     assert (await fn({"day": "tuesday", "time": "11:00", "confirmed": True}))["booked"] is True
     rows = store.list_audit(tid)

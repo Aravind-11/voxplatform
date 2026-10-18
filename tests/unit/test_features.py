@@ -1013,6 +1013,97 @@ def test_outbound_hold_refreshes_its_lease():
     assert fake.get(key) is None
 
 
+def test_outbound_get_error_after_lock_does_not_insert():
+    """SET took the mutex, then GET raises. The lease is falsy, so cap 1 does not insert; a later GET still may."""
+    from api import security
+    from api.store import Store
+
+    class GetDown(_OutboundRedis):
+        def __init__(self):
+            super().__init__()
+            self.fail_get = True
+
+        def get(self, name):
+            if self.fail_get:
+                raise ConnectionError("get failed")
+            return super().get(name)
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    fake = GetDown()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), store)
+    cap.LOCK_WAIT_S = 2
+    key = cap._lock_key(tid)
+    with cap.hold(tid, 1) as allowed:
+        with fake._mu:
+            assert key in fake.kv                         # SET succeeded; only the ownership GET fails
+        assert bool(allowed) is False                    # not `is False`: the yield is a lease, not a bool
+        if allowed:
+            store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+    assert store.count_outbound(tid, time.time() - 86400) == 0
+    fake.fail_get = False
+    with cap.hold(tid, 1) as allowed:
+        assert bool(allowed) is True
+        if allowed:
+            store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+    assert store.count_outbound(tid, time.time() - 86400) == 1
+
+
+def test_outbound_refresh_retries_after_eval_error():
+    """A refresh EVAL blip is retried. The next success replaces the sentinel. A blip does not recreate a missing key."""
+    from api import security
+    from api.store import Store
+
+    class FlakyEval(_OutboundRedis):
+        def __init__(self):
+            super().__init__()
+            self.refresh_raises_left = 1
+            self.refresh_attempts = 0
+            self.refresh_errors = 0
+
+        def eval(self, script, numkeys, *keys_and_args):
+            if "pexpire" in script:
+                self.refresh_attempts += 1
+                if self.refresh_raises_left > 0:
+                    self.refresh_raises_left -= 1
+                    self.refresh_errors += 1
+                    raise ConnectionError("eval blip")
+            return super().eval(script, numkeys, *keys_and_args)
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    fake = FlakyEval()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), store)
+    cap.LOCK_TTL_S = 8
+    cap._refresh_interval = lambda: 0.05
+    key = cap._lock_key(tid)
+    with cap.hold(tid, 1) as allowed:
+        assert bool(allowed) is True
+        token = fake.get(key)
+        assert token
+        with fake._mu:
+            fake.kv[key] = (token, time.time() + 1000)   # sentinel the retry has to overwrite
+        deadline = time.monotonic() + 2
+        renewed = False
+        while time.monotonic() < deadline:
+            with fake._mu:
+                item = fake.kv.get(key)
+            if item and item[0] == token and item[1] is not None:
+                remaining = item[1] - time.time()
+                if 1 < remaining <= cap.LOCK_TTL_S + 0.25:
+                    renewed = True
+                    break
+            time.sleep(0.01)
+        assert renewed
+        assert fake.refresh_errors >= 1
+        assert fake.refresh_attempts >= fake.refresh_errors + 1
+    with fake._mu:
+        fake.kv.pop(key, None)
+    fake.refresh_raises_left = 1
+    assert cap._refresh_lock(tid, token) is True         # blip retries; it must not SET the key back
+    assert fake.get(key) is None
+
+
 def test_outbound_route_does_not_dial_when_the_lock_disappears_before_insert():
     """The handler must skip create_call and Twilio when the lease vanishes after the count."""
     from api import security

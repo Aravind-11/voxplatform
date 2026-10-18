@@ -1,6 +1,11 @@
 import math
+import os
+import subprocess
+import sys
 
 from scripts import cost_model as cm
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def test_gpus_are_sized_for_peak_plus_spare_with_a_floor_of_two():
@@ -46,5 +51,33 @@ def test_spot_above_the_warm_floor_and_overflow_minutes_match_a_hand_calculation
     assert cm.overflow_minutes(40, 24, 2, 20) == 0                       # peak fits on the floor
     plain = cm.scenario(24, 12, gpu_hourly=2.0, calls_per_gpu=24, telephony=0.01)
     assert plain["gpus"] == 2 and math.isclose(plain["monthly_gpu"], 2 * 2.0 * 730)
-    text = cm.render(2.86, 24, 0.0085, 0.05, spot_hourly=1.0, warm_floor=2)
-    assert "Warm floor 2" in text and "spot nodes" in text and "overflow minutes" in text and "0.050/min" in text
+    # Do not pass warm_floor: render's own default must stay 2. The 100-call / 50% row is
+    # 2 on-demand at $2.86 plus 4 spot at $1 = $7,096. Dropping spot or zeroing the floor changes that dollar amount.
+    text = cm.render(2.86, 24, 0.0085, 0.05, spot_hourly=1.0)
+    row = next(line for line in text.splitlines() if line.startswith("| 100 | 50% |"))
+    assert "$7,096" in row
+    assert (
+        "Warm floor 2, on-demand nodes 2, spot nodes 20, "
+        "overflow minutes the warm floor cannot absorb 9,898,800 "
+        "priced at the paid rate $0.050/min ($494,940/month)"
+    ) in text
+
+
+def test_cli_warm_floor_default_bills_two_nodes_on_demand_when_spot_is_set():
+    # argparse's --warm-floor default is a separate literal from render's. Floor 0 would print
+    # "on-demand nodes 0, spot nodes 22".
+    r = subprocess.run(
+        [sys.executable, os.path.join(ROOT, "scripts", "cost_model.py"), "--spot-hourly", "1"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "on-demand nodes 2, spot nodes 20" in r.stdout
+
+
+def test_voice_node_hpa_keeps_the_warm_floor_and_a_ten_minute_scale_down():
+    import yaml
+    docs = yaml.safe_load_all(open(os.path.join(ROOT, "deploy/k8s/voxplatform.yaml")))
+    hpa = next(d for d in docs if d and d.get("kind") == "HorizontalPodAutoscaler"
+               and d.get("metadata", {}).get("name") == "voice-node")
+    assert hpa["spec"]["minReplicas"] == 2
+    assert hpa["spec"]["behavior"]["scaleDown"]["stabilizationWindowSeconds"] == 600

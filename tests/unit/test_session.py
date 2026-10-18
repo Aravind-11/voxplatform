@@ -320,6 +320,77 @@ async def test_close_while_asr_is_in_flight_keeps_the_caller_slot():
     assert not r.s._transcript_task.cancelled()
 
 
+class HoldFirstLLM(FakeLLM):
+    """Blocks the first transcribe only. Text is assigned when the call starts, not when it finishes."""
+
+    def __init__(self, replies):
+        super().__init__(replies)
+        self.gate = asyncio.Event()
+        self.started = asyncio.Event()
+        self.n_entered = 0
+
+    async def transcribe(self, audio):
+        n = self.n_entered
+        self.n_entered += 1
+        if n == 0:
+            self.started.set()
+            await self.gate.wait()
+        return f"caller said {n + 1}"
+
+
+async def _commit_two_turns_while_first_asr_held():
+    """Turn 2 reaches end-of-turn while turn 1's ASR is still blocked."""
+    llm = HoldFirstLLM([["Hi."], ["Okay."], ["Next."]])
+    r = Rig(llm)
+    await r.frames("s", 15)
+    await r.frames("q", 23)
+    await r.settle()
+    first = r.s._transcript_task
+    assert llm.started.is_set() and first is not None and not first.done()
+    assert r.s.history[1]["content"] == "[caller audio]"
+    await r.frames("q", 40)             # turn 1's reply finishes; turn 2 is not a barge-in
+    await r.frames("s", 15)
+    await r.frames("q", 23)             # turn 2 commits while the first task is still pending
+    await r.settle()
+    assert r.s.stats["turns"] == 2 and llm.n_entered == 2
+    assert r.s._transcript_task is not first
+    assert not first.done() and not first.cancelled()
+    assert r.s.history[1]["content"] == "[caller audio]"
+    return r, llm, first
+
+
+async def test_older_transcript_still_lands_when_a_later_turn_commits_first():
+    r, llm, first = await _commit_two_turns_while_first_asr_held()
+    closing = asyncio.create_task(r.s.close())
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if closing.done():
+            break
+    # The later ASR is already done. Hang-up must still wait for the earlier one.
+    assert not closing.done()
+    assert not first.cancelled() and r.s.history[1]["content"] == "[caller audio]"
+    llm.gate.set()
+    await closing
+    users = [m["content"] for m in r.s.history if m["role"] == "user"]
+    assert users == ["caller said 1", "caller said 2"]
+    assert [e["text"] for e in r.events if e["type"] == "user_transcript"] == ["caller said 1", "caller said 2"]
+    assert not first.cancelled()
+
+    r, llm, first = await _commit_two_turns_while_first_asr_held()
+    streamed = len(llm.calls)
+    await r.frames("s", 10)             # barge-in cancels the reply that was waiting on the first ASR
+    await r.frames("q", 8)              # the next speculation must not send "[caller audio]"
+    await r.settle()
+    assert len(llm.calls) == streamed
+    assert not first.cancelled()
+    llm.gate.set()
+    await r.settle()
+    seen = llm.calls[-1]["history"]
+    assert [m["content"] for m in seen if m["role"] == "user"] == ["caller said 1", "caller said 2"]
+    assert all("[caller audio]" not in (m.get("content") or "") for m in seen)
+    assert [e["text"] for e in r.events if e["type"] == "user_transcript"] == ["caller said 1", "caller said 2"]
+
+
 async def test_speculation_synthesizes_only_first_sentence_before_commit():
     llm = FakeLLM([["One two three four. ", "Five six seven. ", "Eight nine."]])
     r = Rig(llm)

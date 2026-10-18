@@ -445,9 +445,12 @@ def test_streaming_recorder_writes_wav_before_save_and_bounds_memory(tmp_path):
     rec = CallRecorder(clock=lambda: t[0], path=str(part))
     assert part.stat().st_size == 44                                # file exists before any audio
     frame = np.full(512, 1000, np.int16)
-    for _ in range(200):
+    for i in range(200):
         rec.mic(frame)
         t[0] += 512 / 16000
+        if i == 49:                                                  # header rewritten on mic, before agent/clear/save
+            early = _wav_pcm(part)
+            assert len(early) == 50 * len(frame) and early[:, 0].min() == 1000
     assert len(rec.left) <= 2
     rec.agent(np.full(16000, 2000, np.int16), 16000)               # extends past the caller track
     data_bytes = int.from_bytes(part.read_bytes()[40:44], "little")
@@ -457,12 +460,14 @@ def test_streaming_recorder_writes_wav_before_save_and_bounds_memory(tmp_path):
         assert w.getnframes() == 200 * 512 + 16000
         pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").reshape(-1, 2)
     assert pcm[0, 0] == 1000 and pcm[200 * 512, 1] == 2000 and pcm[200 * 512 - 1, 1] == 0
+    assert np.array_equal(rec.stereo(), pcm)                        # streaming stereo() reads the file, not self.left
     t[0] += 0.25
     rec.clear()
     with wave.open(str(part)) as w:
         pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").reshape(-1, 2)
     now = int(t[0] * 16000)
     assert len(pcm) == now and pcm[:, 1].nonzero()[0].max() < now
+    assert np.array_equal(rec.stereo(), pcm)
     final = tmp_path / "c.wav"
     secs = rec.save(str(final))
     assert final.is_file() and not part.exists()
@@ -635,6 +640,8 @@ def test_recording_end_to_end_and_download(tmp_path, monkeypatch):
     a = c.post("/v1/agents", json={"name": "rec", "record": True}, headers=H(ka)).json()
     call = c.post("/v1/calls", json={"agentId": a["id"]}, headers=H(ka)).json()
     path = call["joinUrl"].replace("wss://vox.example.com", "")
+    part = tmp_path / f"{call['id']}.part.wav"
+    wav = tmp_path / f"{call['id']}.wav"
     with c.websocket_connect(path) as ws:
         got = b""
         for f in silence(5) + speech(15) + silence(40):
@@ -643,8 +650,11 @@ def test_recording_end_to_end_and_download(tmp_path, monkeypatch):
         while not got and time.time() - t0 < 5:
             m = ws.receive()
             got += m.get("bytes") or b""
+        live = _wav_pcm(part)                                        # streamed during the call, not held until save
+        assert (live[:, 0] == 5000).any() and not wav.exists()
+    assert wav.is_file() and not part.exists()
     r = c.get(f"/v1/calls/{call['id']}/recording", headers=H(ka))
-    assert r.status_code == 200 and r.content[:4] == b"RIFF"
+    assert r.status_code == 200 and r.content == wav.read_bytes() and r.content[:4] == b"RIFF"
     assert c.get(f"/v1/calls/{call['id']}/recording", headers=H(kb)).status_code == 404       # tenant isolation
     plain = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=H(ka)).json()            # record not set
     with c.websocket_connect(plain["joinUrl"].replace("wss://vox.example.com", "")) as ws:

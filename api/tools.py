@@ -165,6 +165,21 @@ def validate_specs(specs: list) -> list[dict]:
     return out
 
 
+def filler_texts(specs: list) -> dict[str, str]:
+    """Per-tool spoken filler. Missing fillerText uses the session default; an explicit blank disables it."""
+    out: dict[str, str] = {}
+    for d in validate_specs(specs):
+        if "fillerText" not in d:
+            continue
+        text = d.get("fillerText")
+        if not isinstance(text, str):
+            continue
+        name = d.get("name") or d.get("demo") or d.get("builtin")
+        if name:
+            out[str(name)] = text.strip()
+    return out
+
+
 def redact_specs(specs: list) -> list:
     return [http_tools.redact(s) if isinstance(s, dict) and "http" in s else s for s in specs or []]
 

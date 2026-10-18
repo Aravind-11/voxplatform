@@ -208,6 +208,197 @@ async def test_tool_call_does_not_run_until_turn_is_committed():
     assert r.tts.texts == ["Let me check.", "Booked for ten."]
 
 
+async def test_slow_tool_speaks_its_filler_before_returning():
+    release = asyncio.Event()
+    seen = {}
+
+    async def lookup(args):
+        await release.wait()
+        seen["texts"] = list(r.tts.texts)
+        return {"slot": "10:00"}
+
+    llm = FakeLLM([["Let me check. ", ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["Booked for ten."]])
+    phrase = "Checking that order."
+    r = Rig(llm, tools={"lookup": lookup},
+            cfg=SessionConfig(tts_poll_s=0, filler_delay_s=0.01, tool_fillers={"lookup": phrase}))
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    try:
+        for _ in range(100):
+            if phrase in r.tts.texts:
+                break
+            await asyncio.sleep(0.01)
+        await r.settle()
+        assert phrase in r.tts.texts
+        assert "One moment, let me check that." not in r.tts.texts
+    finally:
+        release.set()
+    await r.settle()
+    assert phrase in seen["texts"]          # synthesized while the tool was still blocked
+    assert "Booked for ten." in r.tts.texts
+
+
+async def test_blank_per_tool_filler_does_not_speak_the_default():
+    """fillerText "" is a disable, not a missing value. The default line must not play."""
+    from api.tools import filler_texts
+
+    release = asyncio.Event()
+
+    async def lookup(args):
+        await release.wait()
+        return {"slot": "10:00"}
+
+    fillers = filler_texts([{
+        "name": "lookup", "description": "Find a slot.",
+        "parameters": {"type": "object", "properties": {}},
+        "http": {"url": "https://api.example.com/slots"},
+        "fillerText": "   ",
+    }])
+    llm = FakeLLM([["Let me check. ", ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["Booked for ten."]])
+    r = Rig(llm, tools={"lookup": lookup},
+            cfg=SessionConfig(tts_poll_s=0, filler_delay_s=0.01, tool_fillers=fillers))
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    try:
+        await asyncio.sleep(0.05)           # past filler_delay_s while the tool is still blocked
+        assert fillers == {"lookup": ""}
+        assert "One moment, let me check that." not in r.tts.texts
+    finally:
+        release.set()
+    await r.settle()
+    assert "One moment, let me check that." not in r.tts.texts
+    assert "Booked for ten." in r.tts.texts
+
+
+async def test_fast_tool_does_not_speak_a_filler():
+    async def lookup(args):
+        return {"slot": "10:00"}
+
+    llm = FakeLLM([["Let me check. ", ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["Booked for ten."]])
+    r = Rig(llm, tools={"lookup": lookup}, cfg=SessionConfig(tts_poll_s=0, filler_delay_s=0.01))
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    await asyncio.sleep(0.05)               # longer than filler_delay_s; the sleeper was cancelled
+    assert "One moment, let me check that." not in r.tts.texts
+    assert r.tts.texts == ["Let me check.", "Booked for ten."]
+
+
+def _blocked_lookup(release):
+    async def lookup(args):
+        await release.wait()
+        return {"slot": "10:00"}
+
+    return lookup
+
+
+def _two_sentence_tool_turn(release, phrase):
+    """First sentence is 40 words (3.2s) so it stays above the 1.5s lookahead while the tool blocks."""
+    first = " ".join(["alpha"] * 40) + "."
+    second = "Beta sentence follows."
+    llm = FakeLLM([[f"{first} ", f"{second} ", ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["All done now."]])
+    cfg = SessionConfig(tts_poll_s=0, tts_lookahead_ms=1500, filler_delay_s=0.01,
+                        tool_fillers={"lookup": phrase})
+    return first, second, Rig(llm, tools={"lookup": _blocked_lookup(release)}, cfg=cfg)
+
+
+async def test_filler_does_not_speak_ahead_of_a_queued_sentence():
+    """The filler must not be synthesized while a pre-tool sentence is still unspoken, and a tool
+    that returns before that sentence is released must not leave the filler in tts.texts."""
+    release = asyncio.Event()
+    phrase = "FILLER"
+    first, second, r = _two_sentence_tool_turn(release, phrase)
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    try:
+        await asyncio.sleep(0.05)          # past filler_delay_s; sentence 2 is held for lookahead
+        assert r.tts.texts == [first]      # not [first, FILLER] while Beta is still unspoken
+        assert second not in r.tts.texts and phrase not in r.tts.texts
+    finally:
+        release.set()                      # tool returns before the filler is allowed to start
+    r.clk.t += 10_000
+    for _ in range(20):
+        await asyncio.sleep(0.03)
+    await r.settle()
+    assert phrase not in r.tts.texts
+    assert r.tts.texts == [first, second, "All done now."]
+
+
+async def test_tool_only_turn_still_speaks_a_filler():
+    """No pre-tool sentence: the queue is empty and nothing is held, so the filler still plays."""
+    release = asyncio.Event()
+    llm = FakeLLM([[ToolCall("t1", "lookup", {})], ["Done."]])
+    r = Rig(llm, tools={"lookup": _blocked_lookup(release)},
+            cfg=SessionConfig(tts_poll_s=0, filler_delay_s=0.01))
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    try:
+        for _ in range(100):
+            if r.tts.texts:
+                break
+            await asyncio.sleep(0.01)
+        assert r.tts.texts == ["One moment, let me check that."]
+    finally:
+        release.set()
+    await r.settle()
+    assert r.tts.texts == ["One moment, let me check that.", "Done."]
+
+
+async def test_filler_follows_queued_sentences_when_the_tool_is_still_running():
+    release = asyncio.Event()
+    phrase = "FILLER"
+    first, second, r = _two_sentence_tool_turn(release, phrase)
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    try:
+        await asyncio.sleep(0.05)          # delay already elapsed, but Beta is not spoken yet
+        assert phrase not in r.tts.texts
+        r.clk.t += 10_000                  # playback catches up; the queued sentence may be synthesized
+        for _ in range(50):
+            if phrase in r.tts.texts and second in r.tts.texts:
+                break
+            await asyncio.sleep(0.02)
+        assert r.tts.texts == [first, second, phrase]
+    finally:
+        release.set()
+    await r.settle()
+
+
+async def test_slow_first_sentence_does_not_let_the_filler_cut_in():
+    """Filler delay expires during the first synthesize. It must not take speak_lock ahead of
+    the next sentence already sitting on textq."""
+    release = asyncio.Event()
+    phrase = "FILLER"
+
+    class SlowFirstTTS(FakeTTS):
+        async def synthesize(self, text):
+            self.texts.append(text)
+            await asyncio.sleep(0.08 if len(self.texts) == 1 else 0)
+            n = len(text.split()) * self.word_ms * 24
+            yield np.zeros(n, dtype=np.int16)
+
+    llm = FakeLLM([["Alpha sentence here. ", "Beta sentence follows. ",
+                    ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["All done now."]])
+    r = Rig(llm, tts=SlowFirstTTS(), tools={"lookup": _blocked_lookup(release)},
+            cfg=SessionConfig(tts_poll_s=0, filler_delay_s=0.01, tool_fillers={"lookup": phrase}))
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    try:
+        for _ in range(50):
+            if len(r.tts.texts) >= 3:
+                break
+            await asyncio.sleep(0.02)
+        assert r.tts.texts[:3] == ["Alpha sentence here.", "Beta sentence follows.", phrase]
+    finally:
+        release.set()
+    await r.settle()
+
+
 async def test_tool_call_cancelled_speculation_never_runs_tool():
     calls = []
 

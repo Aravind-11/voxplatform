@@ -219,6 +219,7 @@ class Runtime:
         specs = toolmod.resolve_library(cfg.get("tools", []),
                                         lambda n: (self.store.get_tool(tid, n) or {}).get("spec"))
         schemas, fns = toolmod.build(specs, ctx, self.http)
+        fillers = toolmod.filler_texts(specs)
         rec_dir = self.record_dir or os.environ.get("VOX_RECORD_DIR", "")
         recorder = None
         on_utt = None
@@ -264,6 +265,7 @@ class Runtime:
                              greeting=(RESUME_PHRASE.get(lang, RESUME_PHRASE["en"]) if resumed
                                        else varmod.render(str(cfg.get("greeting") or ""), values)),
                              error_phrase=ERROR_PHRASE.get(lang, ERROR_PHRASE["en"]),
+                             tool_fillers=fillers,
                              turn=TurnConfig(end_ms=float(os.environ.get("VOX_END_MS", "640")),
                                              eot_threshold=float(os.environ.get("VOX_EOT_THRESHOLD", "0.8")),
                                              patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000"))))

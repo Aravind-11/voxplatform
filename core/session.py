@@ -85,6 +85,9 @@ class SessionConfig:
     tools_schema: list[dict] = field(default_factory=list)
     greeting: str = ""                 # spoken by the agent as soon as the call connects (no model call)
     error_phrase: str = "Sorry, could you say that again?"  # spoken once if a committed reply fails
+    filler_text: str = "One moment, let me check that."  # spoken when a tool call outlives filler_delay_s
+    filler_delay_s: float = 0.7
+    tool_fillers: dict[str, str] = field(default_factory=dict)  # per-tool line; overrides filler_text. Empty disables.
     turn: TurnConfig = field(default_factory=TurnConfig)
     max_context_tokens: int = 6000     # model context budget; the stored transcript is not trimmed to this
     history_tail: int = 6              # recent messages kept verbatim when the budget replaces older turns
@@ -109,6 +112,8 @@ class _Generation:
         self.fallback_spoken = False   # synthesis of the fallback sentinel has started
         self.sentences: list[str] = [] # model sentences put on textq, in order
         self.uncommitted_tts_failed = False  # speculative TTS died; later ordinary sentences will not play
+        self.speak_lock = asyncio.Lock()  # filler audio and sentence audio must not synthesize at the same time
+        self.holding_sentence = False     # dequeued by _synth but not spoken yet (off textq during lookahead)
         self.after: Optional[ToolResult] = None   # deferred call action requested by a tool this reply
 
 
@@ -386,7 +391,15 @@ class Session:
                 for c in calls:
                     self._emit("tool_call", name=c.name, arguments=c.arguments)
                     t_tool = self.clock()
-                    out = await self._run_tool(c, gen)
+                    done = asyncio.Event()
+                    # Not Session.say: that would replace self._gen and drop this reply.
+                    filler = asyncio.create_task(self._tool_filler(gen, c.name, done))
+                    try:
+                        out = await self._run_tool(c, gen)
+                    finally:
+                        done.set()
+                        filler.cancel()
+                        await asyncio.gather(filler, return_exceptions=True)
                     self._emit("tool_result", name=c.name, ms=self.clock() - t_tool, chars=len(out))
                     followups.append({"role": "tool", "tool_call_id": c.id, "content": out})
         except asyncio.CancelledError:
@@ -436,30 +449,36 @@ class Session:
                 if item is None:
                     return
                 is_fallback = item is _FALLBACK
-                if is_fallback:
-                    if gen.fallback_spoken or gen.cancelled:
-                        continue
-                    await gen.commit.wait()
-                    if gen.cancelled or not gen.committed or gen.fallback_spoken:
-                        continue
-                    gen.fallback_used = True
-                    gen.fallback_spoken = True
-                    text = self.cfg.error_phrase
-                else:
-                    text = item
-                    if idx > 0:
-                        await gen.commit.wait()
-                        while self.tracker.buffered_ms() + gen.pending_ms > self.cfg.tts_lookahead_ms:
-                            await asyncio.sleep(self.cfg.tts_poll_s)
+                # Off textq until _speak returns, including the commit and lookahead waits.
+                # A tool filler must see this or it takes speak_lock in that gap and plays first.
+                gen.holding_sentence = True
                 try:
-                    await self._speak(gen, text)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    await self._on_tts_failure(gen, is_fallback, e)
-                    return
-                if not is_fallback:
-                    idx += 1
+                    if is_fallback:
+                        if gen.fallback_spoken or gen.cancelled:
+                            continue
+                        await gen.commit.wait()
+                        if gen.cancelled or not gen.committed or gen.fallback_spoken:
+                            continue
+                        gen.fallback_used = True
+                        gen.fallback_spoken = True
+                        text = self.cfg.error_phrase
+                    else:
+                        text = item
+                        if idx > 0:
+                            await gen.commit.wait()
+                            while self.tracker.buffered_ms() + gen.pending_ms > self.cfg.tts_lookahead_ms:
+                                await asyncio.sleep(self.cfg.tts_poll_s)
+                    try:
+                        await self._speak(gen, text)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        await self._on_tts_failure(gen, is_fallback, e)
+                        return
+                    if not is_fallback:
+                        idx += 1
+                finally:
+                    gen.holding_sentence = False
         except asyncio.CancelledError:
             raise
         finally:
@@ -562,14 +581,33 @@ class Session:
         if a is not None:
             self._spawn_action(a)
 
+    async def _tool_filler(self, gen: _Generation, name: str, done: asyncio.Event) -> None:
+        """Speak a short line if the tool is still running after filler_delay_s and every sentence
+        already queued for this reply has been synthesized. Blank text disables it."""
+        text = self.cfg.tool_fillers.get(name, self.cfg.filler_text)
+        if not str(text).strip() or gen.cancelled:
+            return
+        await asyncio.sleep(self.cfg.filler_delay_s)
+        # textq is empty while _synth holds the next sentence for lookahead, so the flag is required.
+        # Do not take speak_lock here: _speak takes it, and the lock is not reentrant.
+        while gen.holding_sentence or not gen.textq.empty():
+            if done.is_set() or gen.cancelled:
+                return
+            await asyncio.sleep(self.cfg.tts_poll_s)
+        if done.is_set() or gen.cancelled:
+            return
+        await self._speak(gen, str(text))
+
     async def _speak(self, gen: _Generation, text: str) -> None:
-        t_tts = self.clock()
-        parts = [p async for p in self.tts.synthesize(text)]
-        self._emit("tts_done", ms=self.clock() - t_tts, chars=len(text))
-        pcm = np.concatenate(parts) if parts else np.zeros(0, np.int16)
-        pcm = resample(pcm, self.tts.sample_rate, self.cfg.out_rate)
-        gen.pending_ms += pcm_duration_ms(len(pcm), self.cfg.out_rate)
-        await gen.outbox.put((text, pcm))
+        # Held by both the synth loop and a tool filler so their audio cannot interleave.
+        async with gen.speak_lock:
+            t_tts = self.clock()
+            parts = [p async for p in self.tts.synthesize(text)]
+            self._emit("tts_done", ms=self.clock() - t_tts, chars=len(text))
+            pcm = np.concatenate(parts) if parts else np.zeros(0, np.int16)
+            pcm = resample(pcm, self.tts.sample_rate, self.cfg.out_rate)
+            gen.pending_ms += pcm_duration_ms(len(pcm), self.cfg.out_rate)
+            await gen.outbox.put((text, pcm))
 
     async def _drain(self, gen: _Generation) -> None:
         await gen.commit.wait()

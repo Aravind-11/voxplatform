@@ -3,9 +3,9 @@
 SIP/RTP is handled by Asterisk (a separate process, see deploy/sip/); Asterisk streams each call's audio to this server
 over one plain TCP connection using the AudioSocket protocol (Asterisk docs: AudioSocket, `AudioSocket(uuid,host:port)`).
 Wire format: every message is  kind (1 byte) | length (2 bytes, big endian) | payload.
-  0x01 UUID (16 bytes, first message)   0x10 audio (signed 16-bit little-endian PCM, mono, 20 ms frames)
+  0x01 UUID (16 bytes, first message)   0x10 audio (signed 16-bit little-endian PCM, mono, 8 kHz, 20 ms = 320 bytes)
+  0x12 audio (the same PCM at 16 kHz, 20 ms = 640 bytes; Asterisk plays 0x10 as 8 kHz)
   0x03 DTMF (1 ASCII char)              0x00 hangup (either direction)      0xff error (1 byte code)
-  8 kHz (G.711) is 320 bytes per frame; 16 kHz (G.722 / slin16, VOX_AUDIOSOCKET_RATE) is 640 bytes.
 Asterisk plays audio at the rate it arrives, so this transport PACES outbound frames at real time (20 ms each) from its
 own queue; that queue is what `clear()` empties on an interruption.
 """
@@ -23,6 +23,7 @@ from core.audio import StreamResampler
 from core.session import FRAME_SAMPLES, Session
 
 KIND_HANGUP, KIND_UUID, KIND_DTMF, KIND_AUDIO, KIND_ERROR = 0x00, 0x01, 0x03, 0x10, 0xFF
+KIND_SLIN16 = 0x12         # 16 kHz signed-linear; 0x10 is 8 kHz on every Asterisk that speaks AudioSocket
 FRAME_BYTES = 320          # 20 ms of 8 kHz 16-bit mono; 16 kHz uses sample_rate // 50 * 2
 FRAME_S = 0.02
 DTMF_IDLE_S = 2.0
@@ -103,7 +104,7 @@ class AudioSocketTransport:
             nxt += FRAME_S
             if self._closed:
                 return
-            self.writer.write(pack(KIND_AUDIO, frame))
+            self.writer.write(pack(self._audio_kind(), frame))
             await self.writer.drain()
 
     def _on_dtmf(self, digit: str) -> None:
@@ -155,8 +156,8 @@ class AudioSocketTransport:
             await self.session.start()
             while True:
                 kind, payload = await read_message(self.reader)
-                if kind == KIND_AUDIO:
-                    await self._on_audio(payload)
+                if kind in (KIND_AUDIO, KIND_SLIN16):
+                    await self._on_audio(payload, kind)
                 elif kind == KIND_DTMF:
                     self._on_dtmf(payload.decode("ascii", "ignore")[:1])
                 elif kind == KIND_HANGUP:
@@ -174,9 +175,19 @@ class AudioSocketTransport:
                 await self.session.close()
             await self._close()
 
-    async def _on_audio(self, payload: bytes) -> None:
-        pcm8 = np.frombuffer(payload[: len(payload) - len(payload) % 2], dtype="<i2")
-        self._buf = np.concatenate([self._buf, self._rs.push(pcm8)])
+    def _audio_kind(self) -> int:
+        # 16 kHz PCM tagged 0x10 is played at half speed. 8 kHz stays 0x10 / 320 bytes.
+        return KIND_SLIN16 if self.out_rate == 16000 else KIND_AUDIO
+
+    async def _on_audio(self, payload: bytes, kind: int = KIND_AUDIO) -> None:
+        pcm = np.frombuffer(payload[: len(payload) - len(payload) % 2], dtype="<i2")
+        # 0x12 is already 16 kHz, which is what the session consumes. Running it through the
+        # configured-rate resampler would treat those samples as 8 kHz when out_rate is 8000.
+        if kind == KIND_SLIN16:
+            samples = pcm
+        else:
+            samples = self._rs.push(pcm)
+        self._buf = np.concatenate([self._buf, samples])
         while len(self._buf) >= FRAME_SAMPLES:
             frame, self._buf = self._buf[:FRAME_SAMPLES], self._buf[FRAME_SAMPLES:]
             await self.session.feed(frame)  # type: ignore[union-attr]

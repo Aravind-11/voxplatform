@@ -162,9 +162,53 @@ async def test_wideband_audiosocket_uses_640_byte_frames_and_does_not_resample()
     assert tr.out_rate == 16000
     await tr.send_audio(np.full(16000, 700, dtype=np.int16), 16000)       # 1 s = 50 frames of 640 bytes
     kind, got = await asyncio.wait_for(A.read_message(r), 1)
-    assert kind == A.KIND_AUDIO and len(got) == 640
+    assert kind == 0x12 and len(got) == 640
     await tr.end()
     srv.close()
+
+
+async def test_slin16_kind_is_wideband_and_outbound_16khz_is_not_tagged_8khz():
+    """Kind 0x12 is 16 kHz slin. Asterisk plays kind 0x10 as 8 kHz, so a 16 kHz reply must not use it."""
+    sess = StubSession()
+
+    async def factory(tr, custom):
+        return sess
+
+    box = {}
+
+    async def handler(r, w):
+        tr = A.AudioSocketTransport(r, w, factory, sample_rate=16000)
+        box["tr"] = tr
+        await tr.run()
+
+    srv, port = await serve(handler)
+    r, w = await asyncio.open_connection("127.0.0.1", port)
+    w.write(A.pack(A.KIND_UUID, uuid.uuid4().bytes))
+    payload = np.full(320, 1000, dtype="<i2").tobytes()
+    assert len(payload) == 640
+    w.write(A.pack(0x12, payload) + A.pack(0x12, payload))
+    await w.drain()
+    for _ in range(100):
+        if sess.frames:
+            break
+        await asyncio.sleep(0.01)
+    assert sess.frames, "kind 0x12 was ignored, so the 16 kHz caller audio never reached the session"
+    assert int(sess.frames[0][0]) == 1000 and len(sess.frames[0]) == 512
+    tr = box["tr"]
+    await tr.send_audio(np.full(640, 700, dtype=np.int16), 16000)
+    kind, got = await asyncio.wait_for(A.read_message(r), 1)
+    assert kind == 0x12 and len(got) == 640
+    await tr.end()
+    srv.close()
+
+
+def test_dialplan_requests_slin16_on_the_audiosocket_channel():
+    """AudioSocket() forces 8 kHz slin and ignores CHANNEL(audioreadformat). The channel driver does not."""
+    text = open("deploy/sip/extensions.conf", encoding="utf-8").read()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith(";"))
+    assert "Dial(AudioSocket/api1:9092/${UUID()}/c(slin16))" in code
+    assert "AudioSocket(" not in code
+    assert "audioreadformat" not in code
 
 
 def test_full_sip_call_through_the_app_creates_a_call_speaks_back_and_hangs_up():

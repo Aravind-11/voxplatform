@@ -425,6 +425,81 @@ async def test_runtime_readback_uses_the_assistant_history():
     assert booked["booked"] is True
 
 
+async def test_readback_ignores_an_older_assistant_message_and_the_caller_transcript():
+    """Only the latest finished assistant message counts, and a later call still has the slot."""
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    tid = store.create_tenant("t")
+
+    class T:
+        out_rate = 8000
+
+        async def send_audio(self, pcm, rate=8000):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            return None
+
+    call = store.create_call(tid, None, "webSocket",
+                             {"systemPrompt": "Be brief.", "confirmSlots": True, "tools": ["book_slot"]}, {})
+    sess = rt.build_session(call, T())
+    assert sess._gen is None
+    book = {"day": "tuesday", "time": "11:00"}
+    refusal = {"executed": False, "next_step": toolmod._READBACK_STEP, "details": dict(book)}
+    sess.history += [{"role": "assistant", "content": "Tuesday at 11:00."},
+                     {"role": "assistant", "content": "Monday works."}]
+    assert await sess.tools["book_slot"](dict(book)) == refusal
+    del sess.history[1:]
+    sess.history += [{"role": "assistant", "content": "Monday works."},
+                     {"role": "user", "content": "Tuesday at 11:00."}]
+    assert await sess.tools["book_slot"](dict(book)) == refusal
+    sess.history.append({"role": "assistant", "content": "Tuesday at 11:00."})
+    assert await sess.tools["book_slot"](dict(book)) == {"booked": True, "day": "tuesday", "time": "11:00"}
+
+
+async def test_resolved_library_confirm_turns_the_readback_guard_on(allow_private):
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+    sent = []
+
+    def handler(req):
+        sent.append(str(req.url))
+        return httpx.Response(200, json={"ok": 1})
+
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    rt.http = client(handler)
+    tid = store.create_tenant("t")
+    spec = good(confirm=True)
+    store.put_tool(tid, spec["name"], spec)
+    call = store.create_call(tid, None, "webSocket",
+                             {"systemPrompt": "Be brief.", "tools": [{"library": spec["name"]}]}, {})
+
+    class T:
+        out_rate = 8000
+
+        async def send_audio(self, pcm, rate=8000):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            return None
+
+    sess = rt.build_session(call, T())
+    assert toolmod.READBACK_INSTRUCTION in sess.history[0]["content"]
+    out = await sess.tools[spec["name"]]({"order_id": "ABC-123"})
+    assert out["executed"] is False and out["next_step"] == toolmod._READBACK_STEP and sent == []
+
+
 @pytest.mark.parametrize("said,value", [
     ("9:10 am", "10 am"),
     ("9:10:00", "10:00"),
@@ -477,6 +552,30 @@ async def test_slot_guard_refuses_plain_book_slot_when_the_readback_lookup_raise
         raise RuntimeError("history unavailable")
 
     ctx.last_assistant_text = lookup
+    _, fns = toolmod.build(["book_slot"], ctx, None)
+    out = await fns["book_slot"]({"day": "tuesday", "time": "11:00"})
+    assert out == {"executed": False, "next_step": toolmod._READBACK_STEP,
+                   "details": {"day": "tuesday", "time": "11:00"}}
+    ctx.last_assistant_text = "Tuesday at 11:00"
+    assert await fns["book_slot"]({"day": "tuesday", "time": "11:00"}) == {
+        "booked": True, "day": "tuesday", "time": "11:00"}
+
+
+async def test_short_slot_need_not_appear_in_the_read_back():
+    # "11" is under the length cutoff and the characters 11 are not in the read-back.
+    ctx = toolmod.CallContext()
+    ctx.guard_slots = True
+    ctx.last_assistant_text = "Tuesday."
+    _, fns = toolmod.build(["book_slot"], ctx, None)
+    assert await fns["book_slot"]({"day": "tuesday", "time": "11"}) == {
+        "booked": True, "day": "tuesday", "time": "11:00"}
+
+
+async def test_slot_guard_requires_every_long_string_not_only_the_last():
+    # 11:00 was said; tuesday was not. Checking only the last argument would book.
+    ctx = toolmod.CallContext()
+    ctx.guard_slots = True
+    ctx.last_assistant_text = "The time is 11:00."
     _, fns = toolmod.build(["book_slot"], ctx, None)
     out = await fns["book_slot"]({"day": "tuesday", "time": "11:00"})
     assert out == {"executed": False, "next_step": toolmod._READBACK_STEP,

@@ -145,6 +145,7 @@ async def test_slow_add_message_does_not_stall_the_loop_during_a_logged_turn():
 
 
 async def test_to_thread_still_runs_when_the_task_is_already_cancelled():
+    """The worker still returns its value, and the caller's next await stays cancelled."""
     ran = {}
 
     async def body():
@@ -155,15 +156,14 @@ async def test_to_thread_still_runs_when_the_task_is_already_cancelled():
             ran["ok"] = True
             return 7
 
-        return await to_thread(slow)
+        ran["got"] = await to_thread(slow)
+        await asyncio.sleep(0)
+        ran["after"] = True
 
     task = asyncio.create_task(body())
-    try:
-        got = await task
-    except asyncio.CancelledError:
-        got = None
-    assert ran.get("ok") is True
-    assert got in (7, None)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert ran.get("ok") is True and ran.get("got") == 7 and "after" not in ran
 
 
 def test_sqlite_programming_mistakes_are_not_retried():
@@ -231,6 +231,72 @@ def test_postgres_pool_checks_out_a_connection(pg_mod):
     assert pool.checkouts == 1
     store.ping()
     assert pool.conn.executed == "SELECT 1" and pool.checkouts == 2
+
+
+def test_postgres_pool_size_follows_vox_db_pool_and_import_failure_is_one_connection(monkeypatch):
+    """psycopg_pool gets min 1 and max VOX_DB_POOL (default 8). A failed import keeps a single connection."""
+    import builtins
+
+    rows = types.ModuleType("psycopg.rows")
+    rows.dict_row = object()
+    pg = types.ModuleType("psycopg")
+    pg.rows = rows
+    connected: list = []
+
+    def connect(dsn, **kwargs):
+        conn = types.SimpleNamespace(dsn=dsn, kwargs=kwargs, closed=False)
+        connected.append(conn)
+        return conn
+
+    pg.connect = connect
+    for name in ("psycopg", "psycopg.rows", "psycopg.errors", "psycopg_pool"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setitem(sys.modules, "psycopg", pg)
+    monkeypatch.setitem(sys.modules, "psycopg.rows", rows)
+
+    constructed: list = []
+
+    class ConnectionPool:
+        def __init__(self, *args, **kwargs):
+            self.args, self.kwargs = args, kwargs
+            constructed.append(self)
+
+        def close(self):
+            self.closed = True
+
+    pool_mod = types.ModuleType("psycopg_pool")
+    pool_mod.ConnectionPool = ConnectionPool
+    monkeypatch.setitem(sys.modules, "psycopg_pool", pool_mod)
+
+    store = Store(":memory:")
+    store.db.close()
+    store.pg = True
+    store.dsn = "postgresql://example/db"
+    store.pool = None
+    monkeypatch.delenv("VOX_DB_POOL", raising=False)
+    store._open_postgres()
+    assert connected == [] and len(constructed) == 1
+    assert store.pool is constructed[0] and store.db is store.pool
+    assert constructed[0].args == (store.dsn,)
+    assert constructed[0].kwargs["min_size"] == 1 and constructed[0].kwargs["max_size"] == 8
+
+    monkeypatch.setenv("VOX_DB_POOL", "12")
+    store._open_postgres()
+    assert connected == [] and len(constructed) == 2
+    assert constructed[1].kwargs["min_size"] == 1 and constructed[1].kwargs["max_size"] == 12
+
+    real_import = builtins.__import__
+
+    def no_pool(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "psycopg_pool":
+            raise ImportError("no pool")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", no_pool)
+    monkeypatch.delitem(sys.modules, "psycopg_pool", raising=False)
+    store._open_postgres()
+    assert store.pool is None and len(connected) == 1
+    assert connected[0] is store.db and connected[0].dsn == store.dsn
 
 
 def test_operational_error_reconnects_once_with_the_same_dsn(pg_mod, monkeypatch):
@@ -1247,6 +1313,87 @@ async def test_slow_get_tool_create_call_and_ping_do_not_stall_the_loop():
         store.get_tool, store.create_call, store.ping = real_tool, real_create, real_ping
         release = threading.Event()
         release.set()
+        try:
+            rt.message_log.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def test_admit_reads_the_tenant_off_the_loop_and_starts_the_webhook_on_it():
+    """get_tenant must not block the loop, and call.started is spawned on that loop."""
+    from api import security
+    from api.app import create_app
+    from tests.unit.test_api import SETTINGS
+
+    store = Store(":memory:")
+    rt = Runtime(_LLM(), lambda voice: _TTS(), _VAD, store)
+    hits: list[bool] = []
+    spawned = threading.Event()
+
+    class D:
+        def spawn(self, url, secret, event):
+            if event.get("type") != "call.started":
+                return
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                hits.append(False)
+            else:
+                hits.append(True)
+            spawned.set()
+
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), D(), SETTINGS)
+    tid = store.create_tenant("a")
+    store.set_webhook(tid, "https://hook.example.com/x", "sec")
+    assert store.get_tenant(tid)["webhook_url"]
+    call = store.create_call(tid, None, "webSocket", {"systemPrompt": "p", "greeting": ""}, {})
+    started, done = threading.Event(), {}
+    real_get_tenant = store.get_tenant
+
+    def get_tenant(tenant_id):
+        done["on_loop"] = _on_loop()
+        started.set()
+        time.sleep(0.4)
+        done["t"] = time.monotonic()
+        return real_get_tenant(tenant_id)
+
+    store.get_tenant = get_tenant
+    send_q: asyncio.Queue = asyncio.Queue()
+    recv_q: asyncio.Queue = asyncio.Queue()
+
+    async def receive():
+        return await send_q.get()
+
+    async def send(message):
+        await recv_q.put(message)
+
+    scope = {
+        "type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1", "scheme": "https",
+        "server": ("vox.example.com", 443), "client": ("127.0.0.1", 123),
+        "path": f"/ws/calls/{call['id']}", "raw_path": f"/ws/calls/{call['id']}".encode(),
+        "query_string": f"token={call['join_token']}".encode(), "headers": [], "root_path": "", "state": {},
+    }
+    ws = asyncio.create_task(app(scope, receive, send))
+    try:
+        await send_q.put({"type": "websocket.connect"})
+        assert await asyncio.to_thread(started.wait, 2)
+        assert done.get("on_loop") is False
+        t0 = time.monotonic()
+        await asyncio.sleep(0.05)
+        assert time.monotonic() - t0 < 0.25
+        assert "t" not in done  # get_tenant is still in the worker; this sleep was not stuck behind it
+        assert await asyncio.to_thread(spawned.wait, 2)
+        assert hits == [True]
+        await send_q.put({"type": "websocket.disconnect"})
+        await asyncio.wait_for(ws, 2)
+    finally:
+        store.get_tenant = real_get_tenant
+        if not ws.done():
+            await send_q.put({"type": "websocket.disconnect"})
+            try:
+                await asyncio.wait_for(ws, 2)
+            except Exception:  # noqa: BLE001
+                ws.cancel()
         try:
             rt.message_log.close()
         except Exception:  # noqa: BLE001

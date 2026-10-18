@@ -114,11 +114,17 @@ def test_failed_warm_transfer_keeps_history_and_the_apology():
 
 
 def test_tools_doc_does_not_say_a_failed_warm_transfer_starts_fresh():
-    """docs/TOOLS.md is what an integrator follows. It must describe the returned session, not a blank one."""
-    text = (pathlib.Path(__file__).resolve().parents[2] / "docs" / "TOOLS.md").read_text()
+    """docs/TOOLS.md and the STATUS.md warm-transfer row are what an integrator follows.
+    They must describe the returned session, not a blank one."""
+    root = pathlib.Path(__file__).resolve().parents[2]
+    text = (root / "docs" / "TOOLS.md").read_text()
     line = next(ln for ln in text.splitlines() if '"mode":"warm"' in ln)
     assert "fresh conversation" not in line
     assert "earlier transcript" in line and "not-available apology" in line
+    row = next(ln for ln in (root / "docs" / "STATUS.md").read_text().splitlines()
+               if ln.startswith("| Warm transfer"))
+    assert "fresh conversation" not in row
+    assert "keeps the earlier transcript" in row and "not-available apology" in row
 
 
 def test_stream_loss_after_a_failed_transfer_is_not_labeled_transfer():

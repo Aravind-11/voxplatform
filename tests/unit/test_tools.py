@@ -55,11 +55,15 @@ def test_filler_text_is_stored_and_hidden_from_the_model():
     assert "fillerText" not in http_tools.validate(good())
     assert toolmod.filler_texts([good(fillerText="Checking that order.")]) == {"lookup_order": "Checking that order."}
     # Explicit blank disables that tool. Omitting the field still means the session default.
+    # JSON null is the same disable, not a rejected tool.
     assert http_tools.validate(good(fillerText=""))["fillerText"] == ""
     assert http_tools.validate(good(fillerText="   "))["fillerText"] == ""
+    assert http_tools.validate(good(fillerText=None))["fillerText"] == ""
     assert toolmod.filler_texts([good(fillerText="")]) == {"lookup_order": ""}
     assert toolmod.filler_texts([good(fillerText="  ")]) == {"lookup_order": ""}
+    assert toolmod.filler_texts([good(fillerText=None)]) == {"lookup_order": ""}
     assert toolmod.filler_texts([good()]) == {}
+    assert http_tools.validate(good(fillerText="x" * 200))["fillerText"] == "x" * 200
     with pytest.raises(ToolConfigError):
         http_tools.validate(good(fillerText="x" * 201))
     with pytest.raises(ToolConfigError):

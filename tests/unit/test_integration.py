@@ -7,6 +7,7 @@ import pytest
 from api import http_tools, openapi_import, variables
 from api.runtime import Runtime
 from api.store import Store
+from core.session import SessionConfig
 from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD, make, silence, speech, tenant
 from tests.unit.test_tools import Ctx, client
 
@@ -68,6 +69,7 @@ def test_filler_text_on_a_tool_spec_is_passed_to_the_session():
     sess = rt.build_session(call, T())
     assert sess.cfg.tool_fillers == {"lookup_order": "Checking that order."}
     assert sess.cfg.filler_text == "One moment, let me check that."
+    assert SessionConfig().filler_delay_s == 0.7 and sess.cfg.filler_delay_s == 0.7
 
 
 def test_inbound_phone_calls_get_caller_number_and_empty_unknowns():

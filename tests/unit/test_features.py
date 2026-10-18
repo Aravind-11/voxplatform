@@ -1115,6 +1115,120 @@ def test_sip_machine_hangup_retries_unless_the_delete_finished(monkeypatch):
     assert store.get_call_any(cid)["status"] == "ended"
 
 
+async def test_overlapping_machine_hangup_waits_for_the_delete(monkeypatch):
+    """A second /sip/amd during DELETE must not be told the hang-up finished. Both wait: 502 when the
+    DELETE times out, the row is created again, and a later AMD deletes once. Outbound waits too and
+    returns the placed call as created instead of 502 or ended."""
+    import asyncio
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
+    deletes = []
+    gate = {"mode": "block", "release": asyncio.Event(), "started": asyncio.Event(), "entered": asyncio.Event()}
+
+    async def handler(req: httpx.Request):
+        if req.method != "DELETE":
+            if gate["mode"] == "outbound":
+                args = str(req.url.params.get("appArgs") or "")
+                gate["cid"] = args.split(",", 1)[1] if args.startswith("amd,") else ""
+                gate["entered"].set()
+                await gate["started"].wait()
+                return httpx.Response(200, json={"id": str(req.url.params.get("channelId") or "chan-out")})
+            return httpx.Response(200, json={"id": "chan-9"})
+        deletes.append(str(req.url))
+        if gate["mode"] in ("block", "outbound"):
+            gate["started"].set()
+            await gate["release"].wait()
+            raise httpx.ReadTimeout("timed out", request=req)
+        return httpx.Response(204)
+
+    c, store, _rt = make_outbound(handler, sip_token="s3cret")
+    app = c.app
+    row = store.create_call("t1", None, "sip", {}, {"voicemail": "x", "callSid": "chan-9"})
+    token = {"X-Vox-Sip-Token": "s3cret"}
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        async def post_amd(call_id: str):
+            return await client.post(f"/sip/amd/{call_id}", data={"AnsweredBy": "machine_end_beep"}, headers=token)
+
+        first = asyncio.create_task(post_amd(row["id"]))
+        await asyncio.wait_for(gate["started"].wait(), timeout=2)
+        assert len(deletes) == 1 and deletes[0].endswith("/ari/channels/chan-9")
+        assert app.state.sip_machine_done.get(row["id"]) != "hangup"
+        held = store.get_call_any(row["id"])
+        assert held["status"] == "ended" and held["end_reason"] == "machine_end_beep"
+        assert store.find_sip_call(call_sid="chan-9") is None
+        second = asyncio.create_task(post_amd(row["id"]))
+        joined = False
+        for _ in range(100):
+            if second.done():
+                break
+            inflight = app.state.sip_machine_wait.get(row["id"]) or {}
+            if inflight.get("waiters", 0) >= 1:
+                joined = True
+                break
+            await asyncio.sleep(0.01)
+        assert joined and not second.done()
+        assert len(deletes) == 1
+        gate["release"].set()
+        r1, r2 = await first, await second
+        assert r1.status_code == 502, r1.text
+        assert r2.status_code == 502, r2.text
+        assert r2.json().get("action") != "hangup"
+        settled = store.get_call_any(row["id"])
+        assert settled["status"] == "created" and not settled.get("end_reason")
+        assert settled["metadata"]["answeredBy"] == "machine_end_beep"
+        assert app.state.sip_machine_done.get(row["id"]) is None
+        assert row["id"] not in app.state.sip_machine_wait
+        gate["mode"] = "ok"
+        later = await post_amd(row["id"])
+        assert later.status_code == 200 and later.json()["action"] == "hangup"
+        assert len(deletes) == 2 and deletes[1].endswith("/ari/channels/chan-9")
+        assert store.get_call_any(row["id"])["status"] == "ended"
+
+        gate["mode"] = "outbound"
+        gate["release"] = asyncio.Event()
+        gate["started"] = asyncio.Event()
+        gate["entered"] = asyncio.Event()
+        tres = await client.post("/admin/tenants", json={"name": "a"}, headers={"X-Admin-Key": "adm"})
+        assert tres.status_code == 200, tres.text
+        key = tres.json()["apiKey"]
+        agent = (await client.post("/v1/agents", json={"name": "a"}, headers={"X-API-Key": key})).json()
+        out_task = asyncio.create_task(client.post(
+            "/v1/calls/outbound",
+            json={"agentId": agent["id"], "to": "+15552223333", "channel": "sip", "voicemailMessage": "leave this"},
+            headers={"X-API-Key": key}))
+        await asyncio.wait_for(gate["entered"].wait(), timeout=2)
+        cid = gate["cid"]
+        amd_task = asyncio.create_task(post_amd(cid))
+        await asyncio.wait_for(gate["started"].wait(), timeout=2)
+        early_done = app.state.sip_machine_done.get(cid)
+        joined = False
+        early_out = False
+        for _ in range(100):
+            early_done = app.state.sip_machine_done.get(cid)
+            if early_done == "hangup" or out_task.done():
+                early_out = out_task.done()
+                break
+            inflight = app.state.sip_machine_wait.get(cid) or {}
+            if inflight.get("waiters", 0) >= 1:
+                joined = True
+                break
+            await asyncio.sleep(0.01)
+        n = len(deletes)
+        gate["release"].set()
+        amd_res, out_res = await amd_task, await out_task
+        assert early_done != "hangup" and not early_out and joined
+        assert amd_res.status_code == 502, amd_res.text
+        assert out_res.status_code == 200, out_res.text
+        body = out_res.json()
+        assert body["status"] == "created" and not body.get("end_reason")
+        assert body["metadata"]["answeredBy"] == "machine_end_beep"
+        # The timed-out DELETE is the only one. Outbound must not start a second attempt or report ended.
+        assert len(deletes) == n == 3 and deletes[-1].endswith("/ari/channels/" + body["callSid"])
+        assert store.get_call_any(cid)["status"] == "created"
+
+
 def test_empty_answered_by_does_not_erase_machine_end(monkeypatch):
     """An empty or whitespace AnsweredBy must not clear machine_end, including one posted while originate is in flight.
     The originated channel is still deleted. A later non-empty value may replace the stored one."""

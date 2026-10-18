@@ -314,7 +314,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     app.state.draining = False
     app.state.sip_by_uuid = {}       # AudioSocket UUID -> Asterisk channel uniqueid (POST /sip/bind)
     app.state.sip_by_channel = {}    # Asterisk channel uniqueid -> call id
-    app.state.sip_machine_done = {}  # call id -> "voicemail" | "hangup" once a machine result is acted on
+    app.state.sip_machine_done = {}  # call id -> "voicemail" | "hangup" once that action has finished
+    app.state.sip_machine_wait = {}  # call id -> in-flight hangup shared by concurrent /sip/amd callers
 
     @app.get("/healthz")
     async def healthz():
@@ -998,10 +999,18 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     async def sip_machine(call_id: str) -> str:
         """Act on a stored machine_end result once. A live session is spoken to and hung up; otherwise the ARI
-        channel (metadata callSid, never the AudioSocket UUID) is deleted so the originated call does not stay up."""
+        channel (metadata callSid, never the AudioSocket UUID) is deleted so the originated call does not stay up.
+        A hang-up is finished only after DELETE returns 2xx or 404. Concurrent callers wait on that attempt."""
         done = app.state.sip_machine_done.get(call_id)
         if done:
             return done
+        inflight = app.state.sip_machine_wait.get(call_id)
+        if inflight is not None:
+            inflight["waiters"] += 1
+            await inflight["event"].wait()
+            if inflight.get("error"):
+                raise HTTPException(502, inflight["error"])
+            return inflight.get("result") or ""
         cur = store.get_call_any(call_id)
         if not cur:
             return ""
@@ -1034,24 +1043,36 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not isinstance(ctl, AsteriskCallControl):
             return ""
         # Mark ended before the DELETE await so a concurrent AudioSocket cannot adopt this row.
-        # Only a finished DELETE (2xx, or 404 already gone) keeps that mark. A timeout, connect
-        # error, or HTTP 5xx clears it and reopens the row this attempt ended, so a later
-        # /sip/amd deletes the channel again instead of treating the hang-up as done.
-        app.state.sip_machine_done[call_id] = "hangup"
+        # Do not publish "hangup" until DELETE returns 2xx or 404. A timeout, connect error, or
+        # HTTP 5xx drops the in-flight mark and reopens the row this attempt ended.
+        import asyncio
+        inflight = {"event": asyncio.Event(), "result": "", "error": "", "waiters": 0}
+        app.state.sip_machine_wait[call_id] = inflight
         reason = answered[:80]
         we_ended = cur["status"] == "created"
-        if we_ended:
-            store.update_call(call_id, status="ended", ended=time.time(), end_reason=reason)
         try:
-            await ctl.hangup(channel)
-        except (RuntimeError, httpx.TransportError) as e:
-            app.state.sip_machine_done.pop(call_id, None)
             if we_ended:
-                latest = store.get_call_any(call_id)
-                if latest and latest.get("status") == "ended" and (latest.get("end_reason") or "") == reason:
-                    store.update_call(call_id, status="created", ended=None, end_reason=None)
-            raise HTTPException(502, str(e) or type(e).__name__) from e
-        return "hangup"
+                store.update_call(call_id, status="ended", ended=time.time(), end_reason=reason)
+            try:
+                await ctl.hangup(channel)
+            except (RuntimeError, httpx.TransportError) as e:
+                if we_ended:
+                    latest = store.get_call_any(call_id)
+                    if latest and latest.get("status") == "ended" and (latest.get("end_reason") or "") == reason:
+                        store.update_call(call_id, status="created", ended=None, end_reason=None)
+                inflight["error"] = str(e) or type(e).__name__
+                inflight["event"].set()
+                raise HTTPException(502, inflight["error"]) from e
+            app.state.sip_machine_done[call_id] = "hangup"
+            inflight["result"] = "hangup"
+            inflight["event"].set()
+            return "hangup"
+        finally:
+            if not inflight["event"].is_set():
+                inflight["error"] = inflight.get("error") or "machine hangup failed"
+                inflight["event"].set()
+            if app.state.sip_machine_wait.get(call_id) is inflight:
+                app.state.sip_machine_wait.pop(call_id, None)
 
     @app.post("/v1/calls/outbound")
     async def outbound(body: OutboundIn, t: dict = Depends(tenant_write)):
@@ -1158,7 +1179,12 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             if sid:
                 store.merge_call_metadata(call["id"], {"callSid": sid})
                 app.state.sip_by_channel[sid] = call["id"]
-                await sip_machine(call["id"])
+                try:
+                    await sip_machine(call["id"])
+                except HTTPException:
+                    # The originate succeeded. A machine DELETE that timed out leaves the row created;
+                    # 502 here would look like Asterisk never placed the call.
+                    pass
         else:
             store.update_call(call["id"], metadata={**meta, "callSid": sid})
         log(t, "call.outbound", call["id"], to=body.to)

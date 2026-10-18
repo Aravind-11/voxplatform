@@ -100,9 +100,17 @@ class Runtime:
     live: dict = field(default_factory=dict)       # call_id -> (Session, transport): lets webhooks reach a live call
     recorders: dict = field(default_factory=dict)  # call_id -> CallRecorder
     vad_scheduler: VADScheduler = field(default_factory=VADScheduler)  # one scheduler per process (one Runtime)
+    bus: object = None                             # CallBus; create_app sets one. None in unit tests that build a Runtime by hand.
+    _bus_handlers: dict = field(default_factory=dict)  # call_id -> handler subscribed on bus
+
+    def _drop_bus(self, call_id: str) -> None:
+        handler = self._bus_handlers.pop(call_id, None)
+        if self.bus is not None and handler is not None:
+            self.bus.unsubscribe(call_id, handler)
 
     def finalize(self, call_id: str) -> Optional[str]:
         """Called when a call ends: forgets the live session and writes the recording. Returns the WAV path."""
+        self._drop_bus(call_id)
         self.live.pop(call_id, None)
         rec = self.recorders.pop(call_id, None)
         rec_dir = self.record_dir or os.environ.get("VOX_RECORD_DIR", "")
@@ -315,9 +323,44 @@ class Runtime:
                        vad_scheduler=self.vad_scheduler)
 
         async def voicemail(message: str) -> None:
-            await sess.say_and_wait(message)
-            await transport.end()
+            # Same flag the owning node's webhook sets before it speaks, so a retry published
+            # from another node does not play a second message over the first.
+            if getattr(sess, "_vm_once", False):
+                return
+            sess._vm_once = True
+            try:
+                await sess.say_and_wait(message)
+            finally:
+                await transport.end()
         ctx.voicemail = voicemail
+        # AMD may be delivered on another node, or on the Redis listener thread. Schedule onto
+        # the loop that owns this session; there is no loop when a sync test builds a session.
+        if self.bus is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                def on_bus(msg: dict, _loop=loop, _vm=voicemail) -> None:
+                    if not isinstance(msg, dict) or msg.get("op") != "voicemail":
+                        return
+                    text = msg.get("text") or ""
+                    if not text:
+                        return
+                    fut = asyncio.run_coroutine_threadsafe(_vm(str(text)), _loop)
+
+                    def _retrieved(done) -> None:
+                        if done.cancelled():
+                            return
+                        try:
+                            done.result()
+                        except Exception:  # noqa: BLE001  (retrieved so the failure is not logged as abandoned)
+                            METRICS.inc("vox_errors_total", where="voicemail")
+
+                    fut.add_done_callback(_retrieved)
+                self._drop_bus(call["id"])
+                self.bus.subscribe(call["id"], on_bus)
+                self._bus_handlers[call["id"]] = on_bus
         if resumed:
             sess.seed_history(self._earlier_messages(meta["resumedFrom"]))
         self.live[call["id"]] = (sess, transport)

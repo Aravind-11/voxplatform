@@ -24,6 +24,7 @@ from transports.twilio import TwilioTransport
 from . import security, tools as toolmod
 from . import experiments as expmod
 from . import openapi_import, retention, variables as varmod
+from .callbus import make_bus
 from .runtime import Runtime
 from .store import ROLES, Store, new_id, normalize_e164
 
@@ -251,6 +252,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     app = FastAPI(title="voxplatform")
     if not getattr(runtime, "public_url", ""):
         runtime.public_url = settings.public_base_url
+    if getattr(runtime, "bus", None) is None:
+        runtime.bus = make_bus(os.environ.get("VOX_REDIS_URL", ""))   # tests leave the env unset -> local
     app.state.store, app.state.limiter, app.state.runtime = store, limiter, runtime
     METRICS.gauge("vox_active_calls", limiter.local_active)            # this node's calls
     METRICS.gauge("vox_active_calls_cluster", limiter.total_active)   # every node's calls (Redis scan)
@@ -1675,7 +1678,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     @app.post("/twilio/amd/{call_id}")
     async def twilio_amd(call_id: str, request: Request):
-        """Answering-machine detection result. On a machine, play the prepared message and hang up."""
+        """Answering-machine detection result. On a machine, play the prepared message and hang up.
+
+        The webhook may hit a node that does not own the media stream. That node publishes on the
+        call bus; the owning node's session is subscribed and speaks."""
         form = {k: str(v) for k, v in (await request.form()).items()}
         twilio_check(request, form)
         call = store.get_call_any(call_id)
@@ -1683,17 +1689,35 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             raise HTTPException(404, "call not found")
         answered = form.get("AnsweredBy", "")
         msg = call["metadata"].get("voicemail")
-        live = runtime.live.get(call_id)
         METRICS.inc("vox_amd_total", answered_by=answered or "unknown")
-        if msg and live and answered.startswith("machine_end"):
-            sess, transport = live
+        if msg and answered.startswith("machine_end"):
+            live = runtime.live.get(call_id)
+            if live:
+                sess, transport = live
+                if getattr(sess, "_vm_once", False):
+                    return {"action": "voicemail", "delivered": True}
+                sess._vm_once = True
 
-            async def go():
-                await sess.say_and_wait(msg)
-                await transport.end()
-            import asyncio
-            asyncio.get_running_loop().create_task(go())
-            return {"action": "voicemail"}
+                async def go():
+                    try:
+                        await sess.say_and_wait(msg)
+                    finally:
+                        await transport.end()
+
+                def _retrieved(done) -> None:
+                    if done.cancelled():
+                        return
+                    try:
+                        done.result()
+                    except Exception:  # noqa: BLE001  (retrieved so the failure is not logged as abandoned)
+                        METRICS.inc("vox_errors_total", where="voicemail")
+
+                import asyncio
+                asyncio.get_running_loop().create_task(go()).add_done_callback(_retrieved)
+                return {"action": "voicemail", "delivered": True}
+            bus = getattr(runtime, "bus", None)
+            delivered = bool(bus.publish(call_id, {"op": "voicemail", "text": msg})) if bus is not None else False
+            return {"action": "voicemail", "delivered": delivered}
         return {"action": "none", "answeredBy": answered}
 
     return app

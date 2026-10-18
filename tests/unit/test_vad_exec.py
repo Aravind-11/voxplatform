@@ -10,6 +10,7 @@ import pytest
 from api.runtime import Runtime
 from api.store import Store
 from core.metrics import Metrics
+from core.session import Session, SessionConfig
 from core.vad_exec import EXECUTOR, VADScheduler, current_batch, watch_loop_lag
 
 FRAME = np.zeros(512, np.int16)
@@ -150,8 +151,6 @@ def test_runtime_session_uses_the_process_scheduler_and_rigs_do_not():
     sess = rt.build_session(call, T())
     assert sess.vad_scheduler is rt.vad_scheduler
 
-    from core.session import Session, SessionConfig
-
     class Inline:
         def prob(self, frame):
             return 0.0
@@ -159,6 +158,35 @@ def test_runtime_session_uses_the_process_scheduler_and_rigs_do_not():
     bare = Session(llm=object(), tts=object(), vad=Inline(), send_audio=T.send_audio, clear_audio=T.clear,
                    clock=lambda: 0.0, cfg=SessionConfig())
     assert bare.vad_scheduler is None
+
+
+async def test_feed_without_scheduler_scores_on_the_calling_task():
+    """No scheduler: vad.prob stays on this task. A worker has no running loop, and its call_soon can land first."""
+    seen = False
+
+    class Inline:
+        def prob(self, frame):
+            nonlocal seen
+
+            def mark() -> None:
+                nonlocal seen
+                seen = True
+
+            asyncio.get_running_loop().call_soon(mark)
+            assert seen is False
+            return 0.0
+
+    async def send(pcm, rate):
+        return None
+
+    async def clear():
+        return None
+
+    sess = Session(llm=object(), tts=object(), vad=Inline(), send_audio=send, clear_audio=clear,
+                   clock=lambda: 0.0, cfg=SessionConfig())
+    await sess.feed(FRAME)
+    await asyncio.sleep(0)
+    assert seen is True
 
 
 async def test_executor_shutdown_fails_queued_scores_instead_of_hanging():

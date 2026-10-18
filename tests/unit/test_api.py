@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import time
@@ -373,3 +374,33 @@ def test_greeting_is_part_of_the_agent_and_is_spoken_on_a_browser_call():
     assert [m["text"] for m in store.messages(call["id"]) if m["role"] == "agent"] == ["Hi there."]
     r = c.patch(f"/v1/agents/{a['id']}", json={"greeting": "Hello again."}, headers=h)
     assert r.json()["config"]["greeting"] == "Hello again."
+
+
+async def test_app_startup_keeps_one_loop_lag_watcher():
+    """Startup starts watch_loop_lag once. Entering startup again must not replace that task."""
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    app = create_app(store, rt, security.ConcurrencyLimiter(), None, SETTINGS)
+    started: list[asyncio.Task] = []
+
+    def remember() -> None:
+        for name in ("loop_lag_task", "retention", "heartbeat"):
+            task = getattr(app.state, name, None)
+            if isinstance(task, asyncio.Task) and task not in started:
+                started.append(task)
+
+    try:
+        await app.router._startup()
+        remember()
+        lag = app.state.loop_lag_task
+        assert isinstance(lag, asyncio.Task) and not lag.done()
+        assert lag.get_coro().cr_code.co_name == "watch_loop_lag"
+        await app.router._startup()
+        remember()
+        assert app.state.loop_lag_task is lag
+        assert not lag.done()
+    finally:
+        for task in started:
+            task.cancel()
+        if started:
+            await asyncio.gather(*started, return_exceptions=True)

@@ -232,6 +232,7 @@ def test_twilio_stream_with_wrong_token_is_closed():
     url = f"https://vox.example.com/twilio/voice/{a['id']}"
     c.post(f"/twilio/voice/{a['id']}", data=twilio_form(), headers=sign(url, twilio_form()))
     call = store.list_calls(tid)[0]
+    assert lim.total_active() == 1                                          # the webhook reserved the slot
     with pytest.raises(WebSocketDisconnect) as e:
         with c.websocket_connect(f"/ws/twilio/{call['id']}") as ws:
             ws.send_text(json.dumps({"event": "start", "streamSid": "MZ1", "start": {
@@ -239,6 +240,27 @@ def test_twilio_stream_with_wrong_token_is_closed():
             ws.receive_text()
     assert e.value.code == 4401
     assert store.get_call_any(call["id"])["status"] == "created" and lim.total_active() == 0
+
+
+def test_twilio_stream_that_drops_before_start_keeps_its_slot_until_resume():
+    c, store, lim = make(Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                                  node_max_calls=1))
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "n"}, headers={"X-API-Key": k}).json()
+    url = f"https://vox.example.com/twilio/voice/{a['id']}"
+    form = twilio_form()
+    assert "<Stream" in c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form)).text
+    call = store.list_calls(tid)[0]
+    assert lim.total_active() == 1 and c.get("/healthz").status_code == 503
+    with c.websocket_connect(f"/ws/twilio/{call['id']}") as ws:
+        ws.send_text(json.dumps({"event": "connected"}))
+    assert store.get_call_any(call["id"])["status"] == "created" and lim.total_active() == 1
+    rurl = f"https://vox.example.com/twilio/resume/{call['id']}"
+    resumed = c.post(f"/twilio/resume/{call['id']}", data={"CallSid": "CA1"}, headers=sign(rurl, {"CallSid": "CA1"}))
+    assert "<Stream" in resumed.text and lim.total_active() == 1
+    new = [x for x in store.list_calls(tid) if x["id"] != call["id"]][0]
+    assert lim.try_admit(tid, new["id"], 10, 1) == "ok" and lim.total_active() == 1
+    assert c.get("/healthz").status_code == 503
 
 
 # ---------------------------------------------------------------- webhooks
@@ -300,6 +322,84 @@ def test_try_admit_node_cap_is_atomic_and_a_refusal_takes_no_slot():
     assert lim.try_admit("u", "x", 1, 5) == "ok"
     assert lim.try_admit("u", "y", 1, 5) == "tenant"               # tenant cap, node cap still has room
     assert lim.local_active() == 1 and lim.active("u") == 1
+    assert lim.try_admit("t", "a", 10, 0) == "ok" and lim.try_admit("t", "b", 10, 0) == "ok"
+    assert lim.local_active() == 3                                 # node_limit 0 does not cap this process
+
+
+class _FakeRedis:
+    """Just enough of redis-py for RedisLimiter.try_admit/release, with no server."""
+
+    def __init__(self, fail_zrem: bool = False):
+        self.sets: dict[str, dict] = {}
+        self.fail_zrem = fail_zrem
+
+    def register_script(self, _lua):
+        def run(keys, args):
+            _now, exp, member, cap = args
+            members = self.sets.setdefault(keys[0], {})
+            if member in members:
+                members[member] = float(exp)
+                return 1
+            if len(members) >= int(float(cap)):
+                return 0
+            members[member] = float(exp)
+            return 1
+        return run
+
+    def zrem(self, key, member):
+        if self.fail_zrem:
+            raise RuntimeError("zrem failed")
+        self.sets.get(key, {}).pop(member, None)
+        return 1
+
+
+def test_redis_try_admit_node_cap_is_one_slot_and_release_survives_zrem_failure():
+    client = _FakeRedis()
+    lim = security.RedisLimiter(client=client, default_limit=10)
+    assert lim.try_admit("t", "c1", 10, 1) == "ok"
+    assert lim.try_admit("t", "c2", 10, 1) == "node"
+    assert lim.local_active() == 1
+    assert lim.try_admit("t", "c1", 10, 1) == "ok" and lim.local_active() == 1   # same id, still one slot
+    lim.release("t", "c1")
+    assert lim.local_active() == 0
+    assert lim.try_admit("u", "x", 1, 5) == "ok"
+    assert lim.try_admit("u", "y", 1, 5) == "tenant"                             # refusal keeps no node slot
+    assert lim.local_active() == 1
+    open_lim = security.RedisLimiter(client=_FakeRedis(), default_limit=10)
+    assert open_lim.try_admit("t", "a", 10, 0) == "ok" and open_lim.try_admit("t", "b", 10, 0) == "ok"
+    assert open_lim.local_active() == 2                                          # node_limit 0 disables the node cap
+    broken = _FakeRedis(fail_zrem=True)
+    stuck = security.RedisLimiter(client=broken, default_limit=10)
+    assert stuck.try_admit("t", "a", 10, 1) == "ok"
+    stuck.release("t", "a")                                                      # must not raise
+    assert stuck.local_active() == 0
+    assert stuck.try_admit("t", "b", 10, 1) == "ok" and stuck.local_active() == 1
+
+
+def test_redis_release_failure_still_ends_the_call_and_frees_the_slot():
+    client = _FakeRedis(fail_zrem=True)
+    lim = security.RedisLimiter(client=client, default_limit=10)
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    app = create_app(store, rt, lim, None, Settings(admin_key="adm", public_base_url="https://vox.example.com",
+                                                    node_max_calls=1))
+    c = TestClient(app)
+    key, _tid = tenant(c, limit=10)
+    h = {"X-API-Key": key}
+    call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=h).json()
+    path = call["joinUrl"].replace("wss://vox.example.com", "")
+    with c.websocket_connect(path) as ws:
+        ws.send_bytes(silence(1)[0])
+        assert store.get_call_any(call["id"])["status"] == "active"
+        assert lim.local_active() == 1
+    done = store.get_call_any(call["id"])
+    assert done["status"] == "ended" and done["end_reason"] == "hangup"
+    assert lim.local_active() == 0
+    call2 = c.post("/v1/calls", json={}, headers=h).json()
+    with c.websocket_connect(call2["joinUrl"].replace("wss://vox.example.com", "")) as ws:
+        ws.send_bytes(silence(1)[0])
+        assert store.get_call_any(call2["id"])["status"] == "active"
+        assert lim.local_active() == 1
 
 
 # ---------------------------------------------------------------- tools through the API

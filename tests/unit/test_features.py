@@ -557,6 +557,7 @@ def test_outbound_validation_limits_and_twilio_errors():
     r = c2.post("/v1/calls/outbound", json={"agentId": a2["id"], "to": "+15551234567"}, headers=H(k2))
     assert r.status_code == 502 and "unverified number" in r.text
     assert c2.get("/v1/calls", headers=H(k2)).json()[0]["end_reason"] == "twilio_rejected"
+    assert c2.app.state.limiter.local_active() == 0                       # a rejected dial must not keep the slot
     c3, *_ = make(SETTINGS)
     k3, _ = tenant(c3)
     assert c3.post("/v1/calls/outbound", json={"agentId": "a", "to": "+15551234567"}, headers=H(k3)).status_code == 503
@@ -575,6 +576,7 @@ def test_outbound_status_and_amd_callbacks_need_a_valid_signature():
     assert c.post(f"/twilio/status/{o['id']}", data=form, headers={"X-Twilio-Signature": sig}).status_code == 200
     cur = store.get_call_any(o["id"])
     assert cur["status"] == "ended" and cur["end_reason"] == "no-answer"
+    assert c.app.state.limiter.local_active() == 0                        # never connected: the reservation is gone
     # AMD: a machine triggers the voicemail message on the live session; a human does nothing
     spoke = []
 
@@ -597,6 +599,40 @@ def test_outbound_status_and_amd_callbacks_need_a_valid_signature():
     assert r.json()["action"] == "voicemail"
     time.sleep(0.3)
     assert spoke == ["hi", "END"]
+
+
+def test_outbound_holds_a_slot_while_dialing_and_releases_if_twilio_never_connects():
+    from api import security
+    box = {}
+
+    def handler(req):
+        box["n"] = box.get("n", 0) + 1
+        box["during"] = box["lim"].local_active()
+        if box["n"] == 1:
+            return httpx.Response(201, json={"sid": "CA1"})
+        return httpx.Response(400, json={"message": "nope"})
+
+    c, store, _ = make_outbound(handler, node_max_calls=1)
+    box["lim"] = c.app.state.limiter
+    k, tid = tenant(c, limit=10)
+    h = H(k)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=h).json()
+    first = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551234567"}, headers=h)
+    assert first.status_code == 200 and box["during"] == 1 and box["n"] == 1
+    assert c.get("/healthz").status_code == 503 and c.get("/healthz").json()["nodeFull"] is True
+    before = len(store.list_calls(tid))
+    denied = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551234568"}, headers=h)
+    assert denied.status_code == 503 and box["n"] == 1 and len(store.list_calls(tid)) == before
+    url = f"https://vox.example.com/twilio/status/{first.json()['id']}"
+    form = {"CallStatus": "no-answer"}
+    assert c.post(f"/twilio/status/{first.json()['id']}", data=form,
+                  headers={"X-Twilio-Signature": security.twilio_signature("tok", url, form)}).status_code == 200
+    assert c.app.state.limiter.local_active() == 0 and c.get("/healthz").status_code == 200
+    bad = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551234569"}, headers=h)
+    assert bad.status_code == 502 and "nope" in bad.text
+    assert c.app.state.limiter.local_active() == 0 and c.get("/healthz").status_code == 200
+    refused = [x for x in store.list_calls(tid) if x["end_reason"] == "twilio_rejected"]
+    assert len(refused) == 1
 
 
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)
@@ -644,32 +680,35 @@ def test_node_cap_refuses_the_second_call_and_frees_when_the_first_ends():
     url = f"https://vox.example.com/twilio/voice/{a['id']}"
     open_line = c.post(f"/twilio/voice/{a['id']}", data=form, headers={"X-Twilio-Signature": security.twilio_signature("tok", url, form)})
     assert open_line.status_code == 200 and "<Stream" in open_line.text and "<Redirect>" not in open_line.text
+    tw = store.list_calls(tid)[0]
+    assert lim.local_active() == 1                                  # promised calls hold a slot before the socket
+    hz = c.get("/healthz")
+    assert hz.status_code == 503 and hz.json()["nodeFull"] is True and hz.json()["ok"] is False
     c1 = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=h).json()
-    c2 = c.post("/v1/calls", json={}, headers=h).json()
-    path = lambda call: call["joinUrl"].replace("wss://vox.example.com", "")
-    with c.websocket_connect(path(c1)) as ws1:
-        ws1.send_bytes(silence(1)[0])
-        assert store.get_call_any(c1["id"])["status"] == "active"       # the admitted call keeps running
+    with pytest.raises(WebSocketDisconnect) as e:
+        with c.websocket_connect(c1["joinUrl"].replace("wss://vox.example.com", "")) as ws1:
+            ws1.receive_text()
+    assert e.value.code == 1013
+    assert store.get_call_any(c1["id"])["end_reason"] == "node_full"
+    assert lim.active(tid) == 1                                     # refused before the tenant slot was taken
+    before = len(store.list_calls(tid))
+    form2 = {"From": "+15551230001", "CallSid": "CA2"}
+    busy = c.post(f"/twilio/voice/{a['id']}", data=form2,
+                  headers={"X-Twilio-Signature": security.twilio_signature("tok", url, form2)})
+    assert busy.status_code == 200
+    assert "<Redirect>https://overflow.example/busy?x=1&amp;y=2</Redirect>" in busy.text
+    assert "lines are busy" not in busy.text and len(store.list_calls(tid)) == before
+    with c.websocket_connect(f"/ws/twilio/{tw['id']}") as ws:
+        ws.send_text(json.dumps({"event": "start", "streamSid": "MZ1", "start": {
+            "streamSid": "MZ1", "callSid": "CA1", "customParameters": {"token": tw["join_token"]}}}))
+        # The follow-up yields so admit() has marked this reserved id active before the assert.
+        ws.send_text(json.dumps({"event": "mark", "streamSid": "MZ1", "mark": {"name": "m0"}}))
+        assert store.get_call_any(tw["id"])["status"] == "active"   # already reserved: not a second slot
         assert lim.local_active() == 1
-        hz = c.get("/healthz")
-        assert hz.status_code == 503 and hz.json()["nodeFull"] is True and hz.json()["ok"] is False
-        with pytest.raises(WebSocketDisconnect) as e:
-            with c.websocket_connect(path(c2)) as ws2:
-                ws2.receive_text()
-        assert e.value.code == 1013
-        assert store.get_call_any(c2["id"])["end_reason"] == "node_full"
-        assert lim.active(tid) == 1                                     # refused before the tenant slot was taken
-        before = len(store.list_calls(tid))
-        form2 = {"From": "+15551230001", "CallSid": "CA2"}
-        busy = c.post(f"/twilio/voice/{a['id']}", data=form2,
-                      headers={"X-Twilio-Signature": security.twilio_signature("tok", url, form2)})
-        assert busy.status_code == 200
-        assert "<Redirect>https://overflow.example/busy?x=1&amp;y=2</Redirect>" in busy.text
-        assert "lines are busy" not in busy.text and len(store.list_calls(tid)) == before
-        ws1.send_bytes(silence(1)[0])                                   # still the first call's socket
+        ws.send_text(json.dumps({"event": "stop", "streamSid": "MZ1"}))
     assert lim.local_active() == 0 and c.get("/healthz").status_code == 200
     c3 = c.post("/v1/calls", json={}, headers=h).json()
-    with c.websocket_connect(path(c3)) as ws3:
+    with c.websocket_connect(c3["joinUrl"].replace("wss://vox.example.com", "")) as ws3:
         ws3.send_bytes(silence(1)[0])
         assert store.get_call_any(c3["id"])["status"] == "active" and lim.local_active() == 1
     assert lim.local_active() == 0 and store.get_call_any(c3["id"])["end_reason"] == "hangup"
@@ -691,32 +730,49 @@ def test_full_node_does_not_start_another_twilio_or_outbound_call():
     k, tid = tenant(c, limit=10)
     h = {"X-API-Key": k}
     a = c.post("/v1/agents", json={"name": "a", "greeting": "hi"}, headers=h).json()
-    form = twilio_form()
-    voice = f"https://vox.example.com/twilio/voice/{a['id']}"
-    assert "<Stream" in c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(voice, form)).text
-    tw = store.list_calls(tid)[0]
     held = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=h).json()
     with c.websocket_connect(held["joinUrl"].replace("wss://vox.example.com", "")) as ws:
         ws.send_bytes(silence(1)[0])
         assert lim.local_active() == 1
+        before = len(store.list_calls(tid))
+        form = twilio_form()
+        voice = f"https://vox.example.com/twilio/voice/{a['id']}"
+        busy = c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(voice, form))
+        assert busy.status_code == 200 and "<Stream" not in busy.text and "all of our lines are busy" in busy.text
+        assert len(store.list_calls(tid)) == before                     # full node: no row, no slot
+        tw = store.create_call(tid, a["id"], "twilio", a["config"], {"from": "+15550001", "to": "+15550002"})
         with pytest.raises(WebSocketDisconnect):
             with c.websocket_connect(f"/ws/twilio/{tw['id']}") as tws:
                 tws.send_text(json.dumps({"event": "start", "streamSid": "MZ1", "start": {
                     "streamSid": "MZ1", "callSid": "CA1", "customParameters": {"token": tw["join_token"]}}}))
                 tws.receive_text()
         assert store.get_call_any(tw["id"])["end_reason"] == "node_full"
-        before = len(store.list_calls(tid))
         rurl = f"https://vox.example.com/twilio/resume/{tw['id']}"
         resumed = c.post(f"/twilio/resume/{tw['id']}", data={"CallSid": "CA1"}, headers=sign(rurl, {"CallSid": "CA1"}))
         assert resumed.status_code == 200 and "<Stream" not in resumed.text
-        assert "all of our lines are busy" in resumed.text and len(store.list_calls(tid)) == before
-        # The call that holds the slot can still be reconnected: freeing it must not look "full".
+        assert "all of our lines are busy" in resumed.text and len(store.list_calls(tid)) == before + 1
     own = store.create_call(tid, a["id"], "twilio", a["config"], {"from": "+15550001", "to": "+15550002"})
     store.update_call(own["id"], status="active", joined=time.time())
     assert lim.acquire(tid, own["id"], 10) and lim.local_active() == 1
     ourl = f"https://vox.example.com/twilio/resume/{own['id']}"
     again = c.post(f"/twilio/resume/{own['id']}", data={"CallSid": "CA1"}, headers=sign(ourl, {"CallSid": "CA1"}))
-    assert "<Stream" in again.text and lim.local_active() == 0
+    assert "<Stream" in again.text and lim.local_active() == 1          # replacement id is already held
+    new = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == own["id"]][0]
+    assert lim.try_admit(tid, new["id"], 10, 1) == "ok" and lim.local_active() == 1
+    hz = c.get("/healthz")
+    assert hz.status_code == 503 and hz.json()["nodeFull"] is True
+    other = c.post("/v1/calls", json={}, headers=h).json()
+    with pytest.raises(WebSocketDisconnect):
+        with c.websocket_connect(other["joinUrl"].replace("wss://vox.example.com", "")) as ows:
+            ows.receive_text()
+    assert store.get_call_any(other["id"])["end_reason"] == "node_full" and lim.local_active() == 1
+    with c.websocket_connect(f"/ws/twilio/{new['id']}") as tws:
+        tws.send_text(json.dumps({"event": "start", "streamSid": "MZ2", "start": {
+            "streamSid": "MZ2", "callSid": "CA2", "customParameters": {"token": new["join_token"]}}}))
+        tws.send_text(json.dumps({"event": "mark", "streamSid": "MZ2", "mark": {"name": "m0"}}))
+        assert store.get_call_any(new["id"])["status"] == "active" and lim.local_active() == 1
+        tws.send_text(json.dumps({"event": "stop", "streamSid": "MZ2"}))
+    assert lim.local_active() == 0
     # Outbound must not dial Twilio or insert a row while the node is full.
     seen = []
 
@@ -762,12 +818,21 @@ def test_failed_transfer_does_not_create_a_call_when_the_node_is_full():
     assert lim.acquire(tid, own["id"], 10)
     path, q = f"/twilio/transfer-result/{own['id']}", "to=billing"
     r = c.post(f"{path}?{q}", data=miss, headers=_signed(c, path, miss, query=q))
-    assert "<Stream" in r.text and lim.local_active() == 0
+    assert "<Stream" in r.text and lim.local_active() == 1
     new = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == own["id"]][0]
+    assert c.get("/healthz").status_code == 503 and c.get("/healthz").json()["nodeFull"] is True
+    from starlette.websockets import WebSocketDisconnect
+    extra = c.post("/v1/calls", json={}, headers=h).json()
+    with pytest.raises(WebSocketDisconnect):
+        with c.websocket_connect(extra["joinUrl"].replace("wss://vox.example.com", "")) as ews:
+            ews.receive_text()
+    assert store.get_call_any(extra["id"])["end_reason"] == "node_full" and lim.local_active() == 1
     import json
     with c.websocket_connect(f"/ws/twilio/{new['id']}") as tws:
         tws.send_text(json.dumps({"event": "start", "streamSid": "MZ9", "start": {
             "streamSid": "MZ9", "callSid": "CA9", "customParameters": {"token": new["join_token"]}}}))
+        tws.send_text(json.dumps({"event": "mark", "streamSid": "MZ9", "mark": {"name": "m0"}}))
+        assert store.get_call_any(new["id"])["status"] == "active" and lim.local_active() == 1
         tws.send_text(json.dumps({"event": "stop", "streamSid": "MZ9"}))
     assert store.get_call_any(new["id"])["end_reason"] != "node_full"
     assert lim.local_active() == 0
@@ -808,6 +873,97 @@ def test_sip_call_is_refused_without_a_row_when_the_node_is_full():
         sock.close()
     assert len(store.list_calls(tid)) == before
     assert lim.local_active() == 1
+
+
+def test_sip_call_holds_a_slot_until_the_uuid_arrives_and_releases_if_it_never_does():
+    import socket
+    from api import security
+    from api.runtime import Runtime
+    from api.store import Store
+    from starlette.testclient import TestClient
+    from test_api import FakeLLM, FakeTTS, FakeVAD
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    tid = store.create_tenant("a", 10)
+    ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "Hi", "tools": []})
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    lim = security.ConcurrencyLimiter(4)
+    app = __import__("api.app", fromlist=["create_app"]).create_app(
+        store, rt, lim, None,
+        Settings(admin_key="adm", audiosocket_port=port, audiosocket_agent=ag["id"], node_max_calls=1))
+    with TestClient(app) as client:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.settimeout(1)
+        held = False
+        for _ in range(50):
+            if lim.local_active() == 1:
+                held = True
+                break
+            time.sleep(0.05)
+        assert held
+        hz = client.get("/healthz")
+        assert hz.status_code == 503 and hz.json()["nodeFull"] is True
+        assert lim.try_admit(tid, "other", 10, 1) == "node" and lim.local_active() == 1
+        assert store.list_calls(tid) == []                              # no row until the UUID is in
+        sock.close()
+        freed = False
+        for _ in range(50):
+            if lim.local_active() == 0:
+                freed = True
+                break
+            time.sleep(0.05)
+        assert freed and store.list_calls(tid) == []
+
+
+def test_node_cap_zero_admits_a_second_call_and_healthz_stays_ready():
+    from test_api import silence
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                        node_max_calls=0)
+    c, store, lim = make(settings)
+    k, _tid = tenant(c, limit=10)
+    h = {"X-API-Key": k}
+    first = c.post("/v1/calls", json={}, headers=h).json()
+    second = c.post("/v1/calls", json={}, headers=h).json()
+    path = lambda call: call["joinUrl"].replace("wss://vox.example.com", "")
+    with c.websocket_connect(path(first)) as ws1:
+        ws1.send_bytes(silence(1)[0])
+        with c.websocket_connect(path(second)) as ws2:
+            ws2.send_bytes(silence(1)[0])
+            assert store.get_call_any(first["id"])["status"] == "active"
+            assert store.get_call_any(second["id"])["status"] == "active"
+            assert lim.local_active() == 2
+            hz = c.get("/healthz")
+            assert hz.status_code == 200 and hz.json()["nodeFull"] is False and hz.json()["ok"] is True
+
+
+def test_concurrent_voice_webhooks_cannot_exceed_the_node_cap():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from api import security
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                        node_max_calls=1)
+    c, store, lim = make(settings)
+    k, tid = tenant(c, limit=10)
+    h = {"X-API-Key": k}
+    a = c.post("/v1/agents", json={"name": "a"}, headers=h).json()
+    url = f"https://vox.example.com/twilio/voice/{a['id']}"
+    barrier = threading.Barrier(8)
+
+    def once(i):
+        barrier.wait()
+        form = {"From": f"+1555123000{i}", "CallSid": f"CA{i}"}
+        return c.post(f"/twilio/voice/{a['id']}", data=form,
+                      headers={"X-Twilio-Signature": security.twilio_signature("tok", url, form)}).text
+
+    with ThreadPoolExecutor(8) as ex:
+        texts = list(ex.map(once, range(8)))
+    assert sum("<Stream" in t for t in texts) == 1
+    assert sum("all of our lines are busy" in t for t in texts) == 7
+    assert len(store.list_calls(tid)) == 1 and lim.local_active() == 1
+    assert c.get("/healthz").status_code == 503 and c.get("/healthz").json()["nodeFull"] is True
 
 
 def test_concurrent_joins_cannot_exceed_the_node_cap():

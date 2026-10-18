@@ -23,7 +23,7 @@ from transports.twilio import TwilioTransport
 from . import security, tools as toolmod
 from . import openapi_import, retention, variables as varmod
 from .runtime import Runtime
-from .store import ROLES, Store
+from .store import ROLES, Store, new_id
 
 
 @dataclass
@@ -757,12 +757,41 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return page("dashboard.html")
 
     # ------------------------------------------------------ call lifecycle
+    def reserve_slot(tenant_id: str) -> tuple[str, str]:
+        """Reserve a node and tenant slot for a call that has no row yet.
+
+        Returns (call_id, "ok") or ("", "node"|"tenant"). A refusal takes no slot. The id is what
+        the later socket's admit() sees, so that socket does not take a second slot.
+        """
+        cid = new_id("call")
+        tnt = store.get_tenant(tenant_id)
+        cap = (tnt["concurrency_limit"] if tnt else None) or settings.default_concurrency
+        decision = limiter.try_admit(tenant_id, cid, cap, settings.node_max_calls)
+        if decision != "ok":
+            return "", decision
+        return cid, "ok"
+
+    def create_reserved(cid: str, tenant_id: str, agent_id, medium: str, config: dict,
+                        metadata: Optional[dict]) -> dict:
+        try:
+            return store.create_call(tenant_id, agent_id, medium, config, metadata, call_id=cid)
+        except Exception:  # noqa: BLE001
+            limiter.release(tenant_id, cid)
+            raise
+
+    def release_open(call: dict, reason: str) -> None:
+        """End a leg that still holds a slot and has not reached finish()."""
+        if call["status"] in ("created", "active"):
+            store.update_call(call["id"], status="ended", ended=time.time(), end_reason=reason)
+            limiter.release(call["tenant_id"], call["id"])
+
     def admit(call: dict) -> dict:
         """Common admission: status, drain, per-node cap, then per-tenant concurrency. Raises _Reject."""
         if call["status"] != "created":
             raise _Reject(4401, "call not joinable")
         if app.state.draining:
             store.update_call(call["id"], status="ended", ended=time.time(), end_reason="draining")
+            limiter.release(call["tenant_id"], call["id"])  # no-op unless a webhook already reserved this id
             raise _Reject(1013, "node is draining")
         t = store.get_tenant(call["tenant_id"])
         cap = t["concurrency_limit"] or settings.default_concurrency
@@ -842,14 +871,18 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             if not security.validate_twilio(settings.twilio_auth_token, url, form,
                                             request.headers.get("X-Twilio-Signature", "")):
                 raise HTTPException(403, "bad twilio signature")
-        if app.state.draining or at_node_cap():
+        if app.state.draining:
             return Response(busy_twiml(), media_type="text/xml")   # no call row: nothing was admitted
         agent = store.get_agent_any(agent_id)
         if not agent:
             raise HTTPException(404, "agent not found")
-        call = store.create_call(agent["tenant_id"], agent_id, "twilio", agent["config"],
-                                 {"from": form.get("From", ""), "to": form.get("To", ""),
-                                  "callSid": form.get("CallSid", "")})
+        # Hold the slot before handing Twilio a stream URL, or the next webhook still sees a free node.
+        cid, decision = reserve_slot(agent["tenant_id"])
+        if decision != "ok":
+            return Response(busy_twiml(), media_type="text/xml")   # no call row: nothing was admitted
+        call = create_reserved(cid, agent["tenant_id"], agent_id, "twilio", agent["config"],
+                               {"from": form.get("From", ""), "to": form.get("To", ""),
+                                "callSid": form.get("CallSid", "")})
         return Response(stream_twiml(call), media_type="text/xml")
 
     @app.websocket("/ws/twilio/{call_id}")
@@ -872,35 +905,48 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         try:
             await tr.run()
         except _Reject as r:
+            state["rejected"] = True
             await ws.close(r.code, r.reason)
         finally:
             if "t" in state:
                 finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+            elif state.get("rejected") and (store.get_call_any(call_id) or {}).get("status") != "active":
+                # Bad token, drain, or a cap refusal: drop a reservation the socket never adopted.
+                # A clean close before "start" keeps the slot so /twilio/resume can hand it to the new leg.
+                limiter.release(call["tenant_id"], call["id"])
 
     async def audiosocket_call(reader, writer) -> None:
-        """One SIP call arriving from Asterisk over AudioSocket: create the call, admit it, run the agent."""
+        """One SIP call arriving from Asterisk over AudioSocket: reserve a slot, then admit and run the agent."""
         from transports.audiosocket import AudioSocketTransport
         agent = store.get_agent_any(settings.audiosocket_agent)
-        if not agent or app.state.draining or at_node_cap():
+        if not agent or app.state.draining:
             writer.close()
             return
-        call = store.create_call(agent["tenant_id"], agent["id"], "sip", agent["config"], {})
+        # Reserve before reading the UUID. The read awaits, and a second connection must already see a full node.
+        cid, decision = reserve_slot(agent["tenant_id"])
+        if decision != "ok":
+            writer.close()
+            return
         state: dict = {}
 
         async def factory(tr, custom):
-            store.update_call(call["id"], metadata={"callSid": custom.get("uuid", ""), "channel": "sip"})
+            call = create_reserved(cid, agent["tenant_id"], agent["id"], "sip", agent["config"],
+                                   {"callSid": custom.get("uuid", ""), "channel": "sip"})
+            state["call"] = call
             state["t"] = admit(call)
             return runtime.build_session(call, tr)
 
         tr = AudioSocketTransport(reader, writer, factory)
-        tr.before_end = lambda: store.update_call(call["id"], end_reason="agent_hangup")
+        tr.before_end = lambda: state.get("call") and store.update_call(state["call"]["id"], end_reason="agent_hangup")
         try:
             await tr.run()
         except _Reject:
             writer.close()
         finally:
             if "t" in state:
-                finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+                finish(state["call"], state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+            else:
+                limiter.release(agent["tenant_id"], cid)   # UUID never arrived, or admit rejected the leg
 
     @app.on_event("startup")
     async def _start_audiosocket():
@@ -922,24 +968,27 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         healthy node with the conversation so far, at most MAX_RESUMES times per call."""
         form = {k: str(v) for k, v in (await request.form()).items()}
         twilio_check(request, form)
-        if app.state.draining:
-            raise HTTPException(503, "node is draining")
         call = store.get_call_any(call_id)
         if not call or call["medium"] != "twilio" or call.get("end_reason") in ("agent_hangup", "transfer", "no_credit"):
             return Response(HANGUP_TWIML, media_type="text/xml")
+        if app.state.draining:
+            release_open(call, "stream_lost")   # same slot release as a full node; Twilio gets TwiML, not a 503
+            return Response(busy_twiml(), media_type="text/xml")
         meta = call["metadata"] if isinstance(call["metadata"], dict) else json.loads(call["metadata"] or "{}")
         n = int(meta.get("resumes", 0))
         if n >= MAX_RESUMES:
+            release_open(call, "stream_lost")
             METRICS.inc("vox_call_resume_refused_total")
             return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we are having technical '
                             'difficulties. Please call again shortly. Goodbye.</Say><Hangup/></Response>', media_type="text/xml")
-        if call["status"] in ("created", "active"):
-            store.update_call(call_id, status="ended", ended=time.time(), end_reason="stream_lost")
-            limiter.release(call["tenant_id"], call_id)            # frees the dead node's slot at once
-        if at_node_cap():
+        # Free the dead leg and hold the replacement before yielding. Otherwise local_active drops to 0,
+        # another join takes the only slot, and this caller's new stream is closed node_full.
+        release_open(call, "stream_lost")
+        cid, decision = reserve_slot(call["tenant_id"])
+        if decision != "ok":
             return Response(busy_twiml(), media_type="text/xml")   # no new row while this process is full
-        nxt = store.create_call(call["tenant_id"], call["agent_id"], "twilio", call["config"],
-                                {**meta, "resumedFrom": call_id, "resumes": n + 1})
+        nxt = create_reserved(cid, call["tenant_id"], call["agent_id"], "twilio", call["config"],
+                              {**meta, "resumedFrom": call_id, "resumes": n + 1})
         METRICS.inc("vox_call_resumes_total")
         store.audit(call["tenant_id"], "system", "call.resume", nxt["id"], {"from": call_id, "attempt": n + 1})
         return Response(stream_twiml(nxt), media_type="text/xml")
@@ -959,8 +1008,6 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """Places a phone call through your Twilio account and connects the answered call to the agent."""
         if app.state.draining:
             raise HTTPException(503, "node is draining")
-        if at_node_cap():
-            raise HTTPException(503, "node full")
         if not (settings.twilio_account_sid and settings.twilio_auth_token):
             raise HTTPException(503, "outbound calling needs TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN on the server")
         if runtime.http is None:
@@ -989,8 +1036,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             meta["variables"] = given_vars
         if body.voicemailMessage:
             meta["voicemail"] = body.voicemailMessage
-        call = store.create_call(t["id"], body.agentId, "twilio", cfg, meta)
-        ws = settings.public_base_url.replace("http", "ws", 1)
+        # Reserve before dialing. A full node must not place a call Twilio will connect to a 1013.
+        cid, decision = reserve_slot(t["id"])
+        if decision != "ok":
+            raise HTTPException(503, "node full" if decision == "node" else "concurrency limit")
+        call = create_reserved(cid, t["id"], body.agentId, "twilio", cfg, meta)
         twiml = stream_twiml(call)
         data = {"To": body.to, "From": caller_id, "Twiml": twiml,
                 "StatusCallback": f"{settings.public_base_url}/twilio/status/{call['id']}",
@@ -1003,9 +1053,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Calls.json",
                 auth=(settings.twilio_account_sid, settings.twilio_auth_token), data=data, timeout=15)
         except Exception as e:  # noqa: BLE001
+            limiter.release(t["id"], call["id"])
             store.update_call(call["id"], status="ended", ended=time.time(), end_reason="twilio_unreachable")
             raise HTTPException(502, f"could not reach Twilio: {type(e).__name__}") from e
         if r.status_code >= 300:
+            limiter.release(t["id"], call["id"])
             store.update_call(call["id"], status="ended", ended=time.time(), end_reason="twilio_rejected")
             try:
                 msg = r.json().get("message", "")
@@ -1027,6 +1079,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         status = form.get("CallStatus", "")
         if call["status"] == "created" and status in ("busy", "failed", "no-answer", "canceled", "completed"):
             store.update_call(call_id, status="ended", ended=time.time(), end_reason=status)   # never answered / never connected
+            limiter.release(call["tenant_id"], call_id)   # the socket never adopted the reservation
         return {"ok": True}
 
     @app.post("/twilio/whisper/{call_id}")
@@ -1054,22 +1107,22 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             raise HTTPException(404, "call not found")
         if form.get("DialCallStatus", "") == "completed":
             return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>', media_type="text/xml")
-        if app.state.draining:
-            return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we cannot take your call right now.</Say><Hangup/></Response>', media_type="text/xml")
-        # The Dial already replaced this call's media stream. Drop a slot it still holds so the
-        # return leg is not refused for filling the cap by itself; if the node is still full, do
-        # not create another call.
+        # The Dial already replaced this call's media stream. Drop a slot it still holds, then hold
+        # the return leg before yielding so it cannot lose the only slot to another join.
         if call["status"] == "active":
             store.update_call(call_id, status="ended", ended=time.time(), end_reason="transfer_return")
             limiter.release(call["tenant_id"], call_id)
-        if at_node_cap():
+        if app.state.draining:
             return Response(busy_twiml(), media_type="text/xml")
+        cid, decision = reserve_slot(call["tenant_id"])
+        if decision != "ok":
+            return Response(busy_twiml(), media_type="text/xml")   # no new row while this process is full
         who = re.sub(r"[^\w -]", "", to)[:40] or "that person"
         cfg = dict(call["config"])
         cfg["greeting"] = f"Sorry, {who} is not available right now. Is there anything else I can help you with?"
         cfg["systemPrompt"] = (cfg.get("systemPrompt") or "") + f"\nThe caller asked to be transferred to {who}, who did not answer. Offer to help or to take a message."
         meta = {**call["metadata"], "resumedFrom": call_id}
-        resumed = store.create_call(call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
+        resumed = create_reserved(cid, call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
         return Response(stream_twiml(resumed), media_type="text/xml")
 
     @app.post("/twilio/amd/{call_id}")

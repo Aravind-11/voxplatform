@@ -6,9 +6,12 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import threading
 from typing import Awaitable, Callable, Optional
+
+log = logging.getLogger(__name__)
 
 import httpx
 
@@ -142,9 +145,15 @@ return 1
         return self.try_admit(tenant_id, call_id, limit, 0) == "ok"
 
     def release(self, tenant_id: str, call_id: str) -> None:
-        self.r.zrem(self._key(tenant_id), call_id)
-        with self._lock:
-            self._held.get(tenant_id, set()).discard(call_id)
+        # Drop the local slot even when ZREM fails, so a Redis blip cannot pin this node at the cap
+        # or skip the rest of finish() (the call would stay active and /healthz would stay 503).
+        try:
+            self.r.zrem(self._key(tenant_id), call_id)
+        except Exception:  # noqa: BLE001
+            log.exception("redis ZREM failed; releasing the local slot for %s", call_id)
+        finally:
+            with self._lock:
+                self._held.get(tenant_id, set()).discard(call_id)
 
     def active(self, tenant_id: str) -> int:
         import time

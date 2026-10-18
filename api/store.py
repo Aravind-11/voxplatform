@@ -341,8 +341,8 @@ class Store:
         return d
 
     def create_call(self, tenant_id: str, agent_id: Optional[str], medium: str, config: dict,
-                    metadata: Optional[dict] = None) -> dict:
-        cid, token = new_id("call"), secrets.token_urlsafe(24)
+                    metadata: Optional[dict] = None, *, call_id: Optional[str] = None) -> dict:
+        cid, token = call_id or new_id("call"), secrets.token_urlsafe(24)
         self._x("INSERT INTO calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (cid, tenant_id, agent_id, medium, "created", json.dumps(config), token,
                  json.dumps(metadata or {}), time.time(), None, None, None))

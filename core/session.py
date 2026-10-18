@@ -75,6 +75,69 @@ ClearAudio = Callable[[], Awaitable[None]]
 OnEvent = Callable[[dict], None]
 
 
+class _WordSlice:
+    """Tracker text for one audio chunk. `heard()` calls `split` and stringifies, so filling `.text`
+    after `on_sent` still fixes barge-in without holding the first chunk until synthesis finishes.
+
+    `sentence` is the utterance this chunk belongs to. `covered` is set once a transcript marker
+    or a prefix commit has already counted the chunk, so cancel does not record it twice.
+    """
+
+    def __init__(self, text: str = "", sentence: str = "") -> None:
+        self.text = text
+        self.sentence = sentence
+        self.covered = False
+
+    def split(self, sep=None, maxsplit=-1):
+        return self.text.split() if sep is None else self.text.split(sep, maxsplit)
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def _fill_word_slices(slices: list[_WordSlice], lengths: list[int], sentence: str) -> None:
+    """Give each chunk the words that fall in its share of the samples. One chunk keeps the sentence verbatim."""
+    if len(slices) == 1:
+        slices[0].text = sentence
+        return
+    words = sentence.split()
+    total = sum(lengths) or 1
+    prev = 0
+    acc = 0
+    last = len(slices) - 1
+    for i, (sl, n) in enumerate(zip(slices, lengths)):
+        acc += n
+        k = len(words) if i == last else int(len(words) * acc / total)
+        k = min(len(words), max(prev, k))
+        sl.text = " ".join(words[prev:k])
+        prev = k
+
+
+def _claim_words_so_far(slices: list[_WordSlice], lengths: list[int], sentence: str, out_rate: int,
+                        ms_per_word: float = 180.0) -> None:
+    """Words a barge-in may claim before synthesis of this sentence has finished.
+
+    Elapsed audio caps the claim at about one word per 180 ms. The chunk in progress does not
+    receive the rest of the sentence: that would mark every word heard as soon as the first
+    chunk reached the caller.
+    """
+    words = sentence.split()
+    if not slices or not words:
+        return
+    elapsed = sum(pcm_duration_ms(n, out_rate) for n in lengths)
+    n_words = min(len(words), int(elapsed // ms_per_word))
+    total = sum(lengths) or 1
+    prev = 0
+    acc = 0
+    last = len(slices) - 1
+    for i, (sl, n) in enumerate(zip(slices, lengths)):
+        acc += n
+        k = n_words if i == last else int(n_words * acc / total)
+        k = min(n_words, max(prev, k))
+        sl.text = " ".join(words[prev:k])
+        prev = k
+
+
 @dataclass
 class SessionConfig:
     system_prompt: str = "You are a helpful voice assistant. Keep replies short and conversational."
@@ -105,8 +168,10 @@ class _Generation:
         self.outbox: asyncio.Queue = asyncio.Queue()
         self.textq: asyncio.Queue = asyncio.Queue()
         self.pending_ms = 0.0          # synthesized audio waiting in outbox (not yet sent)
+        self.outbox_audio = 0          # audio items still in outbox (not transcript markers)
         self.tasks: list[asyncio.Task] = []
         self.spoken: list[str] = []
+        self.sent_slices: list[_WordSlice] = []  # slices whose send_audio has returned
         self.produce_done = False
         self.first_audio_sent = False
         self.cancelled = False
@@ -983,20 +1048,89 @@ class Session:
             return
         await self._speak(gen, str(text))
 
+    def _commit_transcript(self, gen: _Generation, text: str) -> None:
+        """Record assistant text whose audio was sent, and emit one agent_speech."""
+        if not text:
+            return
+        gen.spoken.append(text)
+        self._emit("agent_speech", text=text)
+        if self.history and self.history[-1]["role"] == "assistant":
+            self.history[-1]["content"] = " ".join(gen.spoken)
+
+    def _cover_slices(self, track: Any) -> None:
+        if isinstance(track, list):
+            for sl in track:
+                if isinstance(sl, _WordSlice):
+                    sl.covered = True
+
+    def _commit_sent_prefix(self, gen: _Generation) -> None:
+        """One transcript for slices send_audio already accepted and not yet recorded.
+
+        Chunks still in the outbox are not included. Barge-in trims history after this, so the
+        heard prefix plus `[interrupted]` still replaces the assistant turn.
+        """
+        groups: list[list[_WordSlice]] = []
+        for sl in gen.sent_slices:
+            if sl.covered:
+                continue
+            if groups and groups[-1][0].sentence == sl.sentence:
+                groups[-1].append(sl)
+            else:
+                groups.append([sl])
+        parts: list[str] = []
+        for group in groups:
+            joined = " ".join(sl.text for sl in group if sl.text).strip()
+            for sl in group:
+                sl.covered = True
+            if joined:
+                parts.append(joined)
+        if parts:
+            self._commit_transcript(gen, " ".join(parts))
+
+    async def _speak(self, gen: _Generation, text: str) -> None:
+        """Enqueue each TTS chunk as it arrives. The sentence is recorded once every chunk is sent,
+        or only the words on chunks already sent if synthesis or send_audio stops early."""
+        # Held by both the synth loop and a tool filler so their audio cannot interleave.
+        # Drain does not take the lock, so a chunk can be sent while the next one is still synthesizing.
+        async with gen.speak_lock:
+            t_tts = self.clock()
+            slices: list[_WordSlice] = []
+            lengths: list[int] = []
+            try:
+                async for part in self.tts.synthesize(text):
+                    pcm = resample(np.asarray(part), self.tts.sample_rate, self.cfg.out_rate)
+                    if len(pcm) == 0:
+                        continue
+                    # The slice is what barge-in reads. It stays a conservative prefix until synthesis finishes.
+                    sl = _WordSlice("", text)
+                    slices.append(sl)
+                    lengths.append(len(pcm))
+                    _claim_words_so_far(slices, lengths, text, self.cfg.out_rate)
+                    gen.pending_ms += pcm_duration_ms(len(pcm), self.cfg.out_rate)
+                    gen.outbox_audio += 1
+                    await gen.outbox.put(("", sl, pcm))
+            except Exception:
+                # A later chunk failed: keep only the words attached to audio already queued.
+                queued = " ".join(sl.text for sl in slices if sl.text).strip()
+                if queued:
+                    await gen.outbox.put((queued, slices, None))
+                raise
+            self._emit("tts_done", ms=self.clock() - t_tts, chars=len(text))
+            if slices:
+                _fill_word_slices(slices, lengths, text)
+                await gen.outbox.put((text, slices, None))
+            else:
+                await gen.outbox.put((text, text, np.zeros(0, np.int16)))
+
     async def _render(self, text: str) -> tuple[np.ndarray, float]:
+        """Full PCM for a replay. Streaming sends go through _speak; this stays for the tail
+        clear() threw away, which is already in history and must be queued as one replay item."""
         t_tts = self.clock()
         parts = [p async for p in self.tts.synthesize(text)]
         self._emit("tts_done", ms=self.clock() - t_tts, chars=len(text))
         pcm = np.concatenate(parts) if parts else np.zeros(0, np.int16)
         pcm = resample(pcm, self.tts.sample_rate, self.cfg.out_rate)
         return pcm, pcm_duration_ms(len(pcm), self.cfg.out_rate)
-
-    async def _speak(self, gen: _Generation, text: str) -> None:
-        # Held by both the synth loop and a tool filler so their audio cannot interleave.
-        async with gen.speak_lock:
-            pcm, dur = await self._render(text)
-            gen.pending_ms += dur
-            await gen.outbox.put((text, pcm))
 
     def _requeue_front(self, gen: _Generation, item: Any) -> None:
         rest = []
@@ -1009,60 +1143,98 @@ class Session:
         for queued in rest:
             gen.outbox.put_nowait(queued)
 
+    def _unpack_outbox(self, item: Any) -> tuple[str, Any, Any, bool]:
+        """Return text, track, pcm, replay.
+
+        (text, pcm, True) is a replay of audio clear() discarded (the third element is bool, not samples).
+        (text, slices, None) is the sentence marker. ("", slice, pcm) is one streamed chunk.
+        (text, text, zeros) is a sentence synthesize produced no samples for. (text, pcm) is a legacy pair.
+        """
+        if isinstance(item, tuple) and len(item) == 3 and isinstance(item[2], bool):
+            text, pcm, replay = item
+            return text, text, pcm, replay
+        if isinstance(item, tuple) and len(item) == 3:
+            text, track, pcm = item
+            return text, track, pcm, False
+        text, pcm = item
+        return text, text, pcm, False
+
     async def _drain(self, gen: _Generation) -> None:
-        await gen.commit.wait()
-        while True:
-            # A tentative barge-in holds the buffer. A strict hang-up must not run until the
-            # interrupt is confirmed (or the hold is released); a cough must not drop the call.
-            while gen.holding and not gen.cancelled:
-                await asyncio.sleep(self.cfg.tts_poll_s)
-            if gen.cancelled:
-                return
-            item = await gen.outbox.get()
-            if gen.holding and not gen.cancelled:
-                # Already taken off the queue: put it back so the cleared tail can be prepended.
-                self._requeue_front(gen, item)
-                continue
-            if gen.cancelled:
-                return
-            if item is None:
-                if gen.after is not None and not gen.cancelled:
-                    await self._finish_action(gen)
-                return
-            replay = False
-            if isinstance(item, tuple) and len(item) == 3:
-                text, pcm, replay = item
-            else:
-                text, pcm = item
-            if not gen.first_audio_sent:
-                gen.first_audio_sent = True
-                self._emit("agent_first_audio",
-                           latency_ms=self.clock() - gen.speech_end_clock)
-            gen.sending = True
-            try:
-                try:
-                    await self.send_audio(pcm, self.cfg.out_rate)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    # Not sent, so it is not in spoken. This drain is done: a cough has to start
-                    # another player. Leaving the chunk here is what that player sends.
-                    self._emit("error", where="send", error=repr(e))
-                    self._requeue_front(gen, item)
+        try:
+            await gen.commit.wait()
+            while True:
+                # A tentative barge-in holds the buffer. A strict hang-up must not run until the
+                # interrupt is confirmed (or the hold is released); a cough must not drop the call.
+                while gen.holding and not gen.cancelled:
+                    await asyncio.sleep(self.cfg.tts_poll_s)
+                if gen.cancelled:
                     return
-                if self.recorder is not None:
-                    self.recorder.agent(pcm, self.cfg.out_rate)
-                dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
-                self.tracker.on_sent(text, dur)
-                gen.pending_ms -= dur
-                # A replay is audio clear() threw away. spoken/history already include it.
-                if not replay:
-                    gen.spoken.append(text)
-                    if self.history and self.history[-1]["role"] == "assistant":
-                        self.history[-1]["content"] = " ".join(gen.spoken)
-                self._emit("agent_speech", text=text)
-            finally:
-                gen.sending = False
+                item = await gen.outbox.get()
+                if gen.holding and not gen.cancelled:
+                    # Already taken off the queue: put it back so the cleared tail can be prepended.
+                    self._requeue_front(gen, item)
+                    continue
+                if gen.cancelled:
+                    return
+                if item is None:
+                    if gen.after is not None and not gen.cancelled:
+                        await self._finish_action(gen)
+                    return
+                text, track, pcm, replay = self._unpack_outbox(item)
+                if pcm is None:
+                    # A send failure may already have recorded earlier slices of this sentence.
+                    # The marker still names the whole sentence; do not append that prefix twice.
+                    slices = [sl for sl in track if isinstance(sl, _WordSlice)] if isinstance(track, list) else []
+                    already = any(sl.covered for sl in slices)
+                    fresh = [sl for sl in slices if not sl.covered and sl.text]
+                    self._cover_slices(track)
+                    if slices and not already:
+                        self._commit_transcript(gen, text)
+                    elif fresh:
+                        self._commit_transcript(gen, " ".join(sl.text for sl in fresh).strip())
+                    elif not slices and text:
+                        self._commit_transcript(gen, text)
+                    continue
+                counted = isinstance(track, _WordSlice) and len(pcm) > 0
+                if counted:
+                    gen.outbox_audio -= 1
+                if not gen.first_audio_sent:
+                    gen.first_audio_sent = True
+                    self._emit("agent_first_audio",
+                               latency_ms=self.clock() - gen.speech_end_clock)
+                gen.sending = True
+                try:
+                    try:
+                        await self.send_audio(pcm, self.cfg.out_rate)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        # Not sent. Record slices that did leave, and put this chunk back so a
+                        # cough can start another player. Do not apply the sentence marker behind it.
+                        if counted:
+                            gen.outbox_audio += 1
+                        self._commit_sent_prefix(gen)
+                        self._emit("error", where="send_audio", error=repr(e))
+                        self._requeue_front(gen, item)
+                        return
+                    if isinstance(track, _WordSlice):
+                        gen.sent_slices.append(track)
+                    if self.recorder is not None:
+                        self.recorder.agent(pcm, self.cfg.out_rate)
+                    dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
+                    self.tracker.on_sent(track if isinstance(track, _WordSlice) else text, dur)
+                    gen.pending_ms -= dur
+                    if replay:
+                        # Already in spoken/history. Still tell listeners the words went out again.
+                        self._emit("agent_speech", text=text)
+                    elif text:
+                        self._commit_transcript(gen, text)
+                finally:
+                    gen.sending = False
+        except asyncio.CancelledError:
+            # Barge-in, hang-up, and shutdown cancel drain before it reads the sentence marker.
+            self._commit_sent_prefix(gen)
+            raise
 
     # ----------------------------------------------------------- barge-in
     async def _pause_for_barge(self, gen: _Generation) -> None:
@@ -1070,6 +1242,11 @@ class Session:
         if gen.holding or gen.cancelled:
             return
         heard, cut = self.tracker.heard()
+        # Audio still in synthesize, in the outbox, or inside send_audio is not in the tracker,
+        # so a finished chunk looks like a clean end unless we force the cut. A confirmed
+        # interrupt reads this snapshot, not a later tracker.heard().
+        if not gen.produce_done or gen.outbox_audio > 0 or gen.sending:
+            cut = True
         gen.barge_paused = True
         gen.paused_heard = heard
         gen.paused_cut = cut
@@ -1258,6 +1435,11 @@ class Session:
         paused_barge = gen.barge_paused
         if paused_barge:
             heard, cut = gen.paused_heard, gen.paused_cut
+            unfinished = False
+        else:
+            # _cancel flips produce_done. Read the cut reason first. heard is read after cancel
+            # so time spent clearing the socket is not counted as playback.
+            unfinished = (not gen.produce_done) or gen.outbox_audio > 0 or gen.sending
         await self.clear_audio()          # stop the far end first: that is what the caller hears
         if gen.cancelled:
             # Another caller cancelled this generation while clear_audio waited on the socket.
@@ -1270,6 +1452,9 @@ class Session:
         gen.holding = False
         if not paused_barge:
             heard, cut = self.tracker.heard()
+            # A dry jitter buffer is not a finished turn while the next chunk is still synthesizing.
+            if unfinished:
+                cut = True
         a, gen.after = gen.after, None
         if a is not None and a.strict:
             self._spawn_action(a)         # strict: the caller talking over the goodbye does not keep the call alive
@@ -1283,3 +1468,6 @@ class Session:
         for t in gen.tasks:
             t.cancel()
         await asyncio.gather(*gen.tasks, return_exceptions=True)
+        # Drain's cancel handler records slices it had already sent. Repeat is a no-op once covered,
+        # and covers a drain task that finished without seeing the marker.
+        self._commit_sent_prefix(gen)

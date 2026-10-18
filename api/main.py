@@ -32,6 +32,9 @@
   VOX_RETENTION_DAYS       erase ended calls older than this for tenants without their own limit (default: keep)
   VOX_NO_ESPEAK=1          run Kokoro without the GPL espeak-ng fallback (English only; Spanish/French/Italian/Portuguese/Hindi need espeak)
   VOX_PRELOAD_LANGS        Kokoro language codes to load at start-up, default a (a,b English; e,f,h,i,p,j,z others; see docs/LANGUAGES.md)
+  VOX_TTS_URL              if set, OpenAI-compatible {url}/audio/speech is used instead of Kokoro
+  VOX_TTS_MODEL            model field for VOX_TTS_URL (default tts-1);  VOX_TTS_API_KEY  bearer token if that endpoint requires one
+  VOX_TTS_RATE             raw s16le rate when VOX_TTS_URL does not return a WAV (default 24000; a WAV header wins)
   VOX_AUDIOSOCKET_PORT / VOX_AUDIOSOCKET_AGENT / VOX_AUDIOSOCKET_HOST   SIP path: TCP port Asterisk streams call audio to, and the agent id that answers when no number is mapped (docs/SIP.md)
   VOX_AUDIOSOCKET_RATE     AudioSocket PCM rate (8000 ulaw, or 16000 with g722/slin16). Default 8000.
   VOX_SIP_TOKEN            shared secret for POST /internal/sip/setup and POST /sip/recover; empty = both endpoints off
@@ -81,8 +84,6 @@ def build():
                         sip_token=env.get("VOX_SIP_TOKEN", ""),
                         audiosocket_rate=int(env.get("VOX_AUDIOSOCKET_RATE", "8000")))
     store = Store(env.get("VOX_DB", "vox.db"))
-    from core.tts import PipelineSet
-    pipelines = PipelineSet(preload=env.get("VOX_PRELOAD_LANGS", "a"))   # one front end per language, shared by all calls
     llm = VllmClient(base_url=env.get("VOX_VLLM_URL", "http://127.0.0.1:8000/v1"),
                      audio_style=env.get("VOX_AUDIO_STYLE", "input_audio"))
     http = httpx.AsyncClient()
@@ -91,7 +92,22 @@ def build():
         from core.embed import OpenAIEmbedder
         embedder = OpenAIEmbedder(env["VOX_EMBED_URL"], env.get("VOX_EMBED_MODEL", "BAAI/bge-small-en-v1.5"), http,
                                   min_sim=float(env.get("VOX_EMBED_MIN_SIM", "0")))
-    rt = Runtime(llm, lambda voice: KokoroTTS(voice=voice, pipeline=pipelines.for_voice(voice)), SileroVAD, store,
+    if env.get("VOX_TTS_URL"):
+        from core.tts import HttpTTS
+        tts_url = env["VOX_TTS_URL"].strip()
+        tts_model = env.get("VOX_TTS_MODEL", "tts-1")
+        tts_key = env.get("VOX_TTS_API_KEY", "")
+        tts_rate = int(env.get("VOX_TTS_RATE", "24000"))
+
+        def make_tts(voice, url=tts_url, model=tts_model, key=tts_key, rate=tts_rate, client=http):
+            return HttpTTS(url, client, model=model, voice=voice, api_key=key, sample_rate=rate)
+    else:
+        from core.tts import PipelineSet
+        pipelines = PipelineSet(preload=env.get("VOX_PRELOAD_LANGS", "a"))   # one front end per language, shared by all calls
+
+        def make_tts(voice, _pipelines=pipelines):
+            return KokoroTTS(voice=voice, pipeline=_pipelines.for_voice(voice))
+    rt = Runtime(llm, make_tts, SileroVAD, store,
                  http=http, record_dir=settings.record_dir, embedder=embedder)   # one pooled client for tools and Twilio
     limiter = security.make_limiter(env, settings.default_concurrency)
     return create_app(store, rt, limiter, security.WebhookDispatcher(httpx.AsyncClient()), settings)

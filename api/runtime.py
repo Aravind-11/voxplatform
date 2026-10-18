@@ -26,21 +26,55 @@ _LlmWithASR = AsrLLM
 
 
 class LimitedTTS:
-    """Caps simultaneous syntheses process-wide: TTS front-ends (G2P) are CPU/GIL-bound, so many
-    parallel threads only add contention. The semaphore is shared by every call in the process."""
+    """The semaphore stays (GIL-bound G2P); streaming removes the per-sentence buffer; a separate process is VOX_TTS_URL.
+
+    Caps simultaneous syntheses process-wide: TTS front-ends (G2P) are CPU/GIL-bound, so many
+    parallel threads only add contention. The semaphore is shared by every call in the process and
+    is held while each chunk is yielded, not released after a private buffer of the whole sentence.
+    Barge-in detaches the session task from an in-process worker, but the slot stays held until
+    that thread actually exits."""
     _sem: Optional[asyncio.Semaphore] = None
+    _bg: set[asyncio.Task] = set()
 
     def __init__(self, inner, limit: int):
         self.inner, self.limit = inner, limit
-        self.sample_rate = inner.sample_rate
+
+    @property
+    def sample_rate(self) -> int:
+        # HttpTTS replaces this when a WAV header arrives. A copy taken at init would resample
+        # that audio at the wrong rate for the rest of the call.
+        return self.inner.sample_rate
 
     async def synthesize(self, text: str):
         if LimitedTTS._sem is None:
             LimitedTTS._sem = asyncio.Semaphore(self.limit)
-        async with LimitedTTS._sem:
-            parts = [p async for p in self.inner.synthesize(text)]
-        for p in parts:
-            yield p
+        sem = LimitedTTS._sem
+        await sem.acquire()
+        try:
+            async for p in self.inner.synthesize(text):
+                yield p
+        finally:
+            pending = _detached_workers(self.inner)
+            if not pending:
+                sem.release()
+            else:
+                task = asyncio.create_task(_release_tts_slot(sem, pending))
+                LimitedTTS._bg.add(task)
+                task.add_done_callback(LimitedTTS._bg.discard)
+
+
+def _detached_workers(inner) -> list:
+    take = getattr(inner, "detached_workers", None)
+    if take is None:
+        return []
+    return [f for f in take() if f is not None and not f.done()]
+
+
+async def _release_tts_slot(sem: asyncio.Semaphore, workers: list) -> None:
+    try:
+        await asyncio.gather(*workers, return_exceptions=True)
+    finally:
+        sem.release()
 
 
 def _count(e: dict, variant: str = "") -> None:

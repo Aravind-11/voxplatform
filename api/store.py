@@ -408,11 +408,18 @@ class Store:
         return self._all("SELECT role, text, t FROM messages WHERE call_id=? ORDER BY id", (call_id,))
 
     # ---- dialed numbers (SIP). e164 is globally unique: one number belongs to one tenant.
-    def put_number(self, tenant_id: str, e164: str, agent_id: str) -> None:
+    def put_number(self, tenant_id: str, e164: str, agent_id: str) -> bool:
+        """Point e164 at agent_id for this tenant. A row another tenant already owns is left unchanged.
+        Returns whether this tenant owns the number after the write."""
         e164 = normalize_e164(e164)
+        # Do not set tenant_id on conflict. Two API nodes can both pass the 409 check before either writes;
+        # the WHERE keeps the first owner, and a same-tenant put can still change agent_id.
         self._x("INSERT INTO numbers(e164, tenant_id, agent_id) VALUES(?,?,?) "
-                "ON CONFLICT(e164) DO UPDATE SET tenant_id=excluded.tenant_id, agent_id=excluded.agent_id",
+                "ON CONFLICT(e164) DO UPDATE SET agent_id=excluded.agent_id "
+                "WHERE numbers.tenant_id=excluded.tenant_id",
                 (e164, tenant_id, agent_id))
+        row = self._one("SELECT tenant_id FROM numbers WHERE e164=?", (e164,))
+        return bool(row and row["tenant_id"] == tenant_id)
 
     def get_number(self, e164: str) -> Optional[dict]:
         key = normalize_e164(e164)

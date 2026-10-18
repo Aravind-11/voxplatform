@@ -448,7 +448,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         other = store.get_number(num)
         if other and other["tenant_id"] != t["id"]:
             raise HTTPException(409, "number is assigned to another tenant")
-        store.put_number(t["id"], num, body.agentId)
+        if not store.put_number(t["id"], num, body.agentId):
+            raise HTTPException(409, "number is assigned to another tenant")
         log(t, "number.put", num, agentId=body.agentId)
         return {"e164": num, "agentId": body.agentId}
 

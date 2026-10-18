@@ -299,3 +299,144 @@ def test_dialed_number_routes_to_the_mapped_agent_and_no_setup_uses_the_default(
     with TestClient(app2) as c2:
         assert c2.post("/internal/sip/setup", data={"uuid": "z", "caller": "1", "exten": "+1555"},
                        headers={"X-Vox-Sip-Token": "z"}).status_code == 404
+
+
+def _dialplan_code(raw: str) -> str:
+    """Drop an unescaped ';' comment. '\\;' is the dialplan's escaped semicolon, not a comment."""
+    out = []
+    i = 0
+    while i < len(raw):
+        if raw[i] == "\\" and i + 1 < len(raw):
+            out.append(raw[i:i + 2])
+            i += 2
+            continue
+        if raw[i] == ";":
+            break
+        out.append(raw[i])
+        i += 1
+    return "".join(out)
+
+
+def _dialplan_shell_lines(text: str) -> str:
+    """System() and SHELL() are /bin/sh -c. Comments are not executed."""
+    lines = []
+    for raw in text.splitlines():
+        code = _dialplan_code(raw)
+        if "System(" in code or "SHELL(" in code:
+            lines.append(code)
+    return "\n".join(lines)
+
+
+def test_dialplan_system_does_not_interpolate_raw_caller_or_extension():
+    text = open("deploy/sip/extensions.conf", encoding="utf-8").read()
+    shell = _dialplan_shell_lines(text)
+    assert "${CALLERID(num)}" not in shell
+    assert "${EXTEN}" not in shell
+    assert "${SIP_SETUP_TOKEN}" not in shell
+    assert "FILTER(0-9+,${CALLERID(num)})" in text
+    assert "FILTER(0-9+,${EXTEN})" in text
+    assert "${SIP_CALLER}" in shell and "${SIP_EXTEN}" in shell
+    assert "sip/sip_setup.py" in open("deploy/Dockerfile.asterisk", encoding="utf-8").read()
+
+
+def test_sip_setup_encodes_plus_and_refuses_shell_characters(monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("vox_sip_setup", "deploy/sip/sip_setup.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    sent = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b"ok"
+
+    def fake_open(req, timeout=0):
+        sent.append((req.data, req.get_header("X-vox-sip-token"), timeout))
+        return _Resp()
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_open)
+    token = 'sek"$(id)`rm`'
+    assert mod.post_setup("+15551212", "15550000", "abc-DEF", token) is True
+    body, header, timeout = sent[0]
+    assert b"caller=%2B15551212" in body and b"caller=+" not in body
+    assert b"exten=15550000" in body and b"uuid=abc-DEF" in body
+    assert header == token and timeout == 2
+    assert mod.post_setup('+1";id;echo "', "1555", "abc", "t") is False
+    assert mod.post_setup("1555", "$(id)", "abc", "t") is False
+    assert mod.post_setup("1555", "1555", "not a uuid", "t") is False
+    assert len(sent) == 1
+
+    seen = {}
+
+    def fake_post(caller, exten, uuid, tok, url=mod.DEFAULT_URL, timeout=2.0):
+        seen.update(caller=caller, exten=exten, uuid=uuid, token=tok, url=url)
+        return False
+
+    monkeypatch.setattr(mod, "post_setup", fake_post)
+    monkeypatch.setenv("SIP_SETUP_TOKEN", token)
+    assert mod.main(["+15551212", "15550000", "abc-DEF", "http://api1:8080/internal/sip/setup"]) == 0
+    assert seen == {
+        "caller": "+15551212", "exten": "15550000", "uuid": "abc-DEF",
+        "token": token, "url": "http://api1:8080/internal/sip/setup",
+    }
+    assert mod.main(["+1", "2"]) == 2
+
+
+def test_put_number_does_not_give_the_number_to_another_tenant():
+    from api.store import Store
+    s = Store()
+    assert s.put_number("A", "+15551110000", "agt_a") is True
+    assert s.put_number("B", "+15551110000", "agt_b") is False
+    got = s.get_number("+15551110000")
+    assert got["tenant_id"] == "A" and got["agent_id"] == "agt_a"
+    assert s.put_number("A", "+1 555 111 0000", "agt_a2") is True
+    got = s.get_number("+15551110000")
+    assert got["tenant_id"] == "A" and got["agent_id"] == "agt_a2"
+
+
+def test_number_put_is_409_when_another_tenant_owns_it_and_the_agent_stays():
+    from fastapi.testclient import TestClient
+    from api import security
+    from api.app import Settings, create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+
+    store = Store()
+    tenant_a = store.create_tenant("a")
+    tenant_b = store.create_tenant("b")
+    key_a = security.generate_key()
+    key_b = security.generate_key()
+    store.add_key(tenant_a, security.hash_key(key_a), "a")
+    store.add_key(tenant_b, security.hash_key(key_b), "b")
+    cfg = {"systemPrompt": "", "voice": "af_heart", "greeting": "", "tools": []}
+    agent_a = store.create_agent(tenant_a, "A", cfg)
+    agent_a2 = store.create_agent(tenant_a, "A2", cfg)
+    agent_b = store.create_agent(tenant_b, "B", cfg)
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    app = create_app(store, rt, security.ConcurrencyLimiter(2), None, Settings(admin_key="adm"))
+    with TestClient(app) as client:
+        first = client.put("/v1/numbers/+15551110000", json={"agentId": agent_a["id"]}, headers={"X-API-Key": key_a})
+        assert first.status_code == 200
+        stolen = client.put("/v1/numbers/+15551110000", json={"agentId": agent_b["id"]}, headers={"X-API-Key": key_b})
+        assert stolen.status_code == 409
+        again = client.put("/v1/numbers/+15551110000", json={"agentId": agent_a2["id"]}, headers={"X-API-Key": key_a})
+        assert again.status_code == 200 and again.json()["agentId"] == agent_a2["id"]
+    row = store.get_number("+15551110000")
+    assert row["tenant_id"] == tenant_a and row["agent_id"] == agent_a2["id"]
+    assert store.list_numbers(tenant_b) == []
+
+
+def test_sip_doc_routes_by_number_and_passes_caller():
+    doc = open("docs/SIP.md", encoding="utf-8").read()
+    assert "Caller number is not passed" not in doc
+    assert "another way; not built" not in doc
+    assert "VOX_SIP_TOKEN" in doc
+    assert "PUT /v1/numbers/{e164}" in doc
+    assert "{{caller}}" in doc and "{{callee}}" in doc

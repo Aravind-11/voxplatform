@@ -286,6 +286,27 @@ def _guarded_booker(text):
     return ctx, fns["book_slot"]
 
 
+async def test_readback_of_a_different_hour_does_not_book():
+    # "2 pm" is contained in "12 pm", and "9:00" in "19:00". Those are different slots.
+    ctx, run = _guarded_booker("Monday at 12 pm")
+    refused = await run({"day": "monday", "time": "2 pm"})
+    assert refused["executed"] is False
+    assert refused["next_step"] == toolmod._READBACK_STEP
+    ctx.turn = 1
+    assert (await run({"day": "monday", "time": "2 pm", "confirmed": True}))["executed"] is False
+
+    ctx2, run2 = _guarded_booker("Monday at 19:00")
+    refused = await run2({"day": "monday", "time": "9:00"})
+    assert refused["next_step"] == toolmod._READBACK_STEP
+
+    # the same hour, including a trailing period, still passes the guard and then the confirm rules
+    ctx3, run3 = _guarded_booker("Monday at 2 pm.")
+    first = await run3({"day": "monday", "time": "2 pm"})
+    assert first["executed"] is False and "read these details back" in first["next_step"].lower()
+    ctx3.turn = 1
+    assert (await run3({"day": "monday", "time": "2 pm", "confirmed": True}))["booked"] is True
+
+
 async def test_slot_guard_refuses_book_slot_when_tuesday_was_not_read_back():
     ctx, run = _guarded_booker("I can check Monday.")
     out = await run({"day": "tuesday", "time": "11:00"})

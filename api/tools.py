@@ -75,6 +75,8 @@ READBACK_INSTRUCTION = ("Critical slots (names, dates, times, numbers, amounts) 
                         "in the agent's own words before a tool that changes state.")
 _SLOT_MARKS = ("book", "create", "update", "delete", "transfer", "purchase")
 _READBACK_STEP = "Read these values back to the caller before calling the tool."
+# Punctuation becomes a gap so "2 pm" is not found inside "12 pm", and "9:00" is not found inside "19:00".
+_SLOT_GAP = re.compile(r"[^\w']+", re.UNICODE)
 
 
 def needs_slot_guard(specs: list) -> bool:
@@ -100,6 +102,21 @@ def _assistant_text(ctx) -> str:
     return "" if raw is None else str(raw)
 
 
+def _fold_slot(text: str) -> str:
+    """Lowercase and pad so a slot matches only as its own token, not as part of a longer one."""
+    return " " + re.sub(r"\s+", " ", _SLOT_GAP.sub(" ", str(text).lower())).strip() + " "
+
+
+def _slot_was_said(value: str, said: str) -> bool:
+    raw = value.strip()
+    if len(raw) < 3:
+        return True
+    needle = _fold_slot(raw).strip()
+    if not needle:
+        return False
+    return f" {needle} " in _fold_slot(said)
+
+
 def slot_guard(fn, ctx):
     """Block a state-changing call until each string argument (length >= 3) was in the assistant's last message.
 
@@ -110,9 +127,9 @@ def slot_guard(fn, ctx):
         args = dict(args or {})
         if not getattr(ctx, "guard_slots", False):
             return await fn(args)
-        said = _assistant_text(ctx).lower()
+        said = _assistant_text(ctx)
         for value in args.values():
-            if isinstance(value, str) and len(value.strip()) >= 3 and value.strip().lower() not in said:
+            if isinstance(value, str) and not _slot_was_said(value, said):
                 return {"executed": False, "next_step": _READBACK_STEP, "details": args}
         return await fn(args)
     return run

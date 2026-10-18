@@ -150,15 +150,17 @@ def validate_specs(specs: list) -> list[dict]:
 
 
 def filler_texts(specs: list) -> dict[str, str]:
-    """Per-tool spoken filler from `fillerText` on HTTP specs. Absent or blank means 'use the session default'."""
+    """Per-tool spoken filler. Missing fillerText uses the session default; an explicit blank disables it."""
     out: dict[str, str] = {}
     for d in validate_specs(specs):
-        text = d.get("fillerText") or ""
-        if not isinstance(text, str) or not text.strip():
+        if "fillerText" not in d:
+            continue
+        text = d.get("fillerText")
+        if not isinstance(text, str):
             continue
         name = d.get("name") or d.get("demo") or d.get("builtin")
         if name:
-            out[str(name)] = text
+            out[str(name)] = text.strip()
     return out
 
 

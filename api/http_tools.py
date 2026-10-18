@@ -93,17 +93,18 @@ def validate(defn: dict) -> dict:
     auto = defn.get("automatic", []) or []
     if not isinstance(auto, list) or not set(auto) <= AUTOMATIC:
         raise ToolConfigError(f"tool {name}: automatic must be a subset of {sorted(AUTOMATIC)}")
-    filler = defn.get("fillerText", "")
-    if filler is None:
-        filler = ""
-    if not isinstance(filler, str) or len(filler) > 200:
-        raise ToolConfigError(f"tool {name}: fillerText must be a string of at most 200 characters")
     out = {"name": name, "description": desc.strip(), "parameters": params,
            "http": {"url": http["url"], "method": method, "headers": headers, "timeoutS": timeout,
                     "query": list(query_names)},
            "static": static, "automatic": list(auto), "confirm": bool(defn.get("confirm", False))}
-    if filler.strip():
-        out["fillerText"] = filler
+    # Absent uses the session default. An explicit blank (or null) disables the line for this tool.
+    if "fillerText" in defn:
+        filler = defn.get("fillerText")
+        if filler is None:
+            filler = ""
+        if not isinstance(filler, str) or len(filler) > 200:
+            raise ToolConfigError(f"tool {name}: fillerText must be a string of at most 200 characters")
+        out["fillerText"] = filler.strip()
     return out
 
 

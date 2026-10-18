@@ -236,6 +236,39 @@ async def test_slow_tool_speaks_its_filler_before_returning():
     assert "Booked for ten." in r.tts.texts
 
 
+async def test_blank_per_tool_filler_does_not_speak_the_default():
+    """fillerText "" is a disable, not a missing value. The default line must not play."""
+    from api.tools import filler_texts
+
+    release = asyncio.Event()
+
+    async def lookup(args):
+        await release.wait()
+        return {"slot": "10:00"}
+
+    fillers = filler_texts([{
+        "name": "lookup", "description": "Find a slot.",
+        "parameters": {"type": "object", "properties": {}},
+        "http": {"url": "https://api.example.com/slots"},
+        "fillerText": "   ",
+    }])
+    llm = FakeLLM([["Let me check. ", ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["Booked for ten."]])
+    r = Rig(llm, tools={"lookup": lookup},
+            cfg=SessionConfig(tts_poll_s=0, filler_delay_s=0.01, tool_fillers=fillers))
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    try:
+        await asyncio.sleep(0.05)           # past filler_delay_s while the tool is still blocked
+        assert fillers == {"lookup": ""}
+        assert "One moment, let me check that." not in r.tts.texts
+    finally:
+        release.set()
+    await r.settle()
+    assert "One moment, let me check that." not in r.tts.texts
+    assert "Booked for ten." in r.tts.texts
+
+
 async def test_fast_tool_does_not_speak_a_filler():
     async def lookup(args):
         return {"slot": "10:00"}

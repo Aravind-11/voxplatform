@@ -228,3 +228,18 @@ def test_sip_setup_puts_the_caller_on_the_call_and_into_the_prompt():
     with TestClient(app2) as c2:
         assert c2.post("/internal/sip/setup", data={"uuid": "z", "caller": caller, "callee": callee},
                        headers={"X-Vox-Sip-Token": "z"}).status_code == 404
+
+
+def test_dialplan_keeps_the_dialed_number_and_does_not_shell_out_caller_id():
+    """_+X. must land in _X. with the digits still in ${EXTEN}. System() is a shell, and $() runs inside
+    double quotes, so CALLERID(num) and EXTEN cannot be interpolated into that command."""
+    text = open("deploy/sip/extensions.conf", encoding="utf-8").read()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith(";"))
+    assert "exten => _+X.,1,Goto(${EXTEN:1},1)" in code
+    assert "Goto(_X.,1)" not in code
+    shell_lines = [ln for ln in code.splitlines() if "System(" in ln or "SHELL(" in ln]
+    assert shell_lines, "the dialplan should still post the setup before AudioSocket"
+    for ln in shell_lines:
+        assert "${CALLERID(" not in ln
+        assert "${EXTEN}" not in ln
+    assert 'caller=${SAFE_CALLER}' in code and 'callee=${SAFE_CALLEE}' in code

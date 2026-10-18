@@ -3,7 +3,8 @@
 SIP/RTP is handled by Asterisk (a separate process, see deploy/sip/); Asterisk streams each call's audio to this server
 over one plain TCP connection using the AudioSocket protocol (Asterisk docs: AudioSocket, `AudioSocket(uuid,host:port)`).
 Wire format: every message is  kind (1 byte) | length (2 bytes, big endian) | payload.
-  0x01 UUID (16 bytes, first message)   0x10 audio (signed 16-bit little-endian PCM, 8 kHz, mono; 20 ms = 320 bytes)
+  0x01 UUID (16 bytes, first message)   0x10 audio (signed 16-bit little-endian PCM, mono, 8 kHz, 20 ms = 320 bytes)
+  0x12 audio (the same PCM at 16 kHz, 20 ms = 640 bytes; Asterisk plays 0x10 as 8 kHz)
   0x03 DTMF (1 ASCII char)              0x00 hangup (either direction)      0xff error (1 byte code)
 Asterisk plays audio at the rate it arrives, so this transport PACES outbound frames at real time (20 ms each) from its
 own queue; that queue is what `clear()` empties on an interruption.
@@ -22,7 +23,8 @@ from core.audio import StreamResampler
 from core.session import FRAME_SAMPLES, Session
 
 KIND_HANGUP, KIND_UUID, KIND_DTMF, KIND_AUDIO, KIND_ERROR = 0x00, 0x01, 0x03, 0x10, 0xFF
-FRAME_BYTES = 320          # 20 ms of 8 kHz 16-bit mono
+KIND_SLIN16 = 0x12         # 16 kHz signed-linear; 0x10 is 8 kHz on every Asterisk that speaks AudioSocket
+FRAME_BYTES = 320          # 20 ms of 8 kHz 16-bit mono; 16 kHz uses sample_rate // 50 * 2
 FRAME_S = 0.02
 DTMF_IDLE_S = 2.0
 SessionFactory = Callable[["AudioSocketTransport", dict], Awaitable[Session]]
@@ -45,7 +47,8 @@ async def read_message(reader: asyncio.StreamReader) -> tuple[int, bytes]:
 class AudioSocketTransport:
     out_rate = 8000
 
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, session_factory: SessionFactory):
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, session_factory: SessionFactory,
+                 sample_rate: int = 8000):
         self.reader, self.writer = reader, writer
         self.session_factory = session_factory
         self.session: Session | None = None
@@ -53,7 +56,9 @@ class AudioSocketTransport:
         self.custom: dict = {}
         self.ended_by_us = False
         self.before_end = None
-        self._rs = StreamResampler(8000, 16000)
+        self.out_rate = sample_rate        # 8000 ulaw/alaw, or 16000 when the dialplan is slin16 / g722
+        self._frame_bytes = sample_rate // 50 * 2    # 20 ms of 16-bit mono
+        self._rs = StreamResampler(sample_rate, 16000)   # equal rates are a no-op (no 8 kHz upsample)
         self._buf = np.zeros(0, dtype=np.int16)
         self._out: asyncio.Queue[bytes] = asyncio.Queue()
         self._pending = b""
@@ -64,14 +69,15 @@ class AudioSocketTransport:
 
     # --- called by Session ---
     async def send_audio(self, pcm: np.ndarray, rate: int) -> None:
-        assert rate == 8000, "AudioSocket transport expects 8 kHz output"
+        assert rate == self.out_rate, f"AudioSocket transport expects {self.out_rate} Hz output"
         data = self._pending + np.asarray(pcm, dtype="<i2").tobytes()
-        n = len(data) - len(data) % FRAME_BYTES
-        for i in range(0, n, FRAME_BYTES):
-            self._out.put_nowait(data[i:i + FRAME_BYTES])
+        frame_bytes = self._frame_bytes
+        n = len(data) - len(data) % frame_bytes
+        for i in range(0, n, frame_bytes):
+            self._out.put_nowait(data[i:i + frame_bytes])
         self._pending = data[n:]
         if self._pending and self._out.empty():            # flush the tail of a reply as a padded last frame
-            self._out.put_nowait(self._pending.ljust(FRAME_BYTES, b"\x00"))
+            self._out.put_nowait(self._pending.ljust(frame_bytes, b"\x00"))
             self._pending = b""
 
     async def clear(self) -> None:
@@ -83,7 +89,7 @@ class AudioSocketTransport:
                 break
 
     async def send_dtmf(self, digits: str) -> None:
-        await self.send_audio(dtmf.sequence(digits, 8000), 8000)
+        await self.send_audio(dtmf.sequence(digits, self.out_rate), self.out_rate)
 
     async def _pace(self) -> None:
         """Sends one queued frame every 20 ms (silence is not sent: Asterisk fills gaps itself)."""
@@ -98,7 +104,7 @@ class AudioSocketTransport:
             nxt += FRAME_S
             if self._closed:
                 return
-            self.writer.write(pack(KIND_AUDIO, frame))
+            self.writer.write(pack(self._audio_kind(), frame))
             await self.writer.drain()
 
     def _on_dtmf(self, digit: str) -> None:
@@ -169,8 +175,8 @@ class AudioSocketTransport:
             await self.session.start()
             while True:
                 kind, payload = await read_message(self.reader)
-                if kind == KIND_AUDIO:
-                    await self._on_audio(payload)
+                if kind in (KIND_AUDIO, KIND_SLIN16):
+                    await self._on_audio(payload, kind)
                 elif kind == KIND_DTMF:
                     self._on_dtmf(payload.decode("ascii", "ignore")[:1])
                 elif kind == KIND_HANGUP:
@@ -188,9 +194,19 @@ class AudioSocketTransport:
                 await self.session.close()
             await self._close()
 
-    async def _on_audio(self, payload: bytes) -> None:
-        pcm8 = np.frombuffer(payload[: len(payload) - len(payload) % 2], dtype="<i2")
-        self._buf = np.concatenate([self._buf, self._rs.push(pcm8)])
+    def _audio_kind(self) -> int:
+        # 16 kHz PCM tagged 0x10 is played at half speed. 8 kHz stays 0x10 / 320 bytes.
+        return KIND_SLIN16 if self.out_rate == 16000 else KIND_AUDIO
+
+    async def _on_audio(self, payload: bytes, kind: int = KIND_AUDIO) -> None:
+        pcm = np.frombuffer(payload[: len(payload) - len(payload) % 2], dtype="<i2")
+        # 0x12 is already 16 kHz, which is what the session consumes. Running it through the
+        # configured-rate resampler would treat those samples as 8 kHz when out_rate is 8000.
+        if kind == KIND_SLIN16:
+            samples = pcm
+        else:
+            samples = self._rs.push(pcm)
+        self._buf = np.concatenate([self._buf, samples])
         while len(self._buf) >= FRAME_SAMPLES:
             frame, self._buf = self._buf[:FRAME_SAMPLES], self._buf[FRAME_SAMPLES:]
             await self.session.feed(frame)  # type: ignore[union-attr]

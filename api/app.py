@@ -49,6 +49,7 @@ class Settings:
     node_max_calls: int = 32           # this process; 0 = no node cap. Checked before the per-tenant cap.
     overflow_url: str = ""             # http(s) only; a full or draining node redirects Twilio here instead of speaking
     sip_token: str = ""                # VOX_SIP_TOKEN; empty disables /internal/sip/setup and /sip/recover (404)
+    audiosocket_rate: int = 8000       # VOX_AUDIOSOCKET_RATE. 8000 keeps 320-byte frames; 16000 matches g722/slin16.
 
 
 def checked_overflow(url: str) -> str:
@@ -1289,7 +1290,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 state["t"] = admit(call)
                 return runtime.build_session(call, transport)
 
-            tr = AudioSocketTransport(reader, writer, factory)
+            tr = AudioSocketTransport(reader, writer, factory, sample_rate=settings.audiosocket_rate)
             tr.before_end = lambda: state.get("call") and store.update_call(state["call"]["id"], end_reason="agent_hangup")
             try:
                 await tr.run(uuid_timeout=AUDIOSOCKET_UUID_TIMEOUT_S)

@@ -8,7 +8,7 @@
 
 ## How it works here
 ```
-caller -> VoxSun -- SIP/RTP --> Asterisk -- AudioSocket (TCP, 8 kHz audio) --> voice engine (this repo)
+caller -> VoxSun -- SIP/RTP --> Asterisk -- AudioSocket (TCP, 8 kHz or 16 kHz PCM) --> voice engine (this repo)
 ```
 Asterisk (open source) does the SIP and audio-over-IP work. Before AudioSocket opens, the dialplan posts the call
 UUID, the caller number, and the dialed number to `POST /internal/sip/setup` with header `X-Vox-Sip-Token`.
@@ -25,7 +25,7 @@ or no number row, the call is answered as `VOX_SIP_AGENT`. An empty `VOX_SIP_TOK
 ## What is verified and what is not
 | Part | State |
 |---|---|
-| AudioSocket transport: message format, 8 kHz audio in, paced real-time audio out, interruption (queue cleared), DTMF in, hangup both ways | **tested** (4 unit tests incl. a simulated Asterisk talking to the real app; no real Asterisk) |
+| AudioSocket transport: message format, 8 kHz or 16 kHz (`VOX_AUDIOSOCKET_RATE`, g722/slin16) audio in, paced real-time audio out, interruption (queue cleared), DTMF in, hangup both ways | **tested** (unit tests incl. a simulated Asterisk talking to the real app; no real Asterisk) |
 | `VOX_AUDIOSOCKET_*` settings and the call lifecycle (create, admit, session, finish, webhook) | **tested** with the simulated Asterisk |
 | Asterisk config (`deploy/sip/`), `deploy/Dockerfile.asterisk`, compose `asterisk` service (profile `sip`) | **written from Asterisk's documentation, never run**: compose file parses; no Asterisk was available here |
 | Real call from VoxSun | **not done**: needs VoxSun credentials and a test number |
@@ -38,7 +38,7 @@ or no number row, the call is answered as `VOX_SIP_AGENT`. An empty `VOX_SIP_TOK
 5. Check: `docker compose exec asterisk asterisk -rx "pjsip show registrations"` and `... "module show like audiosocket"`.
 6. Call the VoxSun number. In the engine logs you should see a new `sip` call on the mapped agent. `{{caller}}` and `{{callee}}` are filled from that setup.
 
-Without Docker: install Asterisk 18+ (needs the AudioSocket modules), copy the files from `deploy/sip/` (including `sip_setup.py`; `pjsip.conf` includes `pjsip.register.conf`) to `/etc/asterisk/`, export `SIP_SETUP_TOKEN` to the same secret, and run the engine with `VOX_AUDIOSOCKET_PORT=9092 VOX_AUDIOSOCKET_AGENT=<id> VOX_AUDIOSOCKET_HOST=127.0.0.1 VOX_SIP_TOKEN=<secret>` (change `api1` in `extensions.conf` to `127.0.0.1` for both AudioSocket and the setup URL).
+Without Docker: install Asterisk 20.17+, 21.12+, or 22.7+ (needs the AudioSocket channel modules; older releases drop kind 0x12 and the agent is silent), copy the files from `deploy/sip/` (including `sip_setup.py`; `pjsip.conf` includes `pjsip.register.conf`) to `/etc/asterisk/`, export `SIP_SETUP_TOKEN` to the same secret, and run the engine with `VOX_AUDIOSOCKET_PORT=9092 VOX_AUDIOSOCKET_AGENT=<id> VOX_AUDIOSOCKET_HOST=127.0.0.1 VOX_AUDIOSOCKET_RATE=16000 VOX_SIP_TOKEN=<secret>` (change `api1` in `extensions.conf` to `127.0.0.1` for both the AudioSocket dial and the setup URL).
 
 ## Known limits
 - **Caller id:** AudioSocket carries only the call UUID. The dialplan posts the caller id and the dialed number first (`caller`, plus `exten` or `callee`). Only digits and a leading `+` are forwarded (`+` is sent as `%2B`). Anything else is stripped before the request, so it cannot be run as a shell command. The token stays in `SIP_SETUP_TOKEN` and is not placed on the shell command line. Metadata `from` / `to` fill `{{caller}}` and `{{callee}}`. A setup older than 60 seconds is ignored for a new call. Hang-up, DELETE, and retention remove the setup row. An empty `VOX_SIP_TOKEN` leaves setup and `/sip/recover` off.

@@ -1,4 +1,5 @@
 import asyncio
+import re
 import struct
 import time
 import uuid
@@ -359,9 +360,12 @@ def test_dialplan_system_does_not_interpolate_raw_caller_or_extension():
     assert "${SIP_CALLER}" in shell and "${SIP_EXTEN}" in shell
     assert "sip/sip_setup.py" in open("deploy/Dockerfile.asterisk", encoding="utf-8").read()
     code = [_dialplan_code(raw) for raw in text.splitlines()]
-    audiosocket = [line for line in code if "AudioSocket(" in line]
+    # AudioSocket() is 8 kHz. Wideband is Dial(AudioSocket/.../c(slin16)), and that line still
+    # has to carry ${CALLUUID} so the setup row and the socket are the same call.
+    dial = [line for line in code if "Dial(AudioSocket/" in line]
     setup = [line for line in code if "System(" in line and "sip_setup.py" in line]
-    assert len(audiosocket) == 1 and "${CALLUUID}" in audiosocket[0]
+    assert len(dial) == 1 and "${CALLUUID}" in dial[0] and "/c(slin16)" in dial[0]
+    assert not any("AudioSocket(" in line for line in code)
     assert len(setup) == 1 and "${CALLUUID}" in setup[0]
     assert "AudioSocket(${UUID()}" not in text
 
@@ -612,7 +616,7 @@ def test_dialplan_keeps_the_dialed_number_and_does_not_shell_out_caller_id():
 
     system_at = at("System(")
     assert at("Set(SIP_CALLER=") < system_at and at("Set(SIP_EXTEN=") < system_at
-    assert at("Set(CALLUUID=") < system_at < at("AudioSocket(${CALLUUID}")
+    assert at("Set(CALLUUID=") < system_at < at("Dial(AudioSocket/api1:9092/${CALLUUID}/c(slin16))")
     system = lines[system_at]
     assert "${CALLUUID}" in system and "/internal/sip/setup" in system and "sip_setup.py" in system
     assert "AudioSocket(${UUID()}" not in code
@@ -706,3 +710,204 @@ def test_sip_caller_is_dropped_when_the_call_ends_is_deleted_or_expires():
         assert store.get_sip_setup(old_orphan, max_age=None) is None and old_orphan not in app.state.sip_setups
         assert store.get_sip_setup(linked, max_age=None) is None and linked not in app.state.sip_setups
         assert store.get_sip_setup(fresh, max_age=None)["caller"] == caller and fresh in app.state.sip_setups
+
+
+def test_dialplan_requests_slin16_on_the_audiosocket_channel():
+    """AudioSocket() forces 8 kHz slin and ignores CHANNEL(audioreadformat). The channel driver does not."""
+    text = open("deploy/sip/extensions.conf", encoding="utf-8").read()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith(";"))
+    # ${UUID()} would not match the setup row. The socket id is the CALLUUID posted above.
+    assert "Dial(AudioSocket/api1:9092/${CALLUUID}/c(slin16))" in code
+    assert "${UUID()}" not in code
+    assert "AudioSocket(" not in code
+    assert "audioreadformat" not in code
+    assert "Goto(_X.,1)" not in code
+    assert "Goto(${EXTEN:1},1)" in code
+    modules = open("deploy/sip/modules.conf", encoding="utf-8").read()
+    assert "load = chan_audiosocket.so" in modules
+    # Comment lines do not count. g722 before ulaw/alaw is what keeps a dual-offer peer off 8 kHz.
+    sections: list[tuple[str, list[str]]] = []
+    name, body = None, []
+    for raw in open("deploy/sip/pjsip.conf", encoding="utf-8"):
+        ln = raw.split(";", 1)[0].strip()
+        if not ln:
+            continue
+        if ln.startswith("[") and ln.endswith("]"):
+            if name is not None:
+                sections.append((name, body))
+            name, body = ln[1:-1], []
+        elif name is not None:
+            body.append(ln)
+    if name is not None:
+        sections.append((name, body))
+    endpoints = [b for _, b in sections if "type=endpoint" in b]
+    assert len(endpoints) == 1
+    endpoint = endpoints[0]
+    assert "disallow=all" in endpoint
+    assert "allow=g722" in endpoint and "allow=ulaw" in endpoint and "allow=alaw" in endpoint
+    g722 = endpoint.index("allow=g722")
+    assert endpoint.index("disallow=all") < g722
+    assert g722 < endpoint.index("allow=ulaw") and g722 < endpoint.index("allow=alaw")
+
+
+def test_full_sip_call_through_the_app_creates_a_call_speaks_back_and_hangs_up():
+    """A simulated Asterisk connects to the app's AudioSocket port: a 'sip' call is created, the agent answers, and
+    when Asterisk hangs up the call ends in the database."""
+    import socket
+    from fastapi.testclient import TestClient
+    from api import security
+    from api.app import Settings, create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    tid = store.create_tenant("a")
+    ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "Hello from SIP", "tools": []})
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    settings = Settings(admin_key="adm", audiosocket_port=port, audiosocket_agent=ag["id"], audiosocket_rate=8000)
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), None, settings)
+    with TestClient(app):
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.sendall(A.pack(A.KIND_UUID, uuid.uuid4().bytes))
+        got_audio = False
+        sock.settimeout(5)
+        buf = b""
+        end = time.time() + 5
+        while time.time() < end and not got_audio:
+            buf += sock.recv(4096)
+            got_audio = len(buf) >= 3 + 320 and buf[0] == A.KIND_AUDIO
+        assert got_audio, "the greeting should arrive as AudioSocket audio frames"
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        for _ in range(100):
+            calls = store.list_calls(tid)
+            if calls and calls[0]["status"] == "ended":
+                break
+            time.sleep(0.05)
+        assert calls[0]["medium"] == "sip" and calls[0]["status"] == "ended"
+
+
+def _asterisk_plays_slin16(major: int, minor: int) -> bool:
+    """Kinds 0x11-0x18 (0x12 is 16 kHz slin) shipped in 20.17, 21.12, and 22.7."""
+    if major > 22:
+        return True
+    if major == 22:
+        return minor >= 7
+    if major == 21:
+        return minor >= 12
+    if major == 20:
+        return minor >= 17
+    return False
+
+
+def test_asterisk_image_plays_slin16_and_bare_metal_sets_the_rate():
+    """Debian 12 has no asterisk package, and 20.6 drops kind 0x12. The image must build a release that plays it,
+    and the non-docker command must ask the engine for 16 kHz or TTS stays 8 kHz against a slin16 dialplan."""
+    docker = open("deploy/Dockerfile.asterisk", encoding="utf-8").read()
+    m = re.search(r"(?m)^ARG\s+ASTERISK_VERSION=(\d+)\.(\d+)\.(\d+)\s*$", docker)
+    assert m, "Dockerfile.asterisk must pin ASTERISK_VERSION"
+    major, minor = int(m.group(1)), int(m.group(2))
+    assert _asterisk_plays_slin16(major, minor), (major, minor)
+    assert "downloads.asterisk.org" in docker
+    assert "asterisk-${ASTERISK_VERSION}.tar.gz" in docker
+    assert "chan_audiosocket" in docker and "res_audiosocket" in docker
+    code = "\n".join(ln for ln in docker.splitlines() if not ln.lstrip().startswith("#"))
+    assert re.search(r"menuselect\s+--enable\s+codec_g722\b", code)
+    assert re.search(r"test\s+-f\s+\S*codec_g722\.so\b", code)
+    flat = docker.replace("\\\n", " ")
+    installs = re.findall(r"apt-get\s+install\b([^;&|]*)", flat)
+    assert installs, "Dockerfile.asterisk lost its package install"
+    for blob in installs:
+        pkgs = {tok.split("=")[0] for tok in blob.split() if not tok.startswith("-")}
+        assert "asterisk" not in pkgs and "asterisk-modules" not in pkgs
+    sip = open("docs/SIP.md", encoding="utf-8").read()
+    bare = next(ln for ln in sip.splitlines() if ln.startswith("Without Docker:"))
+    assert "18+" not in bare
+    assert "20.17" in bare and "21.12" in bare and "22.7" in bare
+    assert "VOX_AUDIOSOCKET_PORT=9092" in bare
+    assert "VOX_AUDIOSOCKET_AGENT=" in bare
+    assert "VOX_AUDIOSOCKET_HOST=127.0.0.1" in bare
+    assert "VOX_AUDIOSOCKET_RATE=16000" in bare
+
+
+def test_compose_api_sets_audiosocket_rate_16000():
+    """The shipped api services must run at 16000. A missing or 8000 value leaves 320-byte frames against slin16."""
+    text = open("deploy/docker-compose.yml", encoding="utf-8").read()
+    env = re.search(r"(?m)^  environment: &api-env\n((?:    .*\n)*)", text)
+    assert env, "api environment anchor missing"
+    rate = re.search(r'(?m)^    VOX_AUDIOSOCKET_RATE:\s*"16000"\s*(?:#.*)?$', env.group(1))
+    assert rate, "api environment must set VOX_AUDIOSOCKET_RATE to the literal 16000"
+    assert re.search(r"(?m)^  api1:\s*\{[^}\n]*<<:\s*\*api\b", text)
+    assert re.search(r"(?m)^  api2:\s*\{[^}\n]*<<:\s*\*api\b", text)
+
+
+def test_settings_audiosocket_rate_defaults_to_8000_and_build_reads_the_env():
+    """The code default stays 8000. build() must still pass the env value through; do not call build() (it loads TTS)."""
+    from api.app import Settings
+    assert Settings().audiosocket_rate == 8000
+    src = open("api/main.py", encoding="utf-8").read()
+    assert 'audiosocket_rate=int(env.get("VOX_AUDIOSOCKET_RATE", "8000"))' in src
+
+
+def test_wideband_sip_call_through_the_app_speaks_kind_0x12_at_the_session_rate():
+    """create_app must pass audiosocket_rate into the transport and build_session must copy out_rate.
+    The greeting is then kind 0x12, 640 bytes, not an 8 kHz frame Asterisk would play at half speed."""
+    import socket
+    from fastapi.testclient import TestClient
+    from api import security
+    from api.app import Settings, create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    tid = store.create_tenant("a")
+    ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "Hello from SIP", "tools": []})
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    settings = Settings(admin_key="adm", audiosocket_port=port, audiosocket_agent=ag["id"], audiosocket_rate=16000)
+    app = create_app(store, rt, security.ConcurrencyLimiter(default_limit=2), None, settings)
+    with TestClient(app):
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.sendall(A.pack(A.KIND_UUID, uuid.uuid4().bytes))
+        sock.settimeout(5)
+        buf, audio = b"", None
+        end = time.time() + 5
+        while time.time() < end and audio is None:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while len(buf) >= 3 and audio is None:
+                kind, n = struct.unpack_from(">BH", buf)
+                if len(buf) < 3 + n:
+                    break
+                payload, buf = buf[3:3 + n], buf[3 + n:]
+                if kind in (A.KIND_AUDIO, A.KIND_SLIN16):
+                    audio = (kind, payload)
+        assert audio is not None, "the greeting should arrive as an AudioSocket audio frame"
+        kind, payload = audio
+        assert kind == A.KIND_SLIN16 == 0x12 and len(payload) == 640
+        assert abs(int(np.median(np.frombuffer(payload, dtype="<i2"))) - 500) < 50
+        assert rt.live, "build_session did not keep the live session"
+        for sess, tr in rt.live.values():
+            assert sess.cfg.out_rate == 16000 and tr.out_rate == 16000
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        for _ in range(100):
+            calls = store.list_calls(tid)
+            if calls and calls[0]["status"] == "ended":
+                break
+            time.sleep(0.05)
+        assert calls[0]["medium"] == "sip" and calls[0]["status"] == "ended"

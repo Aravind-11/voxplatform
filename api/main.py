@@ -30,6 +30,7 @@
   VOX_NO_ESPEAK=1          run Kokoro without the GPL espeak-ng fallback (English only; Spanish/French/Italian/Portuguese/Hindi need espeak)
   VOX_PRELOAD_LANGS        Kokoro language codes to load at start-up, default a (a,b English; e,f,h,i,p,j,z others; see docs/LANGUAGES.md)
   VOX_AUDIOSOCKET_PORT / VOX_AUDIOSOCKET_AGENT / VOX_AUDIOSOCKET_HOST   SIP path: TCP port Asterisk streams call audio to, and the agent id that answers when no number is mapped (docs/SIP.md)
+  VOX_AUDIOSOCKET_RATE     AudioSocket PCM rate (8000 ulaw, or 16000 with g722/slin16). Default 8000.
   VOX_SIP_TOKEN            shared secret for POST /internal/sip/setup and POST /sip/recover; empty = both endpoints off
   VOX_PROCS                API processes on one host (default 1). Unset or 1: a single uvicorn with --workers 1.
                            Above 1, scripts/deploy.sh starts one process per port 8080..8080+N-1, not uvicorn's
@@ -74,7 +75,8 @@ def build():
                         audiosocket_port=int(env.get("VOX_AUDIOSOCKET_PORT", "0")),
                         audiosocket_agent=env.get("VOX_AUDIOSOCKET_AGENT", ""),
                         audiosocket_host=env.get("VOX_AUDIOSOCKET_HOST", "127.0.0.1"),
-                        sip_token=env.get("VOX_SIP_TOKEN", ""))
+                        sip_token=env.get("VOX_SIP_TOKEN", ""),
+                        audiosocket_rate=int(env.get("VOX_AUDIOSOCKET_RATE", "8000")))
     store = Store(env.get("VOX_DB", "vox.db"))
     from core.tts import PipelineSet
     pipelines = PipelineSet(preload=env.get("VOX_PRELOAD_LANGS", "a"))   # one front end per language, shared by all calls

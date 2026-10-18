@@ -853,23 +853,39 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not agent or app.state.draining:
             writer.close()
             return
-        call = store.create_call(agent["tenant_id"], agent["id"], "sip", agent["config"], {})
         state: dict = {}
 
         async def factory(tr, custom):
-            store.update_call(call["id"], metadata={"callSid": custom.get("uuid", ""), "channel": "sip"})
+            # A recovered row is created, with resumedFrom, and waiting for this uuid.
+            # An ended or still-active row with the same uuid is a different call.
+            uid = str(custom.get("uuid") or "")
+            existing = store.find_call_by_sid(uid, medium="sip") if uid else None
+            meta = (existing or {}).get("metadata") or {}
+            if isinstance(meta, str):
+                meta = json.loads(meta or "{}")
+            if existing and existing["status"] == "created" and meta.get("resumedFrom"):
+                call = existing
+            else:
+                call = store.create_call(agent["tenant_id"], agent["id"], "sip", agent["config"],
+                                         {"callSid": uid, "channel": "sip"})
+            state["call"] = call
             state["t"] = admit(call)
             return runtime.build_session(call, tr)
 
+        def mark_hangup() -> None:
+            call = state.get("call")
+            if call is not None:
+                store.update_call(call["id"], end_reason="agent_hangup")
+
         tr = AudioSocketTransport(reader, writer, factory)
-        tr.before_end = lambda: store.update_call(call["id"], end_reason="agent_hangup")
+        tr.before_end = mark_hangup
         try:
             await tr.run()
         except _Reject:
             writer.close()
         finally:
             if "t" in state:
-                finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+                finish(state["call"], state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
 
     @app.on_event("startup")
     async def _start_audiosocket():

@@ -151,6 +151,63 @@ def test_sip_recover_seeds_history_from_the_lost_audiosocket_call():
     assert off.post("/sip/recover", json={"uuid": "sip-uuid-1"}, headers={"X-Vox-Sip-Token": "sip-secret"}).status_code == 404
 
 
+def test_next_audiosocket_keeps_the_recovered_transcript():
+    """The AudioSocket that follows /sip/recover must run that call. A new blank row drops the transcript."""
+    import socket
+    import uuid
+    from fastapi.testclient import TestClient
+    from api import security
+    from api.app import create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
+    from transports import audiosocket as A
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    store = Store()
+    tid = store.create_tenant("a")
+    ag = store.create_agent(tid, "n", {"systemPrompt": "", "voice": "af_heart", "greeting": "Hello!", "tools": []})
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    settings = Settings(admin_key="adm", public_base_url=BASE, twilio_auth_token="tok", sip_token="sip-secret",
+                        audiosocket_port=port, audiosocket_agent=ag["id"])
+    lim = security.ConcurrencyLimiter(default_limit=2)
+    app = create_app(store, rt, lim, None, settings)
+    uid = str(uuid.uuid4())
+    call = store.create_call(tid, ag["id"], "sip", ag["config"],
+                             {"callSid": uid, "from": "+15550001", "to": "+15550002", "channel": "sip"})
+    store.update_call(call["id"], status="active", joined=time.time())
+    assert lim.acquire(tid, call["id"], 5)
+    store.add_message(call["id"], "agent", "Hello, how can I help?", time.time())
+    store.add_message(call["id"], "user", "I want Tuesday at eleven.", time.time())
+    with TestClient(app) as c:
+        r = c.post("/sip/recover", json={"uuid": uid}, headers={"X-Vox-Sip-Token": "sip-secret"})
+        assert r.status_code == 200
+        new_id = r.json()["callId"]
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.sendall(A.pack(A.KIND_UUID, uuid.UUID(uid).bytes))
+        live = None
+        for _ in range(100):
+            live = app.state.runtime.live.get(new_id)
+            if live:
+                break
+            time.sleep(0.01)
+        assert live, "AudioSocket opened a different call, so the recovered transcript was not attached"
+        body = [(m["role"], m["content"]) for m in live[0].history]
+        assert ("assistant", "Hello, how can I help?") in body
+        assert ("user", "I want Tuesday at eleven.") in body
+        assert len(store.list_calls(tid)) == 2
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        for _ in range(100):
+            if store.get_call_any(new_id)["status"] == "ended":
+                break
+            time.sleep(0.05)
+        assert store.get_call_any(new_id)["status"] == "ended" and lim.total_active() == 0
+
+
 def test_unknown_or_browser_calls_just_hang_up_and_draining_node_refuses():
     c, store, _ = make()
     k, tid = tenant(c)

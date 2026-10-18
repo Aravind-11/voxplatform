@@ -173,6 +173,56 @@ async def test_replay_keeps_silence_until_speculate_ms():
     assert out["first_audio_ms"] is not None
 
 
+async def test_replay_keeps_silence_until_end_ms_when_it_is_the_longest_timer():
+    """end_ms=1500 with patient_end_ms=400. A tail that drops end_ms never reaches the
+    turn timer, so the expected tool does not run."""
+    turn = TurnConfig(end_ms=1500, patient_end_ms=400)
+    tools = {"book": _book, "cancel": _cancel}
+
+    def make():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        return Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"})], ["All set."]]),
+                       tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools=tools,
+                       cfg=SessionConfig(tts_poll_s=0, turn=turn))
+
+    out = await replay(make, _case())
+    assert out["task_success"] is True
+    assert out["wrong_actions"] == []
+    assert out["first_audio_ms"] >= turn.end_ms
+
+
+async def test_replay_keeps_silence_until_fast_end_ms_when_the_scorer_is_confident():
+    """A sync eot_fn above eot_threshold commits at fast_end_ms. That timer is the
+    longest one here; leaving it out of the tail drops the expected tool."""
+    turn = TurnConfig(fast_end_ms=2000)
+
+    def confident(audio, history):
+        return 0.95
+
+    def make():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        return Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"})], ["All set."]]),
+                       tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools={"book": _book, "cancel": _cancel},
+                       cfg=SessionConfig(tts_poll_s=0, turn=turn), eot_fn=confident)
+
+    out = await replay(make, _case())
+    assert out["task_success"] is True
+    assert out["wrong_actions"] == []
+    assert out["first_audio_ms"] >= turn.fast_end_ms
+
+
 async def test_replay_fails_when_expected_and_forbidden_tools_both_finish():
     llm = FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"}),
                     ToolCall("t2", "cancel", {})], ["All set."]])
@@ -421,6 +471,18 @@ def test_task_success_requires_expected_tools_and_the_interruption_budget():
                          {"type": "tool_result", "name": "cancel"}])
     assert both["task_success"] is False
     assert both["wrong_actions"] == ["cancel"]
+    # Every expected name has to finish. The first result alone is not the case.
+    two = Case(audio=SPEECH, expect_tools=["book", "lookup"], forbid_tools=["cancel"])
+    assert _score(two, [{"type": "tool_result", "name": "book"}])["task_success"] is False
+    assert _score(two, [{"type": "tool_result", "name": "book"},
+                        {"type": "tool_result", "name": "lookup"}])["task_success"] is True
+    # Every forbidden result is listed, in the order the events arrived.
+    many = Case(audio=SPEECH, expect_tools=["book"], forbid_tools=["cancel", "transfer"])
+    listed = _score(many, [{"type": "tool_result", "name": "cancel"},
+                           {"type": "tool_result", "name": "book"},
+                           {"type": "tool_result", "name": "transfer"}])
+    assert listed["task_success"] is False
+    assert listed["wrong_actions"] == ["cancel", "transfer"]
 
 
 def test_compare_averages_task_success_and_first_audio():

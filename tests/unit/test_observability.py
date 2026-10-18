@@ -42,6 +42,16 @@ def test_monitoring_files_are_consistent_with_the_metrics_the_app_exports():
     names = [r["alert"] for g in rules["groups"] for r in g["rules"]]
     assert len(names) == len(set(names)) >= 8 and all(r["labels"]["severity"] in ("warning", "critical")
                                                        for g in rules["groups"] for r in g["rules"])
+    by_name = {r["alert"]: r for g in rules["groups"] for r in g["rules"]}
+    near, at = by_name["NodeNearCapacity"], by_name["NodeAtCap"]
+    assert near["expr"] == 'vox_active_calls{job="voxplatform"} > 24' and near["for"] == "5m"
+    assert near["labels"]["severity"] == "warning"
+    assert at["expr"] == 'vox_active_calls{job="voxplatform"} >= 32' and at["for"] == "1m"
+    assert at["labels"]["severity"] == "critical"
+    from api.app import Settings
+    assert Settings().node_max_calls == 32
+    main_src = open(os.path.join(ROOT, "api", "main.py")).read()
+    assert 'env.get("VOX_NODE_MAX_CALLS", "32")' in main_src
     dash = json.load(open(os.path.join(ROOT, "deploy/monitoring/grafana/dashboards/voxplatform.json")))
     assert len(dash["panels"]) >= 10 and len({p["id"] for p in dash["panels"]}) == len(dash["panels"])
 

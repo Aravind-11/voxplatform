@@ -77,8 +77,10 @@ def test_lost_stream_reconnects_with_history_and_frees_the_slot():
     r = resume(c, call["id"])
     assert r.status_code == 200 and "<Stream" in r.text and "<Redirect" in r.text
     old = store.get_call_any(call["id"])
-    assert old["status"] == "ended" and old["end_reason"] == "stream_lost" and lim.total_active() == 0
     new = [x for x in store.list_calls(tid) if x["id"] != call["id"]][0]
+    assert old["status"] == "ended" and old["end_reason"] == "stream_lost"
+    assert lim.total_active() == 1                                          # dead leg freed, replacement already held
+    assert lim.try_admit(tid, new["id"], 5, 32) == "ok" and lim.total_active() == 1
     assert new["metadata"]["resumedFrom"] == call["id"] and new["metadata"]["resumes"] == 1
     assert new["metadata"]["from"] == "+15550001" and new["tenant_id"] == tid        # same caller, same account
     # the new session starts with the earlier conversation and a short apology instead of the greeting
@@ -91,7 +93,7 @@ def test_lost_stream_reconnects_with_history_and_frees_the_slot():
 
 
 def test_resumes_are_capped_so_a_broken_call_cannot_loop():
-    c, store, _ = make()
+    c, store, lim = make()
     k, tid = tenant(c)
     _, _, call = start_call(c, store, k, tid)
     cur = call["id"]
@@ -103,6 +105,7 @@ def test_resumes_are_capped_so_a_broken_call_cannot_loop():
     store.update_call(cur, status="active")
     r = resume(c, cur)
     assert "<Stream" not in r.text and "technical difficulties" in r.text and "<Hangup/>" in r.text
+    assert store.get_call_any(cur)["status"] == "ended" and lim.local_active() == 0
 
 
 def test_real_stream_close_by_twilio_is_marked_stream_closed_and_agent_end_marked_agent_hangup():
@@ -119,13 +122,62 @@ def test_real_stream_close_by_twilio_is_marked_stream_closed_and_agent_end_marke
 
 
 def test_unknown_or_browser_calls_just_hang_up_and_draining_node_refuses():
-    c, store, _ = make()
+    c, store, lim = make()
     k, tid = tenant(c)
     assert "<Hangup/>" in resume(c, "call_nope").text
     browser = c.post("/v1/calls", json={}, headers={"X-API-Key": k}).json()
     assert "<Hangup/>" in resume(c, browser["id"]).text
+    a = c.post("/v1/agents", json={"name": "n", "systemPrompt": "Be brief.", "greeting": "Hello"},
+               headers={"X-API-Key": k}).json()
+    cfg = store.get_agent_any(a["id"])["config"]
+    hung = store.create_call(tid, a["id"], "twilio", cfg, {"from": "+15550001", "to": "+15550002"})
+    store.update_call(hung["id"], status="active", end_reason="agent_hangup")
+    live = store.create_call(tid, a["id"], "twilio", cfg, {"from": "+15550001", "to": "+15550002"})
+    assert lim.acquire(tid, live["id"], 10)
+    xfer = store.create_call(tid, a["id"], "twilio", cfg, {"from": "+15550001", "to": "+15550002"})
+    store.update_call(xfer["id"], status="active", joined=time.time())
+    assert lim.acquire(tid, xfer["id"], 10)
+    assert lim.local_active() == 2
     c.post("/admin/drain", headers={"X-Admin-Key": "adm"})
-    assert resume(c, "call_x").status_code == 503
+    # Hangup reasons win over drain, and an unknown id is still TwiML rather than a 503 JSON error.
+    hung_up = resume(c, hung["id"])
+    assert hung_up.status_code == 200 and "<Hangup/>" in hung_up.text and "busy" not in hung_up.text
+    unknown = resume(c, "call_x")
+    assert unknown.status_code == 200 and "<Hangup/>" in unknown.text
+    before = len(store.list_calls(tid))
+    refused = resume(c, live["id"])
+    assert refused.status_code == 200 and "all of our lines are busy" in refused.text and "<Stream" not in refused.text
+    assert store.get_call_any(live["id"])["end_reason"] == "stream_lost"
+    assert len(store.list_calls(tid)) == before and lim.local_active() == 1
+    path = f"/twilio/transfer-result/{xfer['id']}?to=billing"
+    miss = {"DialCallStatus": "no-answer"}
+    tr = c.post(path, data=miss, headers=sign(f"{BASE}{path}", miss))
+    assert tr.status_code == 200 and "all of our lines are busy" in tr.text and "<Stream" not in tr.text
+    assert "cannot take your call" not in tr.text
+    assert len(store.list_calls(tid)) == before and lim.local_active() == 0
+
+
+def test_draining_resume_and_transfer_redirect_when_overflow_is_set():
+    settings = Settings(admin_key="adm", public_base_url=BASE, twilio_auth_token="tok",
+                        overflow_url="https://overflow.example/busy")
+    c, store, lim = make(settings)
+    k, tid = tenant(c)
+    _, _, call = start_call(c, store, k, tid)
+    assert lim.local_active() == 1
+    own = store.create_call(tid, call["agent_id"], "twilio", call["config"], {"from": "+15550001", "to": "+15550002"})
+    store.update_call(own["id"], status="active", joined=time.time())
+    assert lim.acquire(tid, own["id"], 10) and lim.local_active() == 2
+    c.post("/admin/drain", headers={"X-Admin-Key": "adm"})
+    r = resume(c, call["id"])
+    assert r.status_code == 200 and "<Redirect>https://overflow.example/busy</Redirect>" in r.text
+    assert "<Stream" not in r.text and lim.local_active() == 1
+    assert store.get_call_any(call["id"])["end_reason"] == "stream_lost"
+    before = len(store.list_calls(tid))
+    path = f"/twilio/transfer-result/{own['id']}?to=billing"
+    miss = {"DialCallStatus": "no-answer"}
+    tr = c.post(path, data=miss, headers=sign(f"{BASE}{path}", miss))
+    assert tr.status_code == 200 and "<Redirect>https://overflow.example/busy</Redirect>" in tr.text
+    assert "<Stream" not in tr.text and len(store.list_calls(tid)) == before and lim.local_active() == 0
 
 
 async def test_transport_end_records_the_reason_before_closing_the_stream():

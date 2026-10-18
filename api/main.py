@@ -7,6 +7,15 @@
   VOX_VLLM_URL             Ultravox server, default http://127.0.0.1:8000/v1
   VOX_AUDIO_STYLE          input_audio | audio_url
   VOX_DEFAULT_CONCURRENCY  per-tenant active-call cap, default 10
+  VOX_NODE_MAX_CALLS       active calls this process admits (default 32). deploy.sh sets this to the
+                           already-split per-process share; this process does not divide by VOX_PROCS again.
+                           0 admits nobody. Unset leaves the limiter without a process ceiling and Settings
+                           uses 32. A negative or non-integer value fails startup. A positive node cap smaller
+                           than VOX_PROCS is rejected by deploy.sh, not rounded up to 1 per process. At the cap,
+                           new calls are refused and /healthz is 503 with nodeFull so the load balancer stops
+                           sending more.
+  VOX_OVERFLOW_URL         optional http(s) URL. A full or draining node answers Twilio with <Redirect> to it
+                           instead of the spoken busy line. Any other scheme is rejected.
   TWILIO_AUTH_TOKEN        verifies inbound Twilio webhooks and places outbound calls
   TWILIO_ACCOUNT_SID       outbound calls and the transfer tool
   VOX_TWILIO_NUMBER        default caller id for outbound calls
@@ -27,12 +36,6 @@
                            calls / VAD are per process. Inside one container, do not raise --workers.
                            VOX_PROCS>1 requires VOX_DB to be postgres:// or postgresql://. deploy.sh refuses
                            a SQLite file first: several processes writing it raise "database is locked".
-  VOX_NODE_MAX_CALLS       Optional ceiling on active calls this process may hold, across tenants. deploy.sh
-                           sets it to the already-split share (floor of the node cap / VOX_PROCS; the shares
-                           sum to at most the node cap). This process does not divide by VOX_PROCS again.
-                           Unset: no extra ceiling. 0: admit nobody. A negative or non-integer value fails
-                           startup. A positive node cap smaller than VOX_PROCS is rejected by deploy.sh, not
-                           rounded up to 1 per process.
   VOX_ALLOW_UNSIGNED_TWILIO=1   development only
   VOX_EOT, VOX_EOT_THRESHOLD, VOX_END_MS, VOX_PATIENT_MS, VOX_TTS_CONCURRENCY, VOX_LOG_EVENTS: see docs/TUNING.md
 Run: uvicorn api.main:app --host 0.0.0.0 --port 8080   (put TLS in front; Twilio needs wss)."""
@@ -65,6 +68,8 @@ def build():
                         allow_unsigned_twilio=env.get("VOX_ALLOW_UNSIGNED_TWILIO") == "1",
                         retention_default_days=int(env.get("VOX_RETENTION_DAYS", "0")),
                         default_concurrency=int(env.get("VOX_DEFAULT_CONCURRENCY", "10")),
+                        node_max_calls=int(env.get("VOX_NODE_MAX_CALLS", "32")),
+                        overflow_url=env.get("VOX_OVERFLOW_URL", ""),
                         audiosocket_port=int(env.get("VOX_AUDIOSOCKET_PORT", "0")),
                         audiosocket_agent=env.get("VOX_AUDIOSOCKET_AGENT", ""),
                         audiosocket_host=env.get("VOX_AUDIOSOCKET_HOST", "127.0.0.1"))

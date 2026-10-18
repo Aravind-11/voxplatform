@@ -18,7 +18,7 @@
 		lb_policy least_conn
 		lb_try_duration 3s                  # a request that finds a dead node is retried on another
 		lb_try_interval 250ms
-		health_uri /healthz                 # 503 while a node drains or its database/Redis is unreachable
+		health_uri /healthz                 # 503 while a node drains, its database/Redis is unreachable, or it is at the node cap (nodeFull); health_status 2xx stops new connections
 		health_interval 3s
 		health_timeout 2s
 		health_status 2xx

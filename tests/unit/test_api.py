@@ -300,6 +300,7 @@ def test_twilio_stream_with_wrong_token_is_closed():
     url = f"https://vox.example.com/twilio/voice/{a['id']}"
     c.post(f"/twilio/voice/{a['id']}", data=twilio_form(), headers=sign(url, twilio_form()))
     call = store.list_calls(tid)[0]
+    assert lim.total_active() == 1                                          # the webhook reserved the slot
     with pytest.raises(WebSocketDisconnect) as e:
         with c.websocket_connect(f"/ws/twilio/{call['id']}") as ws:
             ws.send_text(json.dumps({"event": "start", "streamSid": "MZ1", "start": {
@@ -307,6 +308,27 @@ def test_twilio_stream_with_wrong_token_is_closed():
             ws.receive_text()
     assert e.value.code == 4401
     assert store.get_call_any(call["id"])["status"] == "created" and lim.total_active() == 0
+
+
+def test_twilio_stream_that_drops_before_start_keeps_its_slot_until_resume():
+    c, store, lim = make(Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                                  node_max_calls=1))
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "n"}, headers={"X-API-Key": k}).json()
+    url = f"https://vox.example.com/twilio/voice/{a['id']}"
+    form = twilio_form()
+    assert "<Stream" in c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form)).text
+    call = store.list_calls(tid)[0]
+    assert lim.total_active() == 1 and c.get("/healthz").status_code == 503
+    with c.websocket_connect(f"/ws/twilio/{call['id']}") as ws:
+        ws.send_text(json.dumps({"event": "connected"}))
+    assert store.get_call_any(call["id"])["status"] == "created" and lim.total_active() == 1
+    rurl = f"https://vox.example.com/twilio/resume/{call['id']}"
+    resumed = c.post(f"/twilio/resume/{call['id']}", data={"CallSid": "CA1"}, headers=sign(rurl, {"CallSid": "CA1"}))
+    assert "<Stream" in resumed.text and lim.total_active() == 1
+    new = [x for x in store.list_calls(tid) if x["id"] != call["id"]][0]
+    assert lim.try_admit(tid, new["id"], 10, 1) == "ok" and lim.total_active() == 1
+    assert c.get("/healthz").status_code == 503
 
 
 # ---------------------------------------------------------------- webhooks
@@ -345,6 +367,107 @@ def test_limiter_basic():
     l.release("t", "1")
     assert l.acquire("t", "3") and l.active("t") == 2
     assert l.acquire("u", "1")             # tenants independent
+
+
+def test_try_admit_node_cap_is_atomic_and_a_refusal_takes_no_slot():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    lim = security.ConcurrencyLimiter(10)
+    barrier = threading.Barrier(16)
+
+    def once(i):
+        barrier.wait()
+        return lim.try_admit("t", f"c{i}", 10, 1)
+
+    with ThreadPoolExecutor(16) as ex:
+        res = list(ex.map(once, range(16)))
+    ok = [i for i, r in enumerate(res) if r == "ok"]
+    assert len(ok) == 1 and res.count("node") == 15 and lim.local_active() == 1
+    assert lim.try_admit("t", f"c{ok[0]}", 10, 1) == "ok"          # already held, still one slot
+    assert lim.local_active() == 1
+    lim.release("t", f"c{ok[0]}")
+    assert lim.local_active() == 0
+    assert lim.try_admit("u", "x", 1, 5) == "ok"
+    assert lim.try_admit("u", "y", 1, 5) == "tenant"               # tenant cap, node cap still has room
+    assert lim.local_active() == 1 and lim.active("u") == 1
+    assert lim.try_admit("t", "a", 10, 0) == "ok" and lim.try_admit("t", "b", 10, 0) == "ok"
+    assert lim.local_active() == 3                                 # node_limit 0 does not cap this process
+
+
+class _FakeRedis:
+    """Just enough of redis-py for RedisLimiter.try_admit/release, with no server."""
+
+    def __init__(self, fail_zrem: bool = False):
+        self.sets: dict[str, dict] = {}
+        self.fail_zrem = fail_zrem
+
+    def register_script(self, _lua):
+        def run(keys, args):
+            _now, exp, member, cap = args
+            members = self.sets.setdefault(keys[0], {})
+            if member in members:
+                members[member] = float(exp)
+                return 1
+            if len(members) >= int(float(cap)):
+                return 0
+            members[member] = float(exp)
+            return 1
+        return run
+
+    def zrem(self, key, member):
+        if self.fail_zrem:
+            raise RuntimeError("zrem failed")
+        self.sets.get(key, {}).pop(member, None)
+        return 1
+
+
+def test_redis_try_admit_node_cap_is_one_slot_and_release_survives_zrem_failure():
+    client = _FakeRedis()
+    lim = security.RedisLimiter(client=client, default_limit=10)
+    assert lim.try_admit("t", "c1", 10, 1) == "ok"
+    assert lim.try_admit("t", "c2", 10, 1) == "node"
+    assert lim.local_active() == 1
+    assert lim.try_admit("t", "c1", 10, 1) == "ok" and lim.local_active() == 1   # same id, still one slot
+    lim.release("t", "c1")
+    assert lim.local_active() == 0
+    assert lim.try_admit("u", "x", 1, 5) == "ok"
+    assert lim.try_admit("u", "y", 1, 5) == "tenant"                             # refusal keeps no node slot
+    assert lim.local_active() == 1
+    open_lim = security.RedisLimiter(client=_FakeRedis(), default_limit=10)
+    assert open_lim.try_admit("t", "a", 10, 0) == "ok" and open_lim.try_admit("t", "b", 10, 0) == "ok"
+    assert open_lim.local_active() == 2                                          # node_limit 0 disables the node cap
+    broken = _FakeRedis(fail_zrem=True)
+    stuck = security.RedisLimiter(client=broken, default_limit=10)
+    assert stuck.try_admit("t", "a", 10, 1) == "ok"
+    stuck.release("t", "a")                                                      # must not raise
+    assert stuck.local_active() == 0
+    assert stuck.try_admit("t", "b", 10, 1) == "ok" and stuck.local_active() == 1
+
+
+def test_redis_release_failure_still_ends_the_call_and_frees_the_slot():
+    client = _FakeRedis(fail_zrem=True)
+    lim = security.RedisLimiter(client=client, default_limit=10)
+    store = Store()
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
+    app = create_app(store, rt, lim, None, Settings(admin_key="adm", public_base_url="https://vox.example.com",
+                                                    node_max_calls=1))
+    c = TestClient(app)
+    key, _tid = tenant(c, limit=10)
+    h = {"X-API-Key": key}
+    call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=h).json()
+    path = call["joinUrl"].replace("wss://vox.example.com", "")
+    with c.websocket_connect(path) as ws:
+        ws.send_bytes(silence(1)[0])
+        assert store.get_call_any(call["id"])["status"] == "active"
+        assert lim.local_active() == 1
+    done = store.get_call_any(call["id"])
+    assert done["status"] == "ended" and done["end_reason"] == "hangup"
+    assert lim.local_active() == 0
+    call2 = c.post("/v1/calls", json={}, headers=h).json()
+    with c.websocket_connect(call2["joinUrl"].replace("wss://vox.example.com", "")) as ws:
+        ws.send_bytes(silence(1)[0])
+        assert store.get_call_any(call2["id"])["status"] == "active"
+        assert lim.local_active() == 1
 
 
 # ---------------------------------------------------------------- tools through the API
@@ -439,6 +562,305 @@ def test_agent_can_be_updated_in_place_and_new_calls_use_it():
     assert c.patch("/v1/agents/agt_missing", json={}, headers=h).status_code == 404
     kb, _ = tenant(c, "other")
     assert c.patch(f"/v1/agents/{a['id']}", json={"systemPrompt": "x"}, headers={"X-API-Key": kb}).status_code == 404
+
+
+def _make_twilio_rest(handler, **kw):
+    """App whose Twilio REST client is a MockTransport. Inbound calls must register a status callback."""
+    store = Store()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store, http=http)
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                        twilio_account_sid="ACtest", **kw)
+    lim = security.ConcurrencyLimiter(4)
+    return TestClient(create_app(store, rt, lim, None, settings)), store, lim
+
+
+def test_empty_call_sid_does_not_reserve_a_slot():
+    """A signed voice form with no CallSid has nothing a status callback can free."""
+    c, store, lim = make(Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                                  node_max_calls=1))
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "n"}, headers={"X-API-Key": k}).json()
+    url = f"https://vox.example.com/twilio/voice/{a['id']}"
+    for form in ({}, {"From": "+15550001", "To": "+15550002"}):
+        r = c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form))
+        assert r.status_code == 200 and "<Hangup/>" in r.text and "<Stream" not in r.text
+    assert store.list_calls(tid) == [] and lim.local_active() == 0
+    assert c.get("/healthz").status_code == 200
+
+
+def test_repeated_voice_webhook_reuses_the_open_call():
+    c, store, lim = make(Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                                  node_max_calls=2))
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "n"}, headers={"X-API-Key": k}).json()
+    url = f"https://vox.example.com/twilio/voice/{a['id']}"
+    form = twilio_form()
+    first = c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form))
+    second = c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form))
+    assert "<Stream" in first.text and first.text == second.text
+    assert len(store.list_calls(tid)) == 1 and lim.local_active() == 1
+    assert c.get("/healthz").status_code == 200                    # cap is 2; a retry must not take the other slot
+    call = store.list_calls(tid)[0]
+    done = {"CallStatus": "completed"}
+    surl = f"https://vox.example.com/twilio/status/{call['id']}"
+    assert c.post(surl, data=done, headers=sign(surl, done)).status_code == 200
+    assert lim.local_active() == 0 and store.get_call_any(call["id"])["status"] == "ended"
+    again = c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form))
+    assert "<Stream" in again.text and call["id"] not in again.text
+    assert len(store.list_calls(tid)) == 2 and lim.local_active() == 1
+    # Same CallSid on another tenant is a different call, not this row's stream token.
+    k2, tid2 = tenant(c, "b", limit=10)
+    a2 = c.post("/v1/agents", json={"name": "n"}, headers={"X-API-Key": k2}).json()
+    url2 = f"https://vox.example.com/twilio/voice/{a2['id']}"
+    other = c.post(f"/twilio/voice/{a2['id']}", data=form, headers=sign(url2, form))
+    assert "<Stream" in other.text and store.list_calls(tid)[0]["id"] not in other.text
+    assert len(store.list_calls(tid2)) == 1 and lim.local_active() == 2
+
+
+def test_inbound_status_callback_frees_a_leg_that_stops_before_start():
+    """Hang-up before the socket's start event never reaches /twilio/resume. The call-level callback must."""
+    from urllib.parse import parse_qs
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append(req)
+        return httpx.Response(200, json={"sid": "CA1", "status": "in-progress"})
+
+    c, store, lim = _make_twilio_rest(handler, node_max_calls=1)
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "n"}, headers={"X-API-Key": k}).json()
+    url = f"https://vox.example.com/twilio/voice/{a['id']}"
+    form = twilio_form()
+    xml = c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form))
+    assert "<Stream" in xml.text
+    call = store.list_calls(tid)[0]
+    assert len(seen) == 1 and seen[0].url.path.endswith("/Calls/CA1.json")
+    posted = {key: vals[0] for key, vals in parse_qs(seen[0].content.decode()).items()}
+    assert posted["StatusCallback"] == f"https://vox.example.com/twilio/status/{call['id']}"
+    assert posted["StatusCallbackMethod"] == "POST"
+    assert lim.local_active() == 1 and c.get("/healthz").status_code == 503
+    with c.websocket_connect(f"/ws/twilio/{call['id']}") as ws:
+        ws.send_text(json.dumps({"event": "connected"}))
+        ws.send_text(json.dumps({"event": "stop", "streamSid": "MZ1"}))
+    assert store.get_call_any(call["id"])["status"] == "created" and lim.local_active() == 1
+    done = {"CallStatus": "completed"}
+    surl = f"https://vox.example.com/twilio/status/{call['id']}"
+    assert c.post(surl, data=done, headers=sign(surl, done)).status_code == 200
+    ended = store.get_call_any(call["id"])
+    assert ended["status"] == "ended" and ended["end_reason"] == "completed"
+    assert lim.local_active() == 0 and c.get("/healthz").status_code == 200
+    assert len(store.list_calls(tid)) == 1                              # resume was never called
+
+
+def test_failed_status_callback_does_not_hand_back_a_stream():
+    def refuse(req: httpx.Request):
+        return httpx.Response(500, text="no")
+
+    c, store, lim = _make_twilio_rest(refuse, node_max_calls=1)
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "n"}, headers={"X-API-Key": k}).json()
+    url = f"https://vox.example.com/twilio/voice/{a['id']}"
+    form = twilio_form()
+    r = c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form))
+    assert r.status_code == 200 and "<Hangup/>" in r.text and "<Stream" not in r.text
+    row = store.list_calls(tid)[0]
+    assert row["status"] == "ended" and row["end_reason"] == "status_callback_failed"
+    assert lim.local_active() == 0 and c.get("/healthz").status_code == 200
+
+    def explode(req: httpx.Request):
+        raise RuntimeError("twilio down")
+
+    c2, store2, lim2 = _make_twilio_rest(explode, node_max_calls=1)
+    k2, tid2 = tenant(c2, limit=10)
+    a2 = c2.post("/v1/agents", json={"name": "n"}, headers={"X-API-Key": k2}).json()
+    url2 = f"https://vox.example.com/twilio/voice/{a2['id']}"
+    r2 = c2.post(f"/twilio/voice/{a2['id']}", data=form, headers=sign(url2, form))
+    assert "<Hangup/>" in r2.text and "<Stream" not in r2.text
+    row2 = store2.list_calls(tid2)[0]
+    assert row2["status"] == "ended" and row2["end_reason"] == "status_callback_failed"
+    assert lim2.local_active() == 0 and c2.get("/healthz").status_code == 200
+
+
+def test_failed_bind_keeps_a_leg_the_socket_already_adopted():
+    """A retry can open the stream while the first voice POST is still binding the status callback.
+
+    When that bind then fails, the adopted row must stay active and keep the only slot.
+    """
+    import asyncio
+    import threading
+    inside, release = threading.Event(), threading.Event()
+
+    async def handler(req: httpx.Request):
+        inside.set()
+        for _ in range(500):
+            if release.is_set():
+                break
+            await asyncio.sleep(0.01)
+        return httpx.Response(500, text="no")
+
+    c, store, lim = _make_twilio_rest(handler, node_max_calls=1)
+    box: dict = {}
+
+    def first(url, form):
+        try:
+            box["r"] = c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form))
+        except Exception as exc:  # noqa: BLE001
+            box["err"] = exc
+
+    with c:
+        k, tid = tenant(c, limit=10)
+        a = c.post("/v1/agents", json={"name": "n", "greeting": ""}, headers={"X-API-Key": k}).json()
+        url = f"https://vox.example.com/twilio/voice/{a['id']}"
+        form = twilio_form()
+        th = threading.Thread(target=first, args=(url, form))
+        th.start()
+        try:
+            assert inside.wait(5)
+            dup = c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form))
+            call = store.list_calls(tid)[0]
+            assert "<Stream" in dup.text and call["id"] in dup.text and lim.local_active() == 1
+            with c.websocket_connect(f"/ws/twilio/{call['id']}") as ws:
+                ws.send_text(json.dumps({"event": "start", "streamSid": "MZ1", "start": {
+                    "streamSid": "MZ1", "callSid": "CA1", "customParameters": {"token": call["join_token"]}}}))
+                adopted = False
+                for _ in range(50):
+                    if store.get_call_any(call["id"])["status"] == "active":
+                        adopted = True
+                        break
+                    time.sleep(0.02)
+                assert adopted and lim.local_active() == 1
+                release.set()
+                th.join(5)
+                assert not th.is_alive() and "err" not in box
+                assert "<Stream" in box["r"].text and call["id"] in box["r"].text and "<Hangup/>" not in box["r"].text
+                row = store.get_call_any(call["id"])
+                assert row["status"] == "active" and not row["end_reason"] and lim.local_active() == 1
+                other = {"CallSid": "CA2", "From": "+15550003", "To": "+15550004"}
+                busy = c.post(f"/twilio/voice/{a['id']}", data=other, headers=sign(url, other))
+                assert "all of our lines are busy" in busy.text and "<Stream" not in busy.text
+                assert lim.local_active() == 1 and len(store.list_calls(tid)) == 1
+        finally:
+            release.set()
+            th.join(5)
+
+
+def test_resume_terminal_status_releases_and_in_progress_still_reconnects():
+    c, store, lim = make(Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                                  node_max_calls=2))
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "n"}, headers={"X-API-Key": k}).json()
+    url = f"https://vox.example.com/twilio/voice/{a['id']}"
+    form = twilio_form()
+    assert "<Stream" in c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form)).text
+    call = store.list_calls(tid)[0]
+    with c.websocket_connect(f"/ws/twilio/{call['id']}") as ws:
+        ws.send_text(json.dumps({"event": "stop", "streamSid": "MZ1"}))
+    assert lim.local_active() == 1 and store.get_call_any(call["id"])["status"] == "created"
+    done = {"CallSid": "CA1", "CallStatus": "completed"}
+    rurl = f"https://vox.example.com/twilio/resume/{call['id']}"
+    resumed = c.post(rurl, data=done, headers=sign(rurl, done))
+    assert "<Hangup/>" in resumed.text and "<Stream" not in resumed.text
+    assert len(store.list_calls(tid)) == 1
+    assert store.get_call_any(call["id"])["status"] == "ended"
+    assert store.get_call_any(call["id"])["end_reason"] == "completed"
+    assert lim.local_active() == 0
+
+    form2 = {"CallSid": "CA2", "From": "+15550001", "To": "+15550002"}
+    assert "<Stream" in c.post(f"/twilio/voice/{a['id']}", data=form2, headers=sign(url, form2)).text
+    live = [x for x in store.list_calls(tid) if x["status"] == "created"][0]
+    with c.websocket_connect(f"/ws/twilio/{live['id']}") as ws:
+        ws.send_text(json.dumps({"event": "stop", "streamSid": "MZ2"}))
+    mid = {"CallSid": "CA2", "CallStatus": "in-progress"}
+    rurl2 = f"https://vox.example.com/twilio/resume/{live['id']}"
+    again = c.post(rurl2, data=mid, headers=sign(rurl2, mid))
+    assert "<Stream" in again.text and lim.local_active() == 1
+    assert len(store.list_calls(tid)) == 3
+
+
+def test_replacement_leg_is_not_left_held_when_its_status_callback_fails():
+    n = {"i": 0}
+
+    def handler(req: httpx.Request):
+        n["i"] += 1
+        if n["i"] == 1:
+            return httpx.Response(200, json={"sid": "CA1"})
+        return httpx.Response(503, text="later")
+
+    c, store, lim = _make_twilio_rest(handler, node_max_calls=1)
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "n"}, headers={"X-API-Key": k}).json()
+    url = f"https://vox.example.com/twilio/voice/{a['id']}"
+    form = twilio_form()
+    assert "<Stream" in c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form)).text
+    call = store.list_calls(tid)[0]
+    rurl = f"https://vox.example.com/twilio/resume/{call['id']}"
+    mid = {"CallSid": "CA1"}
+    resumed = c.post(rurl, data=mid, headers=sign(rurl, mid))
+    assert "<Hangup/>" in resumed.text and "<Stream" not in resumed.text
+    assert lim.local_active() == 0 and c.get("/healthz").status_code == 200
+    nxt = [x for x in store.list_calls(tid) if x["id"] != call["id"]]
+    assert len(nxt) == 1 and nxt[0]["status"] == "ended" and nxt[0]["end_reason"] == "status_callback_failed"
+    # The return leg of a missed transfer has the same hole.
+    parent = store.create_call(tid, a["id"], "twilio", a["config"], {"from": "+1555", "to": "+1666", "callSid": "CA9"})
+    path, q = f"/twilio/transfer-result/{parent['id']}", "to=billing"
+    miss = {"DialCallStatus": "no-answer", "CallSid": "CA9"}
+    tr = c.post(f"{path}?{q}", data=miss, headers=sign(f"https://vox.example.com{path}?{q}", miss))
+    assert "<Hangup/>" in tr.text and "<Stream" not in tr.text
+    assert lim.local_active() == 0
+    back = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == parent["id"]]
+    assert len(back) == 1 and back[0]["status"] == "ended" and back[0]["end_reason"] == "status_callback_failed"
+
+
+def test_resume_points_the_new_leg_at_its_own_status_callback():
+    from urllib.parse import parse_qs
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append(req)
+        return httpx.Response(200, json={"sid": "CA1"})
+
+    c, store, lim = _make_twilio_rest(handler, node_max_calls=1)
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "n"}, headers={"X-API-Key": k}).json()
+    url = f"https://vox.example.com/twilio/voice/{a['id']}"
+    form = twilio_form()
+    assert "<Stream" in c.post(f"/twilio/voice/{a['id']}", data=form, headers=sign(url, form)).text
+    call = store.list_calls(tid)[0]
+    rurl = f"https://vox.example.com/twilio/resume/{call['id']}"
+    mid = {"CallSid": "CA1"}
+    resumed = c.post(rurl, data=mid, headers=sign(rurl, mid))
+    assert "<Stream" in resumed.text and lim.local_active() == 1
+    new = [x for x in store.list_calls(tid) if x["id"] != call["id"]][0]
+    assert len(seen) == 2
+    posted = {key: vals[0] for key, vals in parse_qs(seen[1].content.decode()).items()}
+    assert posted["StatusCallback"].endswith(f"/twilio/status/{new['id']}")
+    assert call["id"] not in posted["StatusCallback"]
+
+
+def test_transfer_result_points_the_return_leg_at_its_own_status_callback():
+    """A 2xx missed-transfer must register the new leg, not the parent the Dial already replaced."""
+    from urllib.parse import parse_qs
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append(req)
+        return httpx.Response(200, json={"sid": "CA9"})
+
+    c, store, lim = _make_twilio_rest(handler, node_max_calls=1)
+    k, tid = tenant(c, limit=10)
+    a = c.post("/v1/agents", json={"name": "n", "systemPrompt": "Be brief.", "greeting": "Hello!"},
+               headers={"X-API-Key": k}).json()
+    parent = store.create_call(tid, a["id"], "twilio", a["config"], {"from": "+1555", "to": "+1666", "callSid": "CA9"})
+    path, q = f"/twilio/transfer-result/{parent['id']}", "to=billing"
+    miss = {"DialCallStatus": "no-answer", "CallSid": "CA9"}
+    r = c.post(f"{path}?{q}", data=miss, headers=sign(f"https://vox.example.com{path}?{q}", miss))
+    assert "<Stream" in r.text and lim.local_active() == 1
+    back = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == parent["id"]]
+    assert len(back) == 1 and len(seen) == 1
+    posted = {key: vals[0] for key, vals in parse_qs(seen[0].content.decode()).items()}
+    assert posted["StatusCallback"].endswith(f"/twilio/status/{back[0]['id']}")
+    assert parent["id"] not in posted["StatusCallback"]
 
 
 def test_greeting_is_part_of_the_agent_and_is_spoken_on_a_browser_call():

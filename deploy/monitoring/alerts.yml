@@ -36,6 +36,12 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "{{ $labels.instance }} has {{ $value }} active calls (load-test comfort limit is about 28)"
+      - alert: NodeAtCap
+        expr: vox_active_calls{job="voxplatform"} >= 32
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value }} active calls; new calls should be refused"
       - alert: ErrorsInCalls
         expr: sum by (where) (rate(vox_errors_total[5m])) > 0
         for: 5m

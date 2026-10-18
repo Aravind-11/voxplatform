@@ -168,3 +168,4 @@ def test_full_sip_call_through_the_app_creates_a_call_speaks_back_and_hangs_up()
                 break
             time.sleep(0.05)
         assert calls[0]["medium"] == "sip" and calls[0]["status"] == "ended"
+        assert app.state.limiter.local_active() == 0

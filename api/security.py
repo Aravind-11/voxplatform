@@ -6,9 +6,12 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import threading
 from typing import Awaitable, Callable, Mapping, Optional
+
+log = logging.getLogger(__name__)
 
 import httpx
 
@@ -72,21 +75,36 @@ class ConcurrencyLimiter:
         self._active: dict[str, set[str]] = {}
         self._lock = threading.Lock()
 
-    def acquire(self, tenant_id: str, call_id: str, limit: Optional[int] = None) -> bool:
-        cap = limit if limit is not None else self.default_limit
+    def try_admit(self, tenant_id: str, call_id: str, limit: Optional[int] = None, node_limit: int = 0) -> str:
+        """Reserve one call under the tenant cap and the per-process cap, in one lock.
+
+        Returns "ok", "node", or "tenant". A refusal does not take a slot. A call that
+        already holds a slot is "ok" and is not counted twice. ``node_limit <= 0``
+        does not apply that argument. ``process_ceiling`` still applies: None adds
+        nothing, 0 admits nobody, and N caps this process. When both are set, the
+        smaller cap wins. The check happens before the insert, so two admits cannot
+        both pass a cap of N.
+        """
+        cap = self.default_limit if limit is None else limit
         with self._lock:
             calls = self._active.get(tenant_id)
             if calls is not None and call_id in calls:
-                return True
+                return "ok"
+            held = sum(len(v) for v in self._active.values())
             # Across tenants, before a tenant slot is taken. 0 admits nobody; None adds no ceiling.
-            if self.process_ceiling is not None and sum(len(v) for v in self._active.values()) >= self.process_ceiling:
-                return False
+            if self.process_ceiling is not None and held >= self.process_ceiling:
+                return "node"
+            if node_limit > 0 and held >= node_limit:
+                return "node"
             if (len(calls) if calls is not None else 0) >= cap:
-                return False
+                return "tenant"
             if calls is None:
                 calls = self._active[tenant_id] = set()
             calls.add(call_id)
-            return True
+            return "ok"
+
+    def acquire(self, tenant_id: str, call_id: str, limit: Optional[int] = None) -> bool:
+        return self.try_admit(tenant_id, call_id, limit, 0) == "ok"
 
     def release(self, tenant_id: str, call_id: str) -> None:
         with self._lock:
@@ -135,26 +153,61 @@ return 1
     def ping(self) -> None:
         self.r.ping()
 
-    def acquire(self, tenant_id: str, call_id: str, limit: Optional[int] = None) -> bool:
+    def try_admit(self, tenant_id: str, call_id: str, limit: Optional[int] = None, node_limit: int = 0) -> str:
+        """Same contract as ConcurrencyLimiter.try_admit, with the tenant cap in Redis.
+
+        The per-process cap is this node's ``_held`` set, not the shared Redis key.
+        ``node_limit <= 0`` does not apply that argument. ``process_ceiling`` still
+        applies: None adds nothing, 0 admits nobody, and N caps this process. When
+        either local cap is active, the slot is reserved under the lock before the
+        Redis round trip and dropped again if Redis refuses, so two admits cannot
+        both pass. With neither local cap, Redis is checked first.
+        """
         import time
         now = time.time()
-        cap = limit if limit is not None else self.default_limit
-        with self._lock:
-            # Local sets only: a shared Redis key would turn this share into a cluster cap.
-            already = call_id in self._held.get(tenant_id, ())
-            if (not already and self.process_ceiling is not None
-                    and sum(len(v) for v in self._held.values()) >= self.process_ceiling):
-                return False
+        cap = self.default_limit if limit is None else limit
+        local_cap = self.process_ceiling is not None or node_limit > 0
+        already = False
+        if local_cap:
+            with self._lock:
+                current = self._held.get(tenant_id)
+                if current is not None and call_id in current:
+                    already = True
+                else:
+                    held = sum(len(v) for v in self._held.values())
+                    if self.process_ceiling is not None and held >= self.process_ceiling:
+                        return "node"
+                    if node_limit > 0 and held >= node_limit:
+                        return "node"
+                    self._held.setdefault(tenant_id, set()).add(call_id)
+        try:
             ok = self._script(keys=[self._key(tenant_id)], args=[now, now + self.ttl_s, call_id, cap]) == 1
-            if ok:
-                self._held.setdefault(tenant_id, set()).add(call_id)
-            return ok
+        except Exception:
+            if local_cap and not already:
+                with self._lock:
+                    self._held.get(tenant_id, set()).discard(call_id)
+            raise
+        if ok:
+            if not local_cap:
+                with self._lock:
+                    self._held.setdefault(tenant_id, set()).add(call_id)
+            return "ok"
+        if local_cap and not already:
+            with self._lock:
+                self._held.get(tenant_id, set()).discard(call_id)
+        return "tenant"
+
+    def acquire(self, tenant_id: str, call_id: str, limit: Optional[int] = None) -> bool:
+        return self.try_admit(tenant_id, call_id, limit, 0) == "ok"
 
     def release(self, tenant_id: str, call_id: str) -> None:
+        # Drop the local slot even when ZREM fails, so a Redis blip cannot pin this node at the cap
+        # or skip the rest of finish() (the call would stay active and /healthz would stay 503).
         try:
             self.r.zrem(self._key(tenant_id), call_id)
+        except Exception:  # noqa: BLE001
+            log.exception("redis ZREM failed; releasing the local slot for %s", call_id)
         finally:
-            # A failed ZREM must not stick this process's ceiling. The member expires via ttl_s.
             with self._lock:
                 self._held.get(tenant_id, set()).discard(call_id)
 

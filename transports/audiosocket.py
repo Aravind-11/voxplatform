@@ -138,10 +138,29 @@ class AudioSocketTransport:
         except Exception:  # noqa: BLE001  (peer already gone)
             pass
 
-    # --- receive loop ---
-    async def run(self) -> None:
+    def _abort(self) -> None:
+        """Drop the socket without draining. A peer that never reads would block _close() forever."""
+        self._closed = True
         try:
-            kind, payload = await read_message(self.reader)
+            transport = self.writer.transport
+            if transport is not None:
+                transport.abort()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # --- receive loop ---
+    async def run(self, *, uuid_timeout: float | None = None) -> None:
+        try:
+            try:
+                first = read_message(self.reader)
+                if uuid_timeout is not None:
+                    kind, payload = await asyncio.wait_for(first, uuid_timeout)
+                else:
+                    kind, payload = await first
+            except TimeoutError:
+                # The UUID is the first frame Asterisk sends. A stall here is not a live call.
+                self._abort()
+                return
             if kind != KIND_UUID or len(payload) != 16:
                 raise EOFError("first AudioSocket message must carry the call UUID")
             self.call_sid = str(uuidlib.UUID(bytes=payload))

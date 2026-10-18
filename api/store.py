@@ -341,8 +341,8 @@ class Store:
         return d
 
     def create_call(self, tenant_id: str, agent_id: Optional[str], medium: str, config: dict,
-                    metadata: Optional[dict] = None) -> dict:
-        cid, token = new_id("call"), secrets.token_urlsafe(24)
+                    metadata: Optional[dict] = None, *, call_id: Optional[str] = None) -> dict:
+        cid, token = call_id or new_id("call"), secrets.token_urlsafe(24)
         self._x("INSERT INTO calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (cid, tenant_id, agent_id, medium, "created", json.dumps(config), token,
                  json.dumps(metadata or {}), time.time(), None, None, None))
@@ -355,6 +355,24 @@ class Store:
     def get_call_any(self, call_id: str) -> Optional[dict]:
         r = self._one("SELECT * FROM calls WHERE id=?", (call_id,))
         return self._call(r) if r else None
+
+    def find_open_twilio_call(self, tenant_id: str, call_sid: str) -> Optional[dict]:
+        """Oldest non-ended Twilio row for this tenant whose metadata callSid matches.
+
+        Twilio retries the voice webhook when the response is lost. The retry must reuse that row
+        instead of reserving a second slot the first status callback can never name.
+        """
+        if not call_sid:
+            return None
+        rows = self._all(
+            "SELECT * FROM calls WHERE tenant_id=? AND medium=? AND status IN ('created', 'active') ORDER BY created",
+            (tenant_id, "twilio"))
+        for r in rows:
+            call = self._call(r)
+            meta = call.get("metadata") or {}
+            if str(meta.get("callSid", "") or "") == call_sid:
+                return call
+        return None
 
     def list_calls(self, tenant_id: str, limit: int = 50) -> list[dict]:
         return [self._call(r) for r in self._all(

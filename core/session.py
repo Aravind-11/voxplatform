@@ -27,6 +27,8 @@ from .turn import Ev, TurnConfig, TurnEvent, TurnManager
 
 FRAME_SAMPLES = 512   # 32 ms at 16 kHz (Silero VAD frame)
 IN_RATE = 16000
+# Not a string: a model sentence that equals the apology must not count as this attempt.
+_FALLBACK = object()
 
 
 @dataclass
@@ -101,7 +103,9 @@ class _Generation:
         self.first_audio_sent = False
         self.cancelled = False
         self.fallback_used = False     # the spoken apology is claimed at most once per reply
-        self.fallback_spoken = False   # synthesis started; a queue claim alone has not spoken it
+        self.fallback_spoken = False   # synthesis of the fallback sentinel has started
+        self.sentences: list[str] = [] # model sentences put on textq, in order
+        self.uncommitted_tts_failed = False  # speculative TTS died; later ordinary sentences will not play
         self.after: Optional[ToolResult] = None   # deferred call action requested by a tool this reply
 
 
@@ -341,8 +345,10 @@ class Session:
                         self._emit("llm_first_token", ms=self.clock() - t_req)
                     text_parts.append(item)
                     for piece in chunker.push(item):
+                        gen.sentences.append(piece)
                         gen.textq.put_nowait(piece)
                 for piece in chunker.flush():
+                    gen.sentences.append(piece)
                     gen.textq.put_nowait(piece)
                 if not calls:
                     break
@@ -366,9 +372,26 @@ class Session:
             # cancelled, or that fails before the turn commits, must stay silent.
             if gen.committed and not gen.cancelled and not gen.fallback_used:
                 gen.fallback_used = True
-                gen.textq.put_nowait(self.cfg.error_phrase)
+                # The model already closed with this sentence and that audio will still play.
+                # Queue the sentinel only when it will not, including after a speculative TTS
+                # failure that drops the ordinary sentences.
+                if not self._closing_phrase_will_play(gen):
+                    gen.textq.put_nowait(_FALLBACK)
         finally:
             gen.textq.put_nowait(None)
+
+    def _closing_phrase_will_play(self, gen: _Generation) -> bool:
+        """True when the caller will already hear the apology as the reply's last line.
+
+        A TTS failure before commit drops ordinary sentences, so a matching tail is not heard
+        and must not swallow the real fallback."""
+        if gen.uncommitted_tts_failed or gen.cancelled:
+            return False
+        phrase = self.cfg.error_phrase
+        if gen.sentences and gen.sentences[-1] == phrase:
+            return True
+        pending = len(gen.sentences) - len(gen.spoken)
+        return bool(gen.spoken) and gen.spoken[-1] == phrase and pending <= 0
 
     async def _synth(self, gen: _Generation) -> None:
         """Text -> audio, just in time. Only the first sentence is synthesized eagerly (so it is
@@ -377,34 +400,73 @@ class Session:
         one sentence per active call instead of a burst of whole replies, and cancelled
         speculative replies never cost more than one sentence."""
         idx = 0
-        text = None
         try:
             while True:
-                text = await gen.textq.get()
-                if text is None:
+                item = await gen.textq.get()
+                if item is None:
                     return
-                if idx > 0:
+                is_fallback = item is _FALLBACK
+                if is_fallback:
+                    if gen.fallback_spoken or gen.cancelled:
+                        continue
                     await gen.commit.wait()
-                    while self.tracker.buffered_ms() + gen.pending_ms > self.cfg.tts_lookahead_ms:
-                        await asyncio.sleep(self.cfg.tts_poll_s)
-                if text == self.cfg.error_phrase:
-                    gen.fallback_spoken = True   # this attempt is the apology; a failure must not schedule another
-                await self._speak(gen, text)
-                idx += 1
+                    if gen.cancelled or not gen.committed or gen.fallback_spoken:
+                        continue
+                    gen.fallback_used = True
+                    gen.fallback_spoken = True
+                    text = self.cfg.error_phrase
+                else:
+                    text = item
+                    if idx > 0:
+                        await gen.commit.wait()
+                        while self.tracker.buffered_ms() + gen.pending_ms > self.cfg.tts_lookahead_ms:
+                            await asyncio.sleep(self.cfg.tts_poll_s)
+                try:
+                    await self._speak(gen, text)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    await self._on_tts_failure(gen, is_fallback, e)
+                    return
+                if not is_fallback:
+                    idx += 1
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # noqa: BLE001
-            # Failing on an earlier chunk unwinds this loop, so an apology already queued by the
-            # model path would never be read. Speak it here. A failure of the phrase itself stops.
-            if text == self.cfg.error_phrase:
-                self._emit("error", where="tts_fallback", error=repr(e))
-            else:
-                self._emit("error", where="tts", error=repr(e))
-                if gen.committed and not gen.cancelled:
-                    await self._speak_fallback(gen)
         finally:
             gen.produce_done = True
             gen.outbox.put_nowait(None)
+
+    async def _on_tts_failure(self, gen: _Generation, is_fallback: bool, e: Exception) -> None:
+        """One apology for a committed TTS failure. The apology's own failure is not retried.
+
+        A failure before commit must not end this task. Drain would take the terminal outbox
+        mark, and a model error after commit would queue an apology nobody reads. On cancel,
+        stay silent. On commit, speak a queued apology once and drop ordinary sentences: a
+        successful reply whose speculative TTS died stays silent.
+        """
+        if is_fallback:
+            self._emit("error", where="tts_fallback", error=repr(e))
+            return
+        if not gen.committed and not gen.cancelled:
+            gen.uncommitted_tts_failed = True
+        self._emit("error", where="tts", error=repr(e))
+        if gen.cancelled:
+            return
+        if gen.uncommitted_tts_failed:
+            await self._play_queued_fallback(gen)
+            return
+        await self._speak_fallback(gen)
+
+    async def _play_queued_fallback(self, gen: _Generation) -> None:
+        await gen.commit.wait()
+        if gen.cancelled or not gen.committed:
+            return
+        while not gen.cancelled:
+            item = await gen.textq.get()
+            if item is None:
+                return
+            if item is _FALLBACK:
+                await self._speak_fallback(gen)
 
     async def _speak_fallback(self, gen: _Generation) -> None:
         """Synthesize the apology directly. A second failure is reported and not retried."""

@@ -339,6 +339,244 @@ async def test_cancelled_speculation_does_not_speak_an_apology():
     assert "Sorry, could you say that again?" not in r.tts.texts
 
 
+async def test_model_error_before_commit_stays_silent():
+    """A speculative stream that fails before END_OF_TURN must not apologize once the turn commits."""
+
+    class LLM:
+        async def stream(self, history, audio, followups, tools):
+            raise RuntimeError("model down")
+            yield ""  # pragma: no cover
+
+        async def transcribe(self, audio):
+            return "hello"
+
+    r = Rig(LLM())
+    phrase = r.s.cfg.error_phrase
+    await r.frames("s", 15)
+    await r.frames("q", 8)             # speculation starts and the model fails before commit
+    await r.settle()
+    assert any(e["type"] == "error" and e["where"] == "produce" for e in r.events)
+    assert phrase not in r.tts.texts and r.sent == []
+    await r.frames("q", 15)            # silence reaches END_OF_TURN
+    await r.settle()
+    assert phrase not in r.tts.texts and r.sent == []
+    assert r.s.history[-1] == {"role": "assistant", "content": ""}
+
+
+async def test_model_error_after_speculative_tts_failure_still_speaks():
+    """TTS dying during speculation used to end synth and drain, so a model error after
+    commit queued an apology nobody read."""
+
+    class LLM:
+        def __init__(self):
+            self.release = asyncio.Event()
+
+        async def stream(self, history, audio, followups, tools):
+            yield "Hello there. "
+            await self.release.wait()
+            raise RuntimeError("model down")
+
+        async def transcribe(self, audio):
+            return "hello"
+
+    class TTS:
+        sample_rate = 24000
+
+        def __init__(self):
+            self.texts = []
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            if text != "Sorry, could you say that again?":
+                raise RuntimeError("tts down")
+            yield np.zeros(2400, dtype=np.int16)
+
+    llm, tts = LLM(), TTS()
+    r = Rig(llm, tts=tts)
+    phrase = r.s.cfg.error_phrase
+    await r.frames("s", 15)
+    await r.frames("q", 8)
+    await r.settle()
+    assert tts.texts == ["Hello there."]
+    assert r.sent == []
+    assert "user_end_of_turn" not in r.types()
+    await r.frames("q", 15)            # commit; the model has not failed yet
+    await r.settle()
+    assert tts.texts == ["Hello there."] and r.sent == []
+    llm.release.set()
+    await r.settle()
+    assert tts.texts == ["Hello there.", phrase]
+    assert len(r.sent) == 1
+    assert any(e["type"] == "error" and e["where"] == "produce" for e in r.events)
+    assert any(e["type"] == "error" and e["where"] == "tts" for e in r.events)
+
+
+async def test_precommit_tts_failure_of_a_successful_reply_stays_silent():
+    class TTS:
+        sample_rate = 24000
+
+        def __init__(self):
+            self.texts = []
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            raise RuntimeError("tts down")
+            yield np.zeros(1, dtype=np.int16)  # pragma: no cover
+
+    tts = TTS()
+    r = Rig(FakeLLM([["Hello there. More words here."]]), tts=tts)
+    await r.frames("s", 15)
+    await r.frames("q", 8)
+    await r.settle()
+    await r.frames("q", 15)
+    await r.settle()
+    assert tts.texts == ["Hello there."]
+    assert r.s.cfg.error_phrase not in tts.texts
+    assert r.sent == []
+
+
+async def test_speculative_tts_failure_cancelled_by_resume_stays_silent():
+    class TTS:
+        sample_rate = 24000
+
+        def __init__(self):
+            self.texts = []
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            raise RuntimeError("tts down")
+            yield np.zeros(1, dtype=np.int16)  # pragma: no cover
+
+    tts = TTS()
+    r = Rig(FakeLLM([["Hello there. ", HANG]]), tts=tts)
+    await r.frames("s", 15)
+    await r.frames("q", 8)
+    await r.settle()
+    assert tts.texts == ["Hello there."]
+    await r.frames("s", 10)            # resume cancels the uncommitted reply
+    await r.settle()
+    assert r.s.cfg.error_phrase not in tts.texts
+    assert r.sent == []
+
+
+async def test_model_error_does_not_repeat_its_own_closing_apology():
+    class LLM:
+        def __init__(self):
+            self.release = asyncio.Event()
+
+        async def stream(self, history, audio, followups, tools):
+            yield "Sorry, could you say that again? "
+            await self.release.wait()
+            raise RuntimeError("model down")
+
+        async def transcribe(self, audio):
+            return "hello"
+
+    llm = LLM()
+    r = Rig(llm)
+    phrase = r.s.cfg.error_phrase
+    await r.frames("s", 15)
+    await r.frames("q", 8)
+    await r.settle()
+    await r.frames("q", 15)            # commit and play the model's own sentence
+    await r.settle()
+    assert r.tts.texts.count(phrase) == 1
+    assert r.s.history[-1]["content"] == phrase
+    llm.release.set()
+    await r.settle()
+    assert r.tts.texts.count(phrase) == 1
+    assert r.s.history[-1]["content"] == phrase
+    assert [e["text"] for e in r.events if e["type"] == "agent_speech"].count(phrase) == 1
+
+
+async def test_model_error_does_not_repeat_a_closing_apology_after_other_text():
+    class LLM:
+        def __init__(self):
+            self.release = asyncio.Event()
+
+        async def stream(self, history, audio, followups, tools):
+            yield "Hello there. Sorry, could you say that again? "
+            await self.release.wait()
+            raise RuntimeError("model down")
+
+        async def transcribe(self, audio):
+            return "hello"
+
+    llm = LLM()
+    r = Rig(llm)
+    phrase = r.s.cfg.error_phrase
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    llm.release.set()
+    await r.settle()
+    assert r.tts.texts.count(phrase) == 1
+    assert "Hello there." in r.tts.texts
+    assert r.s.history[-1]["content"].count(phrase) == 1
+
+
+async def test_model_apology_sentence_does_not_suppress_later_tts_fallback():
+    class TTS:
+        sample_rate = 24000
+
+        def __init__(self):
+            self.texts = []
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            if text == "I will transfer you now.":
+                raise RuntimeError("tts down")
+            yield np.zeros(2400, dtype=np.int16)
+
+    tts = TTS()
+    r = Rig(FakeLLM([["Sorry, could you say that again? I will transfer you now."]]), tts=tts)
+    phrase = r.s.cfg.error_phrase
+    await r.frames("s", 15)
+    await r.frames("q", 8)
+    await r.settle()
+    assert tts.texts == [phrase]       # second sentence waits for commit
+    await r.frames("q", 15)
+    await r.settle()
+    assert tts.texts == [phrase, "I will transfer you now.", phrase]
+    assert len(r.sent) == 2
+    assert any(e["type"] == "error" and e["where"] == "tts" for e in r.events)
+
+
+async def test_tts_failure_of_model_apology_sentence_retries_once():
+    """The model's own copy of the apology is not the fallback attempt. A TTS error on it
+    is where=tts and is retried once, not relabelled where=tts_fallback with no retry."""
+
+    class TTS:
+        sample_rate = 24000
+
+        def __init__(self):
+            self.texts = []
+            self.fail = asyncio.Event()
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            if len(self.texts) == 1:
+                await self.fail.wait()
+                raise RuntimeError("tts down")
+            yield np.zeros(2400, dtype=np.int16)
+
+    tts = TTS()
+    r = Rig(FakeLLM([["Sorry, could you say that again?"]]), tts=tts)
+    phrase = r.s.cfg.error_phrase
+    await r.frames("s", 15)
+    await r.frames("q", 8)
+    await r.settle()
+    assert tts.texts == [phrase]
+    await r.frames("q", 15)            # commit while that synthesize is blocked
+    await r.settle()
+    tts.fail.set()
+    await r.settle()
+    assert tts.texts == [phrase, phrase]
+    assert len(r.sent) == 1
+    assert any(e["type"] == "error" and e["where"] == "tts" for e in r.events)
+    assert not any(e["type"] == "error" and e["where"] == "tts_fallback" for e in r.events)
+
+
 async def test_noise_burst_triggers_nothing():
     llm = FakeLLM([["Should ", "not ", "happen."]])
     r = Rig(llm)

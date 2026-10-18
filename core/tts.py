@@ -210,11 +210,13 @@ class _BytePCM:
         self.rate = default_rate
         self._buf = bytearray()
         self._i = 0
-        self._mode = "unk"  # unk until the leading bytes say wav or raw
+        self._mode = "unk"  # unk until the leading bytes say wav or raw; done once a sized data chunk ends
         self._channels = 1
         self._data_left: int | None = None  # bytes still owed by the wav data chunk; -1 if the size is unknown
 
     def feed(self, piece) -> list[np.ndarray]:
+        if self._mode == "done":
+            return []
         if isinstance(piece, np.ndarray):
             ready = self._pull(final=False)
             pcm, _rate = _pcm_from_tts(piece, self.rate)
@@ -242,10 +244,12 @@ class _BytePCM:
             out.extend(self._take_wav(final))
             if self._data_left != 0:
                 break
-            self._mode = "unk"
-            self._data_left = None
-            if self._i >= len(self._buf):
-                break
+            # The declared data chunk is finished. Bytes after it are a pad or a LIST trailer.
+            # wave.open ignores those bytes; reclassifying them speaks noise, or aborts the
+            # utterance when the trailer looks like text, and drops samples already decoded.
+            self._mode = "done"
+            self._i = len(self._buf)
+            break
         self._compact()
         return out
 

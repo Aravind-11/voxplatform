@@ -193,6 +193,47 @@ async def test_split_wav_keeps_its_sample_rate_and_every_sample():
         assert pcm.tolist() == samples
 
 
+def _wav_with_trailer(samples, trailer: bytes) -> bytes:
+    """A sized data chunk, then extra bytes. wave.open does not play the extra bytes."""
+    pcm = np.asarray(samples, dtype="<i2").tobytes()
+    fact = (len(samples)).to_bytes(4, "little")
+    fmt = b"".join([
+        (1).to_bytes(2, "little"),
+        (1).to_bytes(2, "little"),
+        (16000).to_bytes(4, "little"),
+        (32000).to_bytes(4, "little"),
+        (2).to_bytes(2, "little"),
+        (16).to_bytes(2, "little"),
+    ])
+
+    def chunk(cid: bytes, payload: bytes) -> bytes:
+        pad = b"\x00" if len(payload) & 1 else b""
+        return cid + len(payload).to_bytes(4, "little") + payload + pad
+
+    body = chunk(b"fact", fact) + chunk(b"fmt ", fmt) + chunk(b"data", pcm) + trailer
+    return b"RIFF" + (4 + len(body)).to_bytes(4, "little") + b"WAVE" + body
+
+
+async def test_wav_trailer_is_not_played_and_does_not_abort():
+    """LIST or text after the data chunk is not more PCM, and it must not fail the utterance."""
+    samples = [1000, -1000, 2000, -2000, 7]
+    bodies = [
+        _wav_with_trailer(samples, b"LIST" + (4).to_bytes(4, "little") + b"INFO"),
+        _wav_with_trailer(samples, b"<INFO>tail</INFO>"),
+    ]
+    for body in bodies:
+        buffered = HttpTTS("http://tts.example/v1", _Client(body), sample_rate=24000)
+        whole = [c async for c in buffered.synthesize("hi")]
+        assert buffered.sample_rate == 16000
+        assert np.concatenate(whole).tolist() == samples
+        for step in (1, 8, len(body)):
+            tts = HttpTTS("http://tts.example/v1", _byte_stream(body, step), sample_rate=24000)
+            got = [c async for c in tts.synthesize("hi")]
+            pcm = np.concatenate(got) if got else np.zeros(0, np.int16)
+            assert tts.sample_rate == 16000
+            assert pcm.tolist() == samples
+
+
 async def test_a_pcm_sample_split_across_chunks_is_not_dropped():
     raw = np.asarray([1000, -1000, 2000, -2000], dtype=np.int16).tobytes()
     tts = HttpTTS("http://tts.example/v1", _byte_stream(raw, 3), sample_rate=24000)

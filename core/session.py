@@ -102,6 +102,31 @@ def _fill_word_slices(slices: list[_WordSlice], lengths: list[int], sentence: st
         prev = k
 
 
+def _claim_words_so_far(slices: list[_WordSlice], lengths: list[int], sentence: str, out_rate: int,
+                        ms_per_word: float = 180.0) -> None:
+    """Words a barge-in may claim before synthesis of this sentence has finished.
+
+    Elapsed audio caps the claim at about one word per 180 ms. The chunk in progress does not
+    receive the rest of the sentence: that would mark every word heard as soon as the first
+    chunk reached the caller.
+    """
+    words = sentence.split()
+    if not slices or not words:
+        return
+    elapsed = sum(pcm_duration_ms(n, out_rate) for n in lengths)
+    n_words = min(len(words), int(elapsed // ms_per_word))
+    total = sum(lengths) or 1
+    prev = 0
+    acc = 0
+    last = len(slices) - 1
+    for i, (sl, n) in enumerate(zip(slices, lengths)):
+        acc += n
+        k = n_words if i == last else int(n_words * acc / total)
+        k = min(n_words, max(prev, k))
+        sl.text = " ".join(words[prev:k])
+        prev = k
+
+
 @dataclass
 class SessionConfig:
     system_prompt: str = "You are a helpful voice assistant. Keep replies short and conversational."
@@ -464,11 +489,12 @@ class Session:
             pcm = resample(np.asarray(part), self.tts.sample_rate, self.cfg.out_rate)
             if len(pcm) == 0:
                 continue
-            # Full sentence on the first chunk only, so _drain does not append it twice. The slice is what
-            # barge-in reads; it is rewritten to this chunk's share of the words once every length is known.
-            sl = _WordSlice(text if first else "")
+            # The transcript line is the whole sentence once. The slice is what barge-in reads, and it
+            # stays a conservative prefix until every chunk's length is known.
+            sl = _WordSlice("")
             slices.append(sl)
             lengths.append(len(pcm))
+            _claim_words_so_far(slices, lengths, text, self.cfg.out_rate)
             spoken = text if first else ""
             first = False
             gen.pending_ms += pcm_duration_ms(len(pcm), self.cfg.out_rate)

@@ -166,6 +166,9 @@ def _pcm_from_tts(raw, default_rate: int) -> tuple[np.ndarray, int]:
         if channels > 1:
             pcm = pcm.reshape(-1, channels)[:, 0].copy()
         return pcm, rate
+    # An error document (JSON or HTML) is even-length often enough to decode as loud PCM.
+    if raw[:1] in (b"{", b"[", b"<"):
+        raise ValueError("HttpTTS response was not audio")
     if len(raw) % 2:
         raw = raw[: len(raw) - 1]
     return np.frombuffer(raw, dtype="<i2").copy(), default_rate
@@ -220,6 +223,9 @@ class HttpTTS:
                     yield pcm
             return
         resp = await posted
+        status = getattr(resp, "status_code", None)
+        if status is not None and int(status) >= 400:
+            raise RuntimeError(f"HttpTTS HTTP {status}")
         if hasattr(resp, "__aiter__") and not isinstance(resp, (bytes, bytearray)):
             async for piece in resp:
                 pcm, rate = _pcm_from_tts(piece, self.sample_rate)

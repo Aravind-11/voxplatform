@@ -26,7 +26,12 @@ class LimitedTTS:
 
     def __init__(self, inner, limit: int):
         self.inner, self.limit = inner, limit
-        self.sample_rate = inner.sample_rate
+
+    @property
+    def sample_rate(self) -> int:
+        # HttpTTS replaces this when a WAV header arrives. A copy taken at init would resample
+        # that audio at the wrong rate for the rest of the call.
+        return self.inner.sample_rate
 
     async def synthesize(self, text: str):
         if LimitedTTS._sem is None:

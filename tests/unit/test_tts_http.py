@@ -4,6 +4,7 @@ import io
 import wave
 
 import numpy as np
+import pytest
 
 from api.runtime import LimitedTTS
 from core.tts import HttpTTS
@@ -121,3 +122,53 @@ async def test_limited_tts_does_not_buffer_before_the_first_yield():
     finally:
         gate.set()
         LimitedTTS._sem = old
+
+
+async def test_limited_tts_follows_a_wav_sample_rate_change():
+    """A rate copied once at wrap time resamples a 16 kHz WAV as 24 kHz for the rest of the call."""
+    old = LimitedTTS._sem
+    LimitedTTS._sem = None
+    try:
+        inner = HttpTTS("http://tts.example/v1", _Client(_wav([1, 2, 3], 16000)))
+        lim = LimitedTTS(inner, 1)
+        assert lim.sample_rate == 24000
+        chunks = [c async for c in lim.synthesize("hi")]
+        assert chunks[0].tolist() == [1, 2, 3]
+        assert lim.sample_rate == 16000
+    finally:
+        LimitedTTS._sem = old
+
+
+async def test_http_tts_does_not_play_an_error_document_as_pcm():
+    class _Err:
+        def __init__(self, status, content):
+            self.status_code = status
+            self.content = content
+
+    class _ClientErr:
+        def __init__(self, status, content):
+            self.status, self.content = status, content
+
+        async def post(self, url, json=None, headers=None):
+            return _Err(self.status, self.content)
+
+    with pytest.raises(RuntimeError):
+        _ = [c async for c in HttpTTS("http://tts.example/v1", _ClientErr(500, b'{"error":"no"}')).synthesize("hi")]
+    with pytest.raises(ValueError):
+        _ = [c async for c in HttpTTS("http://tts.example/v1", _ClientErr(200, b'{"error":"no"}')).synthesize("hi")]
+
+
+def test_claim_words_so_far_does_not_mark_the_rest_of_the_sentence_heard():
+    """A barge-in during the first chunk must not be told the caller heard the whole sentence."""
+    from core.session import _WordSlice, _claim_words_so_far, _fill_word_slices
+
+    sentence = "one two three four five six"
+    one = _WordSlice("SHOULD NOT STICK")
+    _claim_words_so_far([one], [1600], sentence, 8000)  # 200 ms at 8 kHz -> one word
+    assert one.text == "one"
+    a, b = _WordSlice(""), _WordSlice("")
+    _claim_words_so_far([a, b], [2880, 2880], sentence, 8000)  # 360 ms + 360 ms -> four words
+    assert (a.text + " " + b.text).split() == ["one", "two", "three", "four"]
+    assert sentence not in a.text and sentence not in b.text
+    _fill_word_slices([a, b], [2880, 2880], sentence)
+    assert (a.text + " " + b.text).split() == sentence.split()

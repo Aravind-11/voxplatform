@@ -5,6 +5,7 @@ import json
 import numpy as np
 
 from core.session import Session, SessionConfig, ToolCall, TurnConfig
+from harness import eval_conv
 from harness.eval_conv import Case, _score, compare, replay
 from scripts.eval_compare import main as compare_main
 
@@ -180,6 +181,154 @@ async def test_replay_fails_when_expected_and_forbidden_tools_both_finish():
     assert out["wrong_actions"] == ["cancel"]
 
 
+async def test_replay_scores_a_forbidden_tool_still_running_at_the_cap(monkeypatch):
+    """book's tool_result used to be enough for a pass. cancel was already in the
+    committed turn, still awaiting when the cap fired, and close() dropped it with
+    no tool_result, so _score never saw the forbidden call."""
+    monkeypatch.setattr(eval_conv, "_TURN_WAIT_S", 0.2)
+    ran = {"started": False, "finished": False}
+
+    async def book(args):
+        return {"ok": True}
+
+    async def cancel(args):
+        ran["started"] = True
+        await asyncio.sleep(30)
+        ran["finished"] = True
+        return {"ok": True}
+
+    def make():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        return Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {}),
+                                     ToolCall("t2", "cancel", {})], ["All set."]]),
+                       tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools={"book": book, "cancel": cancel},
+                       cfg=SessionConfig(tts_poll_s=0))
+
+    out = await replay(make, _case())
+    assert ran["started"] is True
+    assert ran["finished"] is False
+    assert out["task_success"] is False
+    assert out["wrong_actions"] == ["cancel"]
+
+
+async def test_replay_does_not_pass_when_produce_is_still_running_at_the_cap(monkeypatch):
+    """The follow-up model round is not a tool_call yet. Expiring the cap there used to
+    leave task_success true off the earlier tool_result."""
+    monkeypatch.setattr(eval_conv, "_TURN_WAIT_S", 0.15)
+    ran = {"book": False}
+
+    class HangFollowup(FakeLLM):
+        async def stream(self, history, audio, followups, tools):
+            i = len(self.calls)
+            self.calls.append(i)
+            if followups:
+                await asyncio.sleep(30)
+            for item in self.replies[min(i, len(self.replies) - 1)]:
+                await asyncio.sleep(0)
+                yield item
+
+    async def book(args):
+        ran["book"] = True
+        return {"ok": True}
+
+    def make():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        return Session(llm=HangFollowup([["Done. ", ToolCall("t1", "book", {})], ["All set."]]),
+                       tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools={"book": book, "cancel": _cancel},
+                       cfg=SessionConfig(tts_poll_s=0))
+
+    out = await replay(make, _case())
+    assert ran["book"] is True
+    assert out["task_success"] is False
+    assert out["wrong_actions"] == []
+
+
+async def test_replay_waits_for_a_slow_end_of_turn_verdict_before_more_silence():
+    """eot_async that awaits real time used to lose to the sleep(0) tail: end_ms
+    committed, the turn reset, and a 0.0 score never raised patient_end_ms."""
+    async def not_done(audio, history):
+        await asyncio.sleep(0.05)
+        return 0.0
+
+    def patient():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        return Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"})], ["All set."]]),
+                       tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools={"book": _book, "cancel": _cancel},
+                       cfg=SessionConfig(tts_poll_s=0), eot_async=not_done)
+
+    out = await replay(patient, _case())
+    assert out["task_success"] is True
+    assert out["first_audio_ms"] is not None
+    assert out["first_audio_ms"] >= TurnConfig().patient_end_ms
+
+
+async def test_replay_keeps_end_ms_when_the_end_of_turn_verdict_misses_the_cap(monkeypatch):
+    """A verdict still pending at the cap must not block the tail. end_ms stands."""
+    monkeypatch.setattr(eval_conv, "_TURN_WAIT_S", 0.1)
+
+    async def not_done(audio, history):
+        await asyncio.sleep(5)
+        return 0.0
+
+    def patient():
+        async def send(pcm, rate):
+            return None
+
+        async def clear():
+            return None
+
+        return Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"})], ["All set."]]),
+                       tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools={"book": _book, "cancel": _cancel},
+                       cfg=SessionConfig(tts_poll_s=0), eot_async=not_done)
+
+    out = await replay(patient, _case())
+    assert out["task_success"] is True
+    assert out["first_audio_ms"] == 640
+
+
+async def test_replay_counts_first_audio_only_after_the_write_returns():
+    """agent_first_audio is emitted before send_audio returns. close() used to cancel
+    that write and still report its latency."""
+    state = {"finished": False}
+
+    async def send(pcm, rate):
+        await asyncio.sleep(0.3)
+        state["finished"] = True
+
+    def make():
+        async def clear():
+            return None
+
+        return Session(llm=FakeLLM([["Done. ", ToolCall("t1", "book", {"day": "mon"})], ["All set."]]),
+                       tts=FakeTTS(), vad=EnergyVAD(), send_audio=send, clear_audio=clear,
+                       clock=Clock(), tools={"book": _book, "cancel": _cancel},
+                       cfg=SessionConfig(tts_poll_s=0))
+
+    out = await replay(make, _case())
+    assert state["finished"] is True
+    assert out["first_audio_ms"] is not None
+    assert out["task_success"] is True
+
+
 async def test_replay_runs_a_forbidden_tool_queued_behind_a_slow_call():
     """book's tool_call is emitted before its body returns. Closing there used to score
     success and never start the cancel that was already in the committed turn."""
@@ -231,14 +380,39 @@ async def test_replay_scores_expected_tool_and_rejects_a_forbidden_one():
 def test_task_success_requires_expected_tools_and_the_interruption_budget():
     case = Case(audio=SPEECH, expect_tools=["book"], forbid_tools=["cancel"], max_interruptions=0)
     over = _score(case, [{"type": "tool_result", "name": "book"}, {"type": "user_interrupted"},
-                         {"type": "agent_first_audio", "latency_ms": 640}])
+                         {"type": "agent_first_audio", "latency_ms": 640},
+                         {"type": "agent_speech", "text": "Done."}])
     assert over["task_success"] is False
     assert over["wrong_actions"] == []
     assert over["interruptions"] == 1
     assert over["first_audio_ms"] == 640
+    # The event is emitted before send_audio returns. A cancelled write is not a latency.
+    dropped = _score(case, [{"type": "tool_result", "name": "book"},
+                            {"type": "agent_first_audio", "latency_ms": 640}])
+    assert dropped["first_audio_ms"] is None
+    assert dropped["task_success"] is True
     assert _score(case, [{"type": "tool_result", "name": "book"}])["task_success"] is True
     # Emitted before the body runs. A cancelled call must not pass the case.
     assert _score(case, [{"type": "tool_call", "name": "book"}])["task_success"] is False
+    hung = _score(case, [{"type": "tool_call", "name": "book"}, {"type": "tool_result", "name": "book"},
+                         {"type": "tool_call", "name": "cancel"},
+                         {"type": "agent_first_audio", "latency_ms": 640},
+                         {"type": "agent_speech", "text": "Done."}])
+    assert hung["task_success"] is False
+    assert hung["wrong_actions"] == ["cancel"]
+    assert hung["first_audio_ms"] == 640
+    other = _score(case, [{"type": "tool_call", "name": "book"}, {"type": "tool_result", "name": "book"},
+                          {"type": "tool_call", "name": "lookup"}])
+    assert other["task_success"] is False
+    assert other["wrong_actions"] == []
+    # Produce still running at the cap, with no open tool_call left to see in the events.
+    unsettled = _score(case, [{"type": "tool_result", "name": "book"},
+                              {"type": "agent_first_audio", "latency_ms": 640},
+                              {"type": "agent_speech", "text": "Done."}],
+                       produce_settled=False)
+    assert unsettled["task_success"] is False
+    assert unsettled["wrong_actions"] == []
+    assert unsettled["first_audio_ms"] == 640
     assert _score(case, [])["task_success"] is False
     allowed = Case(audio=SPEECH, expect_tools=["book"], forbid_tools=[], max_interruptions=1)
     assert _score(allowed, [{"type": "tool_result", "name": "book"},

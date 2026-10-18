@@ -8,6 +8,7 @@ from a trailing "um", and a fitted VOX_EOT_MODEL only retunes the same four cues
 from __future__ import annotations
 
 import json
+import math
 
 import numpy as np
 
@@ -40,9 +41,13 @@ class EotClassifier:
         for k in _KEYS:
             if k in data and data[k] is not None:
                 try:
-                    picked[k] = float(data[k])
+                    value = float(data[k])
                 except (TypeError, ValueError, OverflowError):
                     return cls()
+                # 1e309 and JSON Infinity/NaN become inf/nan without raising.
+                if not math.isfinite(value):
+                    return cls()
+                picked[k] = value
         return cls(picked)
 
     def score_features(self, feats: dict) -> float:

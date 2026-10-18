@@ -1,4 +1,5 @@
 import json
+import math
 
 import numpy as np
 
@@ -49,6 +50,33 @@ def test_a_weight_that_cannot_be_a_float_keeps_the_hand_priors(monkeypatch, tmp_
     monkeypatch.setenv("VOX_EOT_MODEL", str(path))
     rt = Runtime(object(), lambda v: None, lambda: None, Store())
     assert rt._eot_sync()(np.zeros(64, np.int16), []) == 0.5
+
+
+def test_a_nonfinite_weight_keeps_the_hand_priors(tmp_path):
+    """JSON 1e309 / Infinity / NaN become non-finite floats without raising, so they must not load."""
+    from tests.unit.test_prosody import clip, tone
+
+    hum = clip(tone(180, 180, 0.5), tone(180, 180, 0.6))
+    filler = {"filler": True, "slope": 0.0, "decay": 0.75, "voiced": 0.0}
+    prior = EotClassifier()
+    prior_hum = prior.score(hum)
+    prior_filler = prior.score_features(filler)
+    assert math.isfinite(prior_hum) and prior_hum != 1.0
+    assert math.isfinite(prior_filler) and prior_filler != 1.0
+    # a finite sibling must not survive: one bad weight drops the whole file
+    bodies = (
+        '{"bias": 1e309, "filler": -40}',
+        '{"bias": Infinity, "slope": 9}',
+        '{"bias": -Infinity, "decay": 9}',
+        '{"bias": NaN, "voiced": 9}',
+    )
+    for body in bodies:
+        path = tmp_path / "bad.json"
+        path.write_text(body)
+        loaded = EotClassifier.load(str(path))
+        assert loaded.weights == DEFAULT_WEIGHTS
+        assert loaded.score(hum) == prior_hum
+        assert loaded.score_features(filler) == prior_filler
 
 
 def test_negative_filler_weight_scores_an_um_below_even():

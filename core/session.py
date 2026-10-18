@@ -100,7 +100,8 @@ class _Generation:
         self.produce_done = False
         self.first_audio_sent = False
         self.cancelled = False
-        self.fallback_used = False     # the spoken apology is attempted at most once per reply
+        self.fallback_used = False     # the spoken apology is claimed at most once per reply
+        self.fallback_spoken = False   # synthesis started; a queue claim alone has not spoken it
         self.after: Optional[ToolResult] = None   # deferred call action requested by a tool this reply
 
 
@@ -376,6 +377,7 @@ class Session:
         one sentence per active call instead of a burst of whole replies, and cancelled
         speculative replies never cost more than one sentence."""
         idx = 0
+        text = None
         try:
             while True:
                 text = await gen.textq.get()
@@ -385,21 +387,31 @@ class Session:
                     await gen.commit.wait()
                     while self.tracker.buffered_ms() + gen.pending_ms > self.cfg.tts_lookahead_ms:
                         await asyncio.sleep(self.cfg.tts_poll_s)
+                if text == self.cfg.error_phrase:
+                    gen.fallback_spoken = True   # this attempt is the apology; a failure must not schedule another
                 await self._speak(gen, text)
                 idx += 1
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
-            self._emit("error", where="tts", error=repr(e))
-            if gen.committed and not gen.cancelled and not gen.fallback_used:
-                await self._speak_fallback(gen)
+            # Failing on an earlier chunk unwinds this loop, so an apology already queued by the
+            # model path would never be read. Speak it here. A failure of the phrase itself stops.
+            if text == self.cfg.error_phrase:
+                self._emit("error", where="tts_fallback", error=repr(e))
+            else:
+                self._emit("error", where="tts", error=repr(e))
+                if gen.committed and not gen.cancelled:
+                    await self._speak_fallback(gen)
         finally:
             gen.produce_done = True
             gen.outbox.put_nowait(None)
 
     async def _speak_fallback(self, gen: _Generation) -> None:
         """Synthesize the apology directly. A second failure is reported and not retried."""
+        if gen.fallback_spoken or not gen.committed or gen.cancelled:
+            return
         gen.fallback_used = True
+        gen.fallback_spoken = True
         try:
             await self._speak(gen, self.cfg.error_phrase)
         except asyncio.CancelledError:

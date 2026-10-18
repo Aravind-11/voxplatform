@@ -254,6 +254,54 @@ async def test_model_error_after_commit_speaks_an_apology():
     assert any(e["type"] == "error" and e["where"] == "produce" for e in r.events)
 
 
+async def test_queued_apology_is_spoken_when_earlier_tts_fails():
+    """The model path queues the apology and marks it used. A TTS error on the partial
+    must not drop that phrase, and must not speak it twice."""
+    class LLM:
+        def __init__(self):
+            self.release = asyncio.Event()
+
+        async def stream(self, history, audio, followups, tools):
+            yield "Partial answer. "
+            await self.release.wait()
+            raise RuntimeError("model down")
+
+        async def transcribe(self, audio):
+            return "hello"
+
+    class TTS:
+        sample_rate = 24000
+
+        def __init__(self):
+            self.texts = []
+            self.partial_started = asyncio.Event()
+            self.fail_partial = asyncio.Event()
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            if text != "Sorry, could you say that again?":
+                self.partial_started.set()
+                await self.fail_partial.wait()
+                raise RuntimeError("tts down")
+            yield np.zeros(2400, dtype=np.int16)
+
+    llm, tts = LLM(), TTS()
+    r = Rig(llm, tts=tts)
+    await r.frames("s", 15)
+    await r.frames("q", 8)
+    await r.settle()
+    await asyncio.wait_for(tts.partial_started.wait(), timeout=2)
+    await r.frames("q", 15)            # commit while both the model and the partial TTS are blocked
+    await r.settle()
+    llm.release.set()
+    await r.settle()                   # model fails and queues the apology before the partial TTS raises
+    tts.fail_partial.set()
+    await r.settle()
+    assert r.tts.texts.count("Sorry, could you say that again?") == 1
+    assert "Partial answer." in r.tts.texts
+    assert any(e["type"] == "error" and e["where"] == "produce" for e in r.events)
+
+
 async def test_tts_failure_speaks_one_fallback_and_does_not_loop():
     class BoomTTS:
         sample_rate = 24000

@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import pathlib
 import re
 import shutil
 import socket
@@ -96,6 +97,67 @@ def test_lost_stream_reconnects_with_history_and_frees_the_slot():
     assert [m["content"] for m in sess.history[1:]] == ["Hello, how can I help?", "I want Tuesday at eleven."]
     assert [m["role"] for m in sess.history[1:]] == ["assistant", "user"]
     assert "cut off" in sess.cfg.greeting and "Hello" not in sess.cfg.greeting
+
+
+def test_failed_warm_transfer_keeps_history_and_the_apology():
+    c, store, _ = make()
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a", "systemPrompt": "Be brief.", "greeting": "Hello!"},
+               headers={"X-API-Key": k}).json()
+    call = store.create_call(tid, a["id"], "twilio", a["config"], {"from": "+1555", "to": "+1666"})
+    store.add_message(call["id"], "agent", "Hello, how can I help?", time.time())
+    store.add_message(call["id"], "user", "I want Tuesday at eleven.", time.time())
+    path, q = f"/twilio/transfer-result/{call['id']}", "to=billing"
+    form = {"DialCallStatus": "no-answer"}
+    r = c.post(f"{path}?{q}", data=form, headers=sign(f"{BASE}{path}?{q}", form))
+    assert r.status_code == 200 and "<Connect>" in r.text
+    new = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == call["id"]][0]
+    assert new["metadata"].get("resumeReason") == "transfer"
+    sess = c.app.state.runtime.build_session(new, type("T", (), {"out_rate": 8000, "call_sid": "CA1",
+                                                                  "send_audio": lambda s, *a: None, "clear": lambda s: None,
+                                                                  "end": lambda s: None})())
+    assert [m["content"] for m in sess.history[1:]] == ["Hello, how can I help?", "I want Tuesday at eleven."]
+    assert [m["role"] for m in sess.history[1:]] == ["assistant", "user"]
+    assert "not available" in sess.cfg.greeting and "cut off" not in sess.cfg.greeting
+
+
+def test_tools_doc_does_not_say_a_failed_warm_transfer_starts_fresh():
+    """docs/TOOLS.md and the STATUS.md warm-transfer row are what an integrator follows.
+    They must describe the returned session, not a blank one."""
+    root = pathlib.Path(__file__).resolve().parents[2]
+    text = (root / "docs" / "TOOLS.md").read_text()
+    line = next(ln for ln in text.splitlines() if '"mode":"warm"' in ln)
+    assert "fresh conversation" not in line
+    assert "earlier transcript" in line and "not-available apology" in line
+    row = next(ln for ln in (root / "docs" / "STATUS.md").read_text().splitlines()
+               if ln.startswith("| Warm transfer"))
+    assert "fresh conversation" not in row
+    assert "keeps the earlier transcript" in row and "not-available apology" in row
+
+
+def test_stream_loss_after_a_failed_transfer_is_not_labeled_transfer():
+    """The transfer apology is only for the call created by transfer-result. A later dropped stream is a reconnect."""
+    c, store, _ = make()
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a", "systemPrompt": "Be brief.", "greeting": "Hello!"},
+               headers={"X-API-Key": k}).json()
+    call = store.create_call(tid, a["id"], "twilio", a["config"], {"from": "+1555", "to": "+1666"})
+    store.add_message(call["id"], "user", "I want Tuesday at eleven.", time.time())
+    path, q = f"/twilio/transfer-result/{call['id']}", "to=billing"
+    form = {"DialCallStatus": "no-answer"}
+    assert c.post(f"{path}?{q}", data=form, headers=sign(f"{BASE}{path}?{q}", form)).status_code == 200
+    transferred = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == call["id"]][0]
+    assert transferred["metadata"].get("resumeReason") == "transfer"
+    store.update_call(transferred["id"], status="active")
+    assert "<Stream" in resume(c, transferred["id"]).text
+    lost = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == transferred["id"]][0]
+    assert lost["metadata"].get("resumeReason") != "transfer"
+    assert "resumeReason" not in lost["metadata"]
+    sess = c.app.state.runtime.build_session(lost, type("T", (), {"out_rate": 8000, "call_sid": "CA1",
+                                                                   "send_audio": lambda s, *a: None, "clear": lambda s: None,
+                                                                   "end": lambda s: None})())
+    assert "cut off" in sess.cfg.greeting and "not available" not in sess.cfg.greeting
+    assert "I want Tuesday at eleven." in [m["content"] for m in sess.history]
 
 
 def test_resumes_are_capped_so_a_broken_call_cannot_loop():

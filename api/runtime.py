@@ -393,10 +393,14 @@ class Runtime:
             prompt += "\n\n" + toolmod.READBACK_INSTRUCTION
         if cfg.get("restateSlots"):
             prompt += "\n\n" + RESTATE_SLOTS
+        # Lost-stream reconnects replace the greeting with a "cut off" apology. A failed warm transfer also
+        # sets resumedFrom, but its own greeting is the "not available" line and must be kept.
+        greeting = varmod.render(str(cfg.get("greeting") or ""), values)
+        if resumed and meta.get("resumeReason") != "transfer":
+            greeting = RESUME_PHRASE.get(lang, RESUME_PHRASE["en"])
         scfg = SessionConfig(system_prompt=prompt,
                              out_rate=transport.out_rate, tools_schema=schemas,
-                             greeting=(RESUME_PHRASE.get(lang, RESUME_PHRASE["en"]) if resumed
-                                       else varmod.render(str(cfg.get("greeting") or ""), values)),
+                             greeting=greeting,
                              error_phrase=ERROR_PHRASE.get(lang, ERROR_PHRASE["en"]),
                              tool_fillers=fillers,
                              turn=TurnConfig(end_ms=float(os.environ.get("VOX_END_MS", "640")),

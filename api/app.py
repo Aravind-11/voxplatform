@@ -1656,12 +1656,15 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         def _handoff():
             # Free the dead leg and hold the replacement before returning. A gap where
             # local_active drops to 0 lets another join take the only slot.
+            # resumeReason "transfer" belongs only to the call transfer-result created. Copying it would make
+            # this dropped stream keep the "not available" greeting instead of the cut-off line.
             _end_lost("stream_lost")
             cid, decision = reserve_slot(call["tenant_id"])
             if decision != "ok":
                 return None
+            carried = {k: v for k, v in meta.items() if k != "resumeReason"}
             return create_reserved(cid, call["tenant_id"], call["agent_id"], "twilio", call["config"],
-                                   {**meta, "resumedFrom": call_id, "resumes": n + 1})
+                                   {**carried, "resumedFrom": call_id, "resumes": n + 1})
 
         nxt = await to_thread(_handoff)
         if nxt is None:
@@ -2178,7 +2181,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not (isinstance(base_prompt, str) and isinstance(prev, str) and prev and base_prompt.endswith(prev)):
             prev = ""
         cfg["systemPrompt"] = base_prompt + note
-        meta = {**call["metadata"], "resumedFrom": call_id, "promptSuffix": prev + note}
+        meta = {**call["metadata"], "resumedFrom": call_id, "promptSuffix": prev + note, "resumeReason": "transfer"}
         resumed = await to_thread(create_reserved, cid, call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
         resumed_sid = str(form.get("CallSid", "") or (resumed["metadata"] or {}).get("callSid") or "")
         if not await bind_status_callback(resumed["id"], resumed_sid):

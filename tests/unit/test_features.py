@@ -692,7 +692,14 @@ class _OutboundRedis:
             self._purge_unlocked()
             if "get" in script and "ARGV[1]" in script:
                 cur = self.kv.get(key)
-                if cur is not None and cur[0] == token:
+                if cur is None or cur[0] != token:
+                    return 0
+                if "pexpire" in script or "expire" in script:
+                    raw = float(keys_and_args[2])
+                    ttl = raw / 1000.0 if "pexpire" in script else raw
+                    self.kv[key] = (cur[0], None if ttl <= 0 else time.time() + ttl)
+                    return 1
+                if "del" in script:
                     del self.kv[key]
                     return 1
                 return 0
@@ -846,7 +853,7 @@ def test_expired_outbound_lock_does_not_stick_the_cap_shut():
     assert fake.get(cap._lock_key(tid)) is None
     started = time.monotonic()
     with cap.hold(tid, 1) as allowed:
-        assert allowed is True
+        assert allowed                                   # lease object: truth is ownership, not `is True`
         store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
     assert time.monotonic() - started < 1.0
     assert store.count_outbound(tid, time.time() - 86400) == 1
@@ -889,6 +896,217 @@ def test_inprocess_outbound_hold_admits_exactly_the_cap():
     assert not errors and all(not t.is_alive() for t in threads)
     assert len(wins) == limit
     assert store.count_outbound(tid, time.time() - 86400) == limit
+
+
+@pytest.mark.parametrize("how", ["delete", "expire"])
+def test_outbound_lock_lost_before_insert_admits_one_row(how):
+    """Cap 1 stays one row when the key is deleted or the TTL fires between allow() and create_call.
+
+    The holder already inside hold must not insert. The next holder, who takes the new lease, may.
+    """
+    from api import security
+    from api.store import Store
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    fake = _OutboundRedis()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), store)
+    cap.LOCK_TTL_S = 30
+    cap.LOCK_WAIT_S = 3
+    cap._refresh_interval = lambda: 60.0          # parked refresher must not put the lost key back
+    key = cap._lock_key(tid)
+    inside, opened = threading.Event(), threading.Event()
+    errors, inserted = [], []
+
+    def holder():
+        try:
+            with cap.hold(tid, 1) as allowed:
+                assert allowed
+                inside.set()
+                assert opened.wait(timeout=5)
+                if allowed:                        # re-read after the lease is gone; a stale True inserts
+                    store.create_call(tid, None, "twilio", {}, {"direction": "outbound", "who": "holder"})
+                    inserted.append("holder")
+        except Exception as e:  # noqa: BLE001
+            errors.append(("holder", repr(e)))
+
+    def other():
+        try:
+            assert opened.wait(timeout=5)
+            with cap.hold(tid, 1) as allowed:
+                if allowed:
+                    store.create_call(tid, None, "twilio", {}, {"direction": "outbound", "who": "other"})
+                    inserted.append("other")
+        except Exception as e:  # noqa: BLE001
+            errors.append(("other", repr(e)))
+
+    first, second = threading.Thread(target=holder), threading.Thread(target=other)
+    first.start()
+    assert inside.wait(timeout=5)
+    with fake._mu:
+        cur = fake.kv.get(key)
+        assert cur is not None
+        if how == "delete":
+            fake.kv.pop(key, None)                 # Redis restart: --save "" and no volume
+        else:
+            fake.kv[key] = (cur[0], time.time() - 1)  # TTL fired under the live holder
+    second.start()
+    opened.set()
+    first.join(timeout=8)
+    second.join(timeout=8)
+    assert not errors, errors
+    assert not first.is_alive() and not second.is_alive()
+    assert inserted == ["other"], (how, inserted)
+    assert store.count_outbound(tid, time.time() - 86400) == 1
+
+
+def test_outbound_hold_refreshes_its_lease():
+    """A live holder extends the mutex well inside LOCK_TTL_S and does not renew someone else's token."""
+    from api import security
+    from api.store import Store
+
+    store = Store()
+    tid = store.create_tenant("acme")
+    fake = _OutboundRedis()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), store)
+    assert cap._refresh_interval() * 2 < cap.LOCK_TTL_S
+    cap.LOCK_TTL_S = 8
+    assert cap._refresh_interval() * 2 < cap.LOCK_TTL_S
+    cap._refresh_interval = lambda: 0.05
+    key = cap._lock_key(tid)
+    with cap.hold(tid, 1) as allowed:
+        assert allowed
+        token = fake.get(key)
+        assert token
+        with fake._mu:
+            fake.kv[key] = (token, time.time() + 1000)  # sentinel a refresh has to overwrite
+        deadline = time.monotonic() + 2
+        renewed = False
+        while time.monotonic() < deadline:
+            with fake._mu:
+                item = fake.kv.get(key)
+            if item and item[0] == token and item[1] is not None and item[1] < time.time() + 30:
+                renewed = True
+                break
+            time.sleep(0.01)
+        assert renewed
+        assert allowed
+        store.create_call(tid, None, "twilio", {}, {"direction": "outbound"})
+    assert store.count_outbound(tid, time.time() - 86400) == 1
+    token = cap._acquire_lock(tid)
+    assert token
+    soon = time.time() + 30
+    with fake._mu:
+        fake.kv[key] = (token, soon)
+    assert cap._refresh_lock(tid, "other-token") is False
+    with fake._mu:
+        assert fake.kv.get(key) == (token, soon)
+    assert cap._refresh_lock(tid, token) is True
+    with fake._mu:
+        item = fake.kv.get(key)
+    assert item is not None and item[0] == token and item[1] > time.time() + 4
+    with fake._mu:
+        fake.kv.pop(key, None)
+    assert cap._refresh_lock(tid, token) is False   # a deleted key is not recreated
+    assert fake.get(key) is None
+    cap._release_lock(tid, token)
+    assert fake.get(key) is None
+
+
+def test_outbound_route_does_not_dial_when_the_lock_disappears_before_insert():
+    """The handler must skip create_call and Twilio when the lease vanishes after the count."""
+    from api import security
+    from api.app import create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from starlette.testclient import TestClient
+    from test_api import FakeLLM as L, FakeTTS as T, FakeVAD
+
+    posts = []
+
+    def handler(req):
+        posts.append(str(req.url))
+        return httpx.Response(201, json={"sid": "CA1"})
+
+    store = Store()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = Runtime(L(), lambda v: T(), FakeVAD, store, http=http)
+    fake = _OutboundRedis()
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                        twilio_account_sid="ACtest", twilio_number="+15550001111", outbound_per_day=1)
+    c = TestClient(create_app(store, rt, security.RedisLimiter(client=fake), None, settings))
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    entered, release = threading.Event(), threading.Event()
+    orig = store.count_outbound
+    state = {"block": True}
+
+    def wrapped(tenant_id, since):
+        if state["block"]:
+            state["block"] = False
+            entered.set()
+            assert release.wait(timeout=5)
+            with fake._mu:
+                fake.kv.clear()                    # gone after allow()'s count, before create_call
+        return orig(tenant_id, since)
+
+    store.count_outbound = wrapped
+    box = {}
+
+    def go():
+        box["r"] = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551230000"}, headers=H(k))
+
+    t = threading.Thread(target=go)
+    t.start()
+    assert entered.wait(timeout=5)
+    release.set()
+    t.join(timeout=10)
+    assert not t.is_alive()
+    assert box["r"].status_code == 429 and "outbound limit" in box["r"].text
+    assert posts == [] and orig(tid, time.time() - 86400) == 0
+    r2 = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551230001"}, headers=H(k))
+    assert r2.status_code == 200 and r2.json()["callSid"] == "CA1"
+    assert len(posts) == 1 and orig(tid, time.time() - 86400) == 1
+
+
+def test_drain_during_outbound_admit_places_nothing():
+    """Drain that lands after the handler's first check and before insert is 503, with no row and no dial."""
+    posts = []
+
+    def handler(req):
+        posts.append(str(req.url))
+        return httpx.Response(201, json={"sid": "CA1"})
+
+    c, store, _ = make_outbound(handler, outbound_per_day=5)
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    entered, release = threading.Event(), threading.Event()
+    orig = store.count_outbound
+
+    def wrapped(tenant_id, since):
+        entered.set()
+        assert release.wait(timeout=5)
+        return orig(tenant_id, since)
+
+    store.count_outbound = wrapped
+    box = {}
+
+    def go():
+        box["r"] = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551230000"}, headers=H(k))
+
+    t = threading.Thread(target=go)
+    t.start()
+    assert entered.wait(timeout=5)
+    assert c.app.state.draining is False           # the check above run_in_executor already passed
+    c.app.state.draining = True
+    release.set()
+    t.join(timeout=10)
+    assert not t.is_alive(), box
+    r = box["r"]
+    assert r.status_code == 503 and "node is draining" in r.text
+    assert posts == []
+    assert orig(tid, time.time() - 86400) == 0
+    assert store.list_calls(tid) == []
 
 
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)

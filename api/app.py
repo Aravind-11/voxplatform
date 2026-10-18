@@ -951,15 +951,22 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             meta["voicemail"] = body.voicemailMessage
         tenant_id = t["id"]
 
+        node_draining = object()
+
         def _admit():
             # hold() sleeps while another node inserts; that wait must not block this event loop.
+            # Drain can flip during the wait, and the lease can disappear. Re-check both before the insert.
             with outbound_cap.hold(tenant_id, settings.outbound_per_day) as allowed:
-                if not allowed:
+                if not allowed:                        # over the cap, or this holder's lease is gone
                     return None
+                if app.state.draining:                 # preStop waits on active_calls, which does not include this dial
+                    return node_draining
                 return store.create_call(tenant_id, body.agentId, "twilio", cfg, meta)
 
         import asyncio
         call = await asyncio.get_running_loop().run_in_executor(None, _admit)
+        if call is node_draining:
+            raise HTTPException(503, "node is draining")
         if call is None:
             raise HTTPException(429, f"outbound limit reached ({settings.outbound_per_day} per 24 h)")
         ws = settings.public_base_url.replace("http", "ws", 1)

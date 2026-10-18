@@ -7,6 +7,7 @@ Later entries override earlier ones with the same name (so a tenant can replace 
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import re
 from dataclasses import dataclass
@@ -67,7 +68,7 @@ class CallContext:
     base_url: str = ""                                              # public URL of this API (warm-transfer callbacks)
     tool_budget: int = 8                                            # side-effect calls allowed on this call; the next one is refused
     tool_calls: int = 0
-    last_user_text: Callable[[], str] = lambda: ""                  # empty when the caller has not been transcribed yet
+    last_user_text: Callable[[], Any] = lambda: ""                  # str or awaitable str; empty when not transcribed yet
 
 
 # Phrase list only. A caller who avoids these words is not stopped, and a quoted phrase can still false-positive.
@@ -93,19 +94,22 @@ def _iter_strings(value):
             yield from _iter_strings(item)
 
 
-def _injection_blocked(ctx, args) -> bool:
-    """True when the caller line or a string argument matches the injection phrase list."""
-    if injection_risk(_caller_text(ctx)):
+async def _injection_blocked(ctx, args) -> bool:
+    """True when a caller line or a string argument matches the injection phrase list."""
+    if injection_risk(await _caller_text(ctx)):
         return True
     return any(injection_risk(text) for text in _iter_strings(args))
 
 
-def _caller_text(ctx) -> str:
+async def _caller_text(ctx) -> str:
+    """Caller text from the provider. A coroutine provider is awaited; anything else non-str is empty."""
     provider = getattr(ctx, "last_user_text", None)
     if provider is None:
         return ""
     try:
         text = provider() if callable(provider) else provider
+        if inspect.isawaitable(text):
+            text = await text
     except Exception:  # noqa: BLE001
         return ""
     return text if isinstance(text, str) else ""
@@ -119,7 +123,7 @@ def _with_budget(fn, ctx):
     """Shared per-call cap. The refused call does not run `fn` and does not increment the counter."""
     async def run(args: dict):
         args = dict(args or {})
-        if _injection_blocked(ctx, args):
+        if await _injection_blocked(ctx, args):
             return _injection_refusal()
         used = int(getattr(ctx, "tool_calls", 0) or 0)
         budget = int(getattr(ctx, "tool_budget", 8))
@@ -152,7 +156,7 @@ def with_confirmation(fn, schema: dict, ctx):
 
     async def run(args: dict):
         args = dict(args or {})
-        if _injection_blocked(ctx, args):
+        if await _injection_blocked(ctx, args):
             return _injection_refusal()
         confirmed = args.pop("confirmed", False) is True
         key, turn = _canon(args), ctx.turn_fn()

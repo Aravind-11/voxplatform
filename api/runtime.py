@@ -210,14 +210,22 @@ class Runtime:
         self.live[call["id"]] = (sess, transport)
         ctx.turn_fn = lambda: sess.stats["turns"]      # lets confirm-before-acting tools tell turns apart
 
-        def last_user_text() -> str:
-            # This turn is still "[caller audio]" when tools run. The previous caller line is the transcript.
-            for message in reversed(sess.history):
+        async def last_user_text() -> str:
+            # The committed turn is still "[caller audio]" until `_transcribe` finishes, and tools run in that
+            # window. Wait for it, then keep every caller line: a newer benign transcript must not hide an older one.
+            task = sess._transcript_task
+            if task is not None and not task.done():
+                try:
+                    await task
+                except Exception:  # noqa: BLE001  (a failed transcript still leaves the earlier lines to check)
+                    pass
+            lines = []
+            for message in sess.history:
                 if message.get("role") != "user":
                     continue
                 text = str(message.get("content") or "").strip()
                 if text and text != "[caller audio]":
-                    return text
-            return ""
+                    lines.append(text)
+            return "\n".join(lines)
         ctx.last_user_text = last_user_text
         return sess

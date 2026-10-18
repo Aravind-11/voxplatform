@@ -767,6 +767,78 @@ async def test_voicemail_hangs_up_when_speech_fails_and_ignores_a_second_amd():
     assert spoke == ["please call back", "END"]
 
 
+async def test_owner_amd_and_a_bus_retry_do_not_both_speak():
+    """The owner speaks from the webhook. A retry that lands elsewhere publishes; that must not start a second message."""
+    from api import security
+    from api.callbus import LocalCallBus
+    from api.runtime import LimitedTTS
+
+    bus = LocalCallBus()
+    c, store, rt = make_outbound(lambda r: httpx.Response(201, json={"sid": "CA1"}))
+    rt.bus = bus
+    k, _ = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    machine = {"AnsweredBy": "machine_end_beep"}
+    release = asyncio.Event()
+    says: list[str] = []
+
+    class T:
+        out_rate = 8000
+        call_sid = "CA1"
+
+        async def send_audio(self, pcm, rate):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            says.append("END")
+
+    async def say(msg):
+        says.append(msg)
+        await release.wait()
+
+    def open_call():
+        o = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551234567",
+                                               "voicemailMessage": "please call back"}, headers=H(k)).json()
+        sess = rt.build_session(store.get_call_any(o["id"]), T())
+        sess.say_and_wait = say
+        url = f"https://vox.example.com/twilio/amd/{o['id']}"
+        sig = {"X-Twilio-Signature": security.twilio_signature("tok", url, machine)}
+        return o["id"], sig
+
+    LimitedTTS._sem = None
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=c.app),
+                                      base_url="https://vox.example.com") as client:
+            cid, sig = open_call()
+            hit = await client.post(f"/twilio/amd/{cid}", data=machine, headers=sig)
+            assert hit.json()["delivered"] is True
+            assert bus.publish(cid, {"op": "voicemail", "text": "please call back"}) is True
+            await asyncio.sleep(0.05)
+            assert says == ["please call back"]
+            release.set()
+            for _ in range(40):
+                if says.count("END") >= 1:
+                    break
+                await asyncio.sleep(0.05)
+            assert says.count("END") == 1
+
+            says.clear()
+            release.clear()
+            cid, sig = open_call()
+            assert bus.publish(cid, {"op": "voicemail", "text": "from-bus"}) is True
+            await asyncio.sleep(0.05)
+            hit = await client.post(f"/twilio/amd/{cid}", data=machine, headers=sig)
+            assert hit.json()["delivered"] is True
+            await asyncio.sleep(0.05)
+            assert says == ["from-bus"]
+    finally:
+        release.set()
+        LimitedTTS._sem = None
+
+
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)
 def test_drain_stops_new_calls_but_reports_readiness():
     from test_api import speech, silence

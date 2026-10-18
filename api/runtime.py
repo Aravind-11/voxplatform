@@ -209,13 +209,12 @@ class Runtime:
                        cfg=scfg, tools=fns, on_event=on_event, eot_fn=self._eot_sync(),
                        eot_async=self._eot_async(), recorder=recorder, on_utterance=on_utt)
 
-        speaking = False
-
         async def voicemail(message: str) -> None:
-            nonlocal speaking
-            if speaking:
+            # Same flag the owning node's webhook sets before it speaks, so a retry published
+            # from another node does not play a second message over the first.
+            if getattr(sess, "_vm_once", False):
                 return
-            speaking = True
+            sess._vm_once = True
             try:
                 await sess.say_and_wait(message)
             finally:

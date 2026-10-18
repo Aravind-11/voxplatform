@@ -1041,6 +1041,122 @@ async def test_speculative_tts_failure_speaks_apology_before_deferred_hangup():
     assert [e["text"] for e in r.events if e["type"] == "agent_speech"] == [phrase]
 
 
+def _held_hangup_tts():
+    """TTS blocks the goodbye until `fail` is set, then the apology plays for a long time.
+    The hang-up tool waits on `release` so it can outlive that synthesize."""
+    ended = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    rounds = []
+
+    async def hang(args):
+        entered.set()
+        await release.wait()
+
+        async def after():
+            ended.append(1)
+        return ToolResult({"ok": True}, after=after, strict=True)
+
+    class LLM:
+        async def stream(self, history, audio, followups, tools):
+            rounds.append(copy.deepcopy(followups))
+            if not followups and len(rounds) == 1:
+                yield "Goodbye now. "
+                yield ToolCall("h", "hang", {})
+                return
+            if followups:
+                yield "Still talking. "
+                return
+            yield "Next reply."
+
+        async def transcribe(self, audio):
+            return "hello"
+
+    class TTS:
+        sample_rate = 24000
+
+        def __init__(self):
+            self.texts = []
+            self.started = asyncio.Event()
+            self.fail = asyncio.Event()
+
+        async def synthesize(self, text):
+            self.texts.append(text)
+            if text != "Sorry, could you say that again?":
+                self.started.set()
+                await self.fail.wait()
+                raise RuntimeError("tts down")
+            n = len(text.split()) * 400 * 24
+            yield np.zeros(n, dtype=np.int16)
+
+    tts = TTS()
+    llm = LLM()
+    r = Rig(llm, tts=tts, tools={"hang": hang})
+    return r, tts, llm, entered, release, ended, rounds
+
+
+async def _commit_while_goodbye_tts_blocked(r, tts, entered):
+    await r.frames("s", 15)
+    await r.frames("q", 8)
+    await r.settle()
+    await asyncio.wait_for(tts.started.wait(), timeout=2)
+    await r.frames("q", 15)            # commit; the tool is awaiting and TTS has not raised
+    await r.settle()
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    assert r.sent == []
+
+
+async def test_postcommit_tts_failure_holds_hangup_until_the_apology_finishes():
+    """TTS that raises after commit used to end synth before a slow tool stored `after`,
+    so the hang-up never ran."""
+    r, tts, llm, entered, release, ended, rounds = _held_hangup_tts()
+    phrase = r.s.cfg.error_phrase
+    await _commit_while_goodbye_tts_blocked(r, tts, entered)
+    tts.fail.set()
+    await r.settle()
+    assert tts.texts == ["Goodbye now.", phrase] and len(r.sent) == 1 and ended == []
+    release.set()                      # tool returns while the apology is still playing
+    await r.settle()
+    assert "Still talking." not in tts.texts
+    assert ended == []
+    t_sent, n, rate = r.sent[0]
+    dur = 1000.0 * n / rate
+    assert dur > 0 and r.clk.t < t_sent + dur
+    r.clk.t = t_sent + dur - 1
+    await asyncio.sleep(0.2)
+    assert ended == []
+    r.clk.t = t_sent + dur + 1
+    await asyncio.sleep(0.2)
+    assert ended == [1]
+    assert [e["text"] for e in r.events if e["type"] == "agent_speech"] == [phrase]
+
+
+async def test_second_utterance_cancels_produce_waiting_on_a_tool_after_tts_failure():
+    """Once the apology has finished, a produce task still inside the tool must stay the
+    active generation. A new utterance cancels it instead of letting it stream again."""
+    r, tts, llm, entered, release, ended, rounds = _held_hangup_tts()
+    await _commit_while_goodbye_tts_blocked(r, tts, entered)
+    tts.fail.set()
+    await r.settle()
+    assert len(r.sent) == 1 and ended == []
+    old = r.s._gen
+    t_sent, n, rate = r.sent[0]
+    r.clk.t = t_sent + (1000.0 * n / rate) + 1    # apology clock already past; tool still awaiting
+    await asyncio.sleep(0.05)
+    await r.frames("s", 10)            # caller speaks again: must barge in, not orphan produce
+    await r.frames("q", 10)
+    await r.settle()
+    assert old.cancelled and all(t.done() for t in old.tasks)
+    assert r.s.stats["interruptions"] == 1
+    assert r.s._gen is not old and len(rounds) >= 2
+    assert all(not f for f in rounds)
+    n_rounds = len(rounds)
+    release.set()
+    await r.settle()
+    assert len(rounds) == n_rounds and all(not f for f in rounds)
+    assert ended == []
+
+
 async def test_strict_hangup_still_happens_if_caller_talks_over_the_goodbye():
     r, ended = _hangup_rig(strict=True)
     await r.frames("s", 15)

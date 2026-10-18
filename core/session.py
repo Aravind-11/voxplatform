@@ -451,7 +451,9 @@ class Session:
         mark, and a model error after commit would queue an apology nobody reads. On cancel,
         stay silent. On commit, speak a queued apology once and drop ordinary sentences: a
         successful reply whose speculative TTS died stays silent, unless a deferred hang-up
-        or transfer would otherwise run against that silence.
+        or transfer would otherwise run against that silence. A failure after commit also
+        stays until produce closes textq: the tool may still be awaiting, and ending here
+        would drop its deferred action and leave that produce task running.
         """
         if is_fallback:
             self._emit("error", where="tts_fallback", error=repr(e))
@@ -465,6 +467,16 @@ class Session:
             await self._play_queued_fallback(gen)
             return
         await self._speak_fallback(gen)
+        await self._skip_until_textq_closes(gen)
+
+    async def _skip_until_textq_closes(self, gen: _Generation) -> None:
+        """Drop later sentences until produce finishes. outbox closes only after this returns."""
+        while not gen.cancelled:
+            item = await gen.textq.get()
+            if item is None:
+                return
+            if item is _FALLBACK:
+                await self._speak_fallback(gen)
 
     async def _play_queued_fallback(self, gen: _Generation) -> None:
         await gen.commit.wait()

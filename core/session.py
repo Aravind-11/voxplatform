@@ -134,51 +134,56 @@ class Session:
         self._last_speech_clock = 0.0
         self._transcript_task: Optional[asyncio.Task] = None
         self._bg: set[asyncio.Task] = set()
+        self._turn_lock = asyncio.Lock()  # feed holds this across its score so the frame is applied first
         self.stats = {"turns": 0, "speculations": 0, "speculations_cancelled": 0, "interruptions": 0}
 
     # ------------------------------------------------------------------ input
     async def feed(self, frame: np.ndarray) -> None:
         """Feed one 512-sample 16 kHz int16 frame (32 ms)."""
-        if self.recorder is not None:
-            self.recorder.mic(frame)
-        if self.vad_scheduler is not None:
-            prob = await self.vad_scheduler.prob(self.vad, frame)
-        else:
-            prob = self.vad.prob(frame)   # no scheduler: stay on this task (Rig tests depend on it)
-        if prob >= self.cfg.turn.threshold:
-            self._last_speech_clock = self.clock()
-        self.turn.set_agent_speaking(self._agent_active())
-        (self._utt if self.turn.in_turn else self._pre).append(frame)
-        for ev in self.turn.process(prob):
-            await self._handle(ev)
+        # Scoring awaits. Keep the lock until this frame is applied so a verdict, inject_text,
+        # or say that becomes runnable during the score cannot commit or barge ahead of it.
+        async with self._turn_lock:
+            if self.recorder is not None:
+                self.recorder.mic(frame)
+            if self.vad_scheduler is not None:
+                prob = await self.vad_scheduler.prob(self.vad, frame)
+            else:
+                prob = self.vad.prob(frame)   # no scheduler: stay on this task (Rig tests depend on it)
+            if prob >= self.cfg.turn.threshold:
+                self._last_speech_clock = self.clock()
+            self.turn.set_agent_speaking(self._agent_active())
+            (self._utt if self.turn.in_turn else self._pre).append(frame)
+            for ev in self.turn.process(prob):
+                await self._handle(ev)
 
     async def start(self) -> None:
         """Called by the transport once the call is connected: speaks the configured greeting, if any."""
         if self.cfg.greeting.strip():
-            self.say(self.cfg.greeting.strip())
+            await self.say(self.cfg.greeting.strip())
 
-    def say(self, text: str) -> None:
+    async def say(self, text: str) -> None:
         """Speaks fixed text with no model call. It is a normal committed reply: the caller can talk over it
         (barge-in) and the history keeps only what they heard."""
-        gen = _Generation(np.zeros(0, np.int16), list(self.history), self.clock())
-        gen.committed = True
-        gen.commit.set()
-        self.history.append({"role": "assistant", "content": ""})
+        async with self._turn_lock:
+            gen = _Generation(np.zeros(0, np.int16), list(self.history), self.clock())
+            gen.committed = True
+            gen.commit.set()
+            self.history.append({"role": "assistant", "content": ""})
 
-        async def produce() -> None:
-            chunker = SentenceChunker()
-            for piece in [*chunker.push(text), *chunker.flush()]:
-                gen.textq.put_nowait(piece)
-            gen.textq.put_nowait(None)
+            async def produce() -> None:
+                chunker = SentenceChunker()
+                for piece in [*chunker.push(text), *chunker.flush()]:
+                    gen.textq.put_nowait(piece)
+                gen.textq.put_nowait(None)
 
-        gen.tasks = [asyncio.create_task(produce()), asyncio.create_task(self._synth(gen)),
-                     asyncio.create_task(self._drain(gen))]
-        self._gen = gen
-        self._emit("greeting", text=text)
+            gen.tasks = [asyncio.create_task(produce()), asyncio.create_task(self._synth(gen)),
+                         asyncio.create_task(self._drain(gen))]
+            self._gen = gen
+            self._emit("greeting", text=text)
 
     async def say_and_wait(self, text: str, timeout_s: float = 60.0) -> None:
         """Speaks fixed text and returns once it has finished playing (or the caller talked over it)."""
-        self.say(text)
+        await self.say(text)   # lock covers only the install; playback below must stay interruptible
         gen = self._gen
         assert gen is not None
         deadline = self.clock() + timeout_s * 1000.0
@@ -195,23 +200,24 @@ class Session:
 
     async def inject_text(self, text: str) -> None:
         """A caller turn that arrived as text (keypad digits): interrupts the agent like speech would, then replies."""
-        g = self._gen
-        if g and g.committed and self._agent_active():
-            await self._interrupt(g)
-        elif g and not g.committed:
-            await self._cancel(g)
-            self._gen = None
-        self.stats["turns"] += 1
-        self.history.append({"role": "user", "content": text})
-        base = list(self.history)
-        self.history.append({"role": "assistant", "content": ""})
-        gen = _Generation(np.zeros(0, np.int16), base, self.clock())
-        gen.committed = True
-        gen.commit.set()
-        gen.tasks = [asyncio.create_task(self._produce(gen)), asyncio.create_task(self._synth(gen)),
-                     asyncio.create_task(self._drain(gen))]
-        self._gen = gen
-        self._emit("user_transcript", text=text, source="text")
+        async with self._turn_lock:
+            g = self._gen
+            if g and g.committed and self._agent_active():
+                await self._interrupt(g)
+            elif g and not g.committed:
+                await self._cancel(g)
+                self._gen = None
+            self.stats["turns"] += 1
+            self.history.append({"role": "user", "content": text})
+            base = list(self.history)
+            self.history.append({"role": "assistant", "content": ""})
+            gen = _Generation(np.zeros(0, np.int16), base, self.clock())
+            gen.committed = True
+            gen.commit.set()
+            gen.tasks = [asyncio.create_task(self._produce(gen)), asyncio.create_task(self._synth(gen)),
+                         asyncio.create_task(self._drain(gen))]
+            self._gen = gen
+            self._emit("user_transcript", text=text, source="text")
 
     async def close(self) -> None:
         self._cancel_eot()
@@ -278,10 +284,14 @@ class Session:
         except Exception as e:  # noqa: BLE001
             self._emit("error", where="eot", error=repr(e))
             return
-        self._last_eot = score
-        self._emit("eot_score", score=round(score, 3), ms=self.clock() - t0)
-        for ev in self.turn.apply_eot(score):
-            await self._handle(ev)
+        async with self._turn_lock:
+            # A speech frame already in feed cancels this task; if it was replaced, do not commit.
+            if asyncio.current_task() is not self._eot_task:
+                return
+            self._last_eot = score
+            self._emit("eot_score", score=round(score, 3), ms=self.clock() - t0)
+            for ev in self.turn.apply_eot(score):
+                await self._handle(ev)
 
     def _eot_score(self) -> float:
         audio = np.concatenate(self._utt) if self._utt else np.zeros(0, np.int16)

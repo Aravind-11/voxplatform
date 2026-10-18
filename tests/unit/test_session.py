@@ -1,10 +1,13 @@
 import asyncio
 import copy
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
 
 from core.session import Session, SessionConfig, ToolCall
+from core.vad_exec import VADScheduler
 
 SPEECH = (np.ones(512) * 5000).astype(np.int16)
 SILENCE = np.zeros(512, dtype=np.int16)
@@ -340,6 +343,194 @@ async def test_verdict_for_a_resumed_pause_is_dropped_and_scorer_errors_fall_bac
     await r2.frames("q", 25)          # no verdict: default 640 ms timing still commits
     await r2.settle()
     assert r2.sent and any(e["type"] == "error" and e["where"] == "eot" for e in r2.events)
+
+
+class _GateVAD:
+    """Energy VAD. After arm(), the next prob() blocks the worker until release()."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release_ev = threading.Event()
+        self._arm = False
+
+    def arm(self) -> None:
+        self.entered.clear()
+        self.release_ev.clear()
+        self._arm = True
+
+    def prob(self, frame):
+        if self._arm:
+            self._arm = False
+            self.entered.set()
+            if not self.release_ev.wait(5):
+                raise TimeoutError("vad gate was not released")
+        return 0.9 if np.abs(frame).max() > 1000 else 0.1
+
+
+class _HoldVerdict:
+    """End-of-turn scorer that stays pending until go() so a test can release it mid-score."""
+
+    def __init__(self, score=0.95):
+        self.score = score
+        self.calls = 0
+        self.started = asyncio.Event()
+        self._go = asyncio.Event()
+
+    async def __call__(self, audio, history):
+        self.calls += 1
+        self.started.set()
+        await self._go.wait()
+        return self.score
+
+    def go(self) -> None:
+        self._go.set()
+
+
+async def _wait_gate(gate: _GateVAD) -> None:
+    for _ in range(200):
+        if gate.entered.is_set():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("scoring did not reach the worker")
+
+
+def _scheduler_rig(llm, eot=None, tts=None):
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vad-race")
+    gate = _GateVAD()
+    r = Rig(llm, tts=tts)
+    r.s.vad = gate
+    r.s.vad_scheduler = VADScheduler(pool)
+    if eot is not None:
+        r.s.eot_async = eot
+    return r, gate, pool
+
+
+async def test_inflight_speech_frame_drops_a_ready_eot_verdict():
+    """A speech frame already awaiting VAD must cancel a 0.95 verdict, not lose the race to it.
+
+    15 speech + 10 silence leaves the turn speculated at 320 ms (end target still 640). Releasing
+    the verdict while the next speech frame is on the worker used to commit before turn.process.
+    """
+    eot = _HoldVerdict(0.95)
+    llm = FakeLLM([["Sure thing."]])
+    r, gate, pool = _scheduler_rig(llm, eot)
+    feed_task = None
+    try:
+        await r.frames("s", 15)
+        await r.frames("q", 10)             # 320 ms silence: speculated, not yet the 640 ms end
+        assert eot.started.is_set() and eot.calls == 1
+        assert r.s.turn._speculated and r.s.turn._silence_ms == 320 and r.s.turn._end_target == 640
+        assert "user_end_of_turn" not in r.types()
+        gate.arm()
+        feed_task = asyncio.create_task(r.s.feed(SPEECH))
+        await _wait_gate(gate)
+        eot.go()
+        for _ in range(5):                  # the verdict is runnable while this frame is still scoring
+            await asyncio.sleep(0)
+        assert "user_end_of_turn" not in r.types() and "eot_score" not in r.types()
+        gate.release_ev.set()
+        await asyncio.wait_for(feed_task, 2)
+        await r.settle()
+        assert "speculate_cancelled" in r.types()
+        assert "user_end_of_turn" not in r.types()
+        assert "eot_score" not in r.types()
+        assert r.sent == [] and llm.n_transcribe == 0
+        assert r.s.stats["speculations_cancelled"] == 1
+        assert r.s.history == [{"role": "system", "content": r.s.cfg.system_prompt}]
+    finally:
+        gate.release_ev.set()
+        if feed_task is not None and not feed_task.done():
+            feed_task.cancel()
+            await asyncio.gather(feed_task, return_exceptions=True)
+        await r.s.close()
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+async def test_inflight_speech_frame_does_not_interrupt_inject_text():
+    """Keypad text injected while a barge-in frame is scoring must not be barged by that frame.
+
+    The agent is already speaking, so the barge threshold is 192 ms. Five speech frames leave
+    run_ms at 160. The sixth is on the worker; inject_text during that score used to install the
+    digit turn and then lose it when the frame resumed and interrupted the new generation.
+    """
+    llm = FakeLLM([["Got it."]])
+    r, gate, pool = _scheduler_rig(llm, tts=FakeTTS(word_ms=400))
+    feed_task = inject_task = None
+    try:
+        await r.s.say("Hello from the agent this is long.")
+        await r.settle()
+        await r.frames("s", 5)              # 160 ms < 192 ms barge-in while the greeting still plays
+        assert r.s._agent_active() and r.s.turn._run_ms == 160 and not r.s.turn.in_turn
+        assert "user_interrupted" not in r.types()
+        gate.arm()
+        feed_task = asyncio.create_task(r.s.feed(SPEECH))
+        await _wait_gate(gate)
+        inject_task = asyncio.create_task(
+            r.s.inject_text("[The caller pressed these keypad digits: 42]"))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert all("42" not in str(m.get("content")) for m in r.s.history)
+        gate.release_ev.set()
+        await asyncio.wait_for(asyncio.gather(feed_task, inject_task), 2)
+        await r.settle()
+        assert r.types().count("user_interrupted") == 1   # the greeting only, not the digit turn
+        assert r.s._gen is not None and not r.s._gen.cancelled
+        assert r.s.history[-2:] == [
+            {"role": "user", "content": "[The caller pressed these keypad digits: 42]"},
+            {"role": "assistant", "content": "Got it."}]
+    finally:
+        gate.release_ev.set()
+        for task in (feed_task, inject_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        await r.s.close()
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+async def test_inflight_speech_frame_does_not_interrupt_say():
+    """A fixed line started while a barge-in frame is scoring must not be barged by that frame."""
+    llm = FakeLLM([["nope"]])
+    r, gate, pool = _scheduler_rig(llm, tts=FakeTTS(word_ms=400))
+    feed_task = say_task = None
+    try:
+        await r.s.say("Hello from the agent this is long.")
+        await r.settle()
+        await r.frames("s", 5)
+        assert r.s._agent_active() and r.s.turn._run_ms == 160 and not r.s.turn.in_turn
+        gate.arm()
+        feed_task = asyncio.create_task(r.s.feed(SPEECH))
+        await _wait_gate(gate)
+        say_task = asyncio.create_task(r.s.say("Please call us back now friend."))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert all("Please call us back" not in str(m.get("content")) for m in r.s.history)
+        gate.release_ev.set()
+        await asyncio.wait_for(asyncio.gather(feed_task, say_task), 2)
+        await r.settle()
+        assert r.types().count("user_interrupted") == 1
+        assert r.s._gen is not None and not r.s._gen.cancelled
+        assert r.s.history[-1] == {"role": "assistant", "content": "Please call us back now friend."}
+    finally:
+        gate.release_ev.set()
+        for task in (feed_task, say_task):
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        await r.s.close()
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+async def test_say_and_wait_playback_stays_interruptible():
+    """The turn lock must not be held while say_and_wait waits out playback, or barge-in cannot run."""
+    r = Rig(FakeLLM([["x."]]), tts=FakeTTS(word_ms=200))
+    task = asyncio.create_task(r.s.say_and_wait("Please call us back later today."))
+    await r.settle()
+    assert r.sent
+    await asyncio.wait_for(r.frames("s", 6), 2)   # 192 ms crosses the barge-in threshold while audio is queued
+    await r.settle()
+    assert r.clears == 1 and r.s.stats["interruptions"] == 1
+    await asyncio.wait_for(task, 2)
 
 
 # ------------------------------------------------------- tool-driven call actions (hang up / transfer)

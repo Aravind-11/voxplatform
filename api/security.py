@@ -139,34 +139,45 @@ return 1
 
 
 class OutboundCap:
-    """Daily outbound cap. Redis INCR is atomic across nodes; without Redis the count runs under store.lock.
+    """Outbound cap over a rolling 24 hours, shared by every node when Redis is configured.
 
-    A rejected attempt must not consume a slot: the Lua script DECRs when the INCR goes over the cap.
+    The Redis key is one sorted set, ``vox:outbound:{tenant}``, scored by time. The script drops
+    entries older than 24 hours, then adds this attempt only when the set is still under the cap.
+    Without Redis the same window is a SQL count under ``store.lock``.
     """
 
     LUA = """
-local n = redis.call('INCR', KEYS[1])
-redis.call('EXPIRE', KEYS[1], ARGV[1])
-if tonumber(n) > tonumber(ARGV[2]) then
-  redis.call('DECR', KEYS[1])
+local now = tonumber(ARGV[1])
+local window = ARGV[2]
+local cap = tonumber(ARGV[3])
+local member = ARGV[4]
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[5])
+local n = redis.call('ZCARD', KEYS[1])
+if n >= cap then
+  redis.call('EXPIRE', KEYS[1], window)
   return 0
 end
+redis.call('ZADD', KEYS[1], now, member)
+redis.call('EXPIRE', KEYS[1], window)
 return 1
 """
-    TTL_S = 48 * 60 * 60
+    WINDOW_S = 24 * 60 * 60
 
     def __init__(self, limiter, store):
         self.limiter, self.store = limiter, store
         self._script = limiter.r.register_script(self.LUA) if isinstance(limiter, RedisLimiter) else None
 
     def allow(self, tenant_id: str, per_day: int) -> bool:
-        """True if this tenant may place another outbound call. Redis key is vox:outbound:{tenant}:{UTC date}."""
+        """True if this tenant may place another outbound call inside the rolling 24 hour window."""
         if self._script is not None:
-            from datetime import datetime, timezone
-            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            key = f"vox:outbound:{tenant_id}:{day}"
-            return int(self._script(keys=[key], args=[self.TTL_S, int(per_day)])) == 1
-        since = time.time() - 86400
+            now = time.time()
+            window = self.WINDOW_S
+            # "(" is Redis' exclusive bound: a call placed exactly 24h ago still counts.
+            cutoff = f"({now - window:.6f}"
+            member = secrets.token_hex(8)
+            key = f"vox:outbound:{tenant_id}"
+            return int(self._script(keys=[key], args=[f"{now:.6f}", str(window), str(int(per_day)), member, cutoff])) == 1
+        since = time.time() - self.WINDOW_S
         return self.store.count_outbound(tenant_id, since) < int(per_day)
 
     @contextmanager

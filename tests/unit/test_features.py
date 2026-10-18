@@ -627,41 +627,74 @@ def test_count_outbound_is_not_limited_by_list_calls_page_size():
     assert r.status_code == 429
 
 
+class _OutboundRedis:
+    """Applies the rolling-window commands OutboundCap sends. Does not reimplement a second policy."""
+
+    def __init__(self):
+        self.z, self.expire, self.scripts = {}, {}, []
+
+    def register_script(self, script):
+        self.scripts.append(script)
+
+        def call(keys=None, args=None, client=None):
+            key = keys[0]
+            now, window, cap, member = float(args[0]), float(args[1]), int(args[2]), args[3]
+            bound = str(args[4])
+            cutoff = float(bound[1:])
+            bucket = self.z.setdefault(key, {})
+            for m, score in list(bucket.items()):
+                if score < cutoff:
+                    del bucket[m]
+            self.expire[key] = window
+            if len(bucket) >= cap:
+                return 0
+            bucket[member] = now
+            return 1
+
+        return call
+
+
 def test_redis_outbound_cap_second_acquire_does_not_consume_a_slot():
-    from datetime import datetime, timezone
     from api import security
     from api.store import Store
 
-    class FakeRedis:
-        def __init__(self):
-            self.kv, self.expire, self.scripts = {}, {}, []
-
-        def register_script(self, script):
-            self.scripts.append(script)
-
-            def call(keys=None, args=None, client=None):
-                if "INCR" not in script:
-                    return 1
-                key = keys[0]
-                ttl, cap = int(args[0]), int(args[1])
-                n = int(self.kv.get(key, 0)) + 1
-                self.kv[key] = n
-                self.expire[key] = ttl
-                if n > cap:
-                    self.kv[key] = n - 1
-                    return 0
-                return 1
-
-            return call
-
-    fake = FakeRedis()
+    fake = _OutboundRedis()
     cap = security.OutboundCap(security.RedisLimiter(client=fake), Store())
     assert cap.allow("tnt_a", 1) is True
     assert cap.allow("tnt_a", 1) is False
-    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    key = f"vox:outbound:tnt_a:{day}"
-    assert fake.kv[key] == 1 and fake.expire[key] == 48 * 60 * 60
-    assert any("INCR" in s and "DECR" in s for s in fake.scripts)
+    key = "vox:outbound:tnt_a"
+    assert len(fake.z[key]) == 1 and fake.expire[key] == 24 * 60 * 60
+    src = fake.scripts[-1]
+    assert "redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[5])" in src
+    assert "if n >= cap then" in src and "redis.call('ZADD', KEYS[1], now, member)" in src
+    assert "INCR" not in src
+    other = security.OutboundCap(security.RedisLimiter(client=fake), Store())
+    assert other.allow("tnt_a", 1) is False
+    assert len(fake.z[key]) == 1
+
+
+def test_redis_outbound_cap_does_not_reset_at_utc_midnight():
+    """The cap is the last 24 hours. A new UTC date inside that window must not open another full cap."""
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+    from api import security
+    from api.store import Store
+
+    t0 = datetime(2026, 10, 17, 23, 50, tzinfo=timezone.utc).timestamp()
+    now = {"t": t0}
+
+    fake = _OutboundRedis()
+    cap = security.OutboundCap(security.RedisLimiter(client=fake), Store())
+    with patch("api.security.time.time", lambda: now["t"]):
+        assert cap.allow("tnt_a", 1) is True
+        now["t"] = datetime(2026, 10, 18, 0, 10, tzinfo=timezone.utc).timestamp()
+        assert cap.allow("tnt_a", 1) is False
+        assert list(fake.z) == ["vox:outbound:tnt_a"] and len(fake.z["vox:outbound:tnt_a"]) == 1
+        now["t"] = t0 + 86400
+        assert cap.allow("tnt_a", 1) is False
+        now["t"] = t0 + 86400 + 1
+        assert cap.allow("tnt_a", 1) is True
+        assert len(fake.z["vox:outbound:tnt_a"]) == 1
 
 
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)

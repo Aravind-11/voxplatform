@@ -8,6 +8,9 @@ Events
   SPEECH_RESUME  caller resumed before the turn ended: cancel the speculative reply
   END_OF_TURN    silence long enough: commit the reply and let it play
   SPEECH_ABORT   a started "turn" was too short to be real speech (noise): discard
+  OVERLAP_CHECK  while the agent talks, a burst ended before backchannel_ms: transcribe it
+                 before deciding whether it takes the floor. Not emitted when backchannel_ms
+                 is at or under the barge floor, so high sensitivity still interrupts at once.
 
 An optional end-of-turn scorer (e.g. UltraVAD) is consulted once per pause. If it is
 confident the caller is done, the turn ends after `fast_end_ms` of silence instead of
@@ -26,6 +29,7 @@ class Ev(str, Enum):
     SPEECH_RESUME = "speech_resume"
     END_OF_TURN = "end_of_turn"
     SPEECH_ABORT = "speech_abort"
+    OVERLAP_CHECK = "overlap_check"
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,7 @@ class TurnEvent:
     kind: Ev
     t_ms: float            # time the event was emitted
     onset_ms: float = 0.0  # time the current utterance's speech actually began
+    speech_ms: float = 0.0  # how long the burst was, for OVERLAP_CHECK
 
 
 @dataclass
@@ -132,6 +137,12 @@ class TurnManager:
                     self._silence_ms = 0.0
                     out.append(TurnEvent(Ev.SPEECH_START, t, self._onset_ms))
             else:
+                # A burst that ends before backchannel_ms never opens a turn, so "stop" would
+                # be thrown away with "yeah". Hand the audio to the session instead. When the
+                # backchannel gate is not above the barge floor this branch cannot run.
+                need = max(c.start_ms_agent_speaking, c.backchannel_ms)
+                if self.agent_speaking and c.start_ms_agent_speaking <= self._run_ms < need:
+                    out.append(TurnEvent(Ev.OVERLAP_CHECK, t, self._run_start_ms, self._run_ms))
                 self._run_ms = 0.0
             return out
 

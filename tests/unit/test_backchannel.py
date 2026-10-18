@@ -43,7 +43,8 @@ def test_classifier_accepts_the_fixed_set_only_when_short():
 def test_turn_holds_speech_start_for_backchannel_ms_while_agent_speaks():
     tm = TurnManager()
     tm.set_agent_speaking(True)
-    assert feed(tm, [(True, 14), (False, 12)]) == []                 # 448 ms, then silence: nothing
+    ev = feed(tm, [(True, 14), (False, 12)])                         # 448 ms, then silence
+    assert kinds(ev) == [Ev.OVERLAP_CHECK] and ev[0][1] == 14 * F    # transcribed, not a turn yet
     fresh = TurnManager()
     fresh.set_agent_speaking(True)
     ev = feed(fresh, [(True, 16)])
@@ -51,7 +52,8 @@ def test_turn_holds_speech_start_for_backchannel_ms_while_agent_speaks():
 
     low = TurnManager(TurnConfig(backchannel_ms=BACKCHANNEL_MS["low"]))
     low.set_agent_speaking(True)
-    assert feed(low, [(True, 21), (False, 8)]) == []                 # 672 ms < 700
+    ev = feed(low, [(True, 21), (False, 8)])                         # 672 ms < 700
+    assert kinds(ev) == [Ev.OVERLAP_CHECK] and ev[0][1] == 21 * F
     # not speaking: backchannel_ms does not move the normal 96 ms start
     ev = feed(TurnManager(TurnConfig(backchannel_ms=700)), [(True, 4)])
     assert kinds(ev) == [Ev.SPEECH_START] and ev[0][1] == 2 * F
@@ -90,6 +92,11 @@ def test_note_overlap_transcript_emits_backchannel_and_does_not_count():
 
 async def test_short_overlap_does_not_barge_and_a_yeah_after_a_real_cut_is_marked():
     llm = FakeLLM([["Hold on, I am still talking through this whole reply with you."]])
+
+    async def transcribe(audio):
+        return "yeah"
+
+    llm.transcribe = transcribe
     r = Rig(llm, tts=FakeTTS(word_ms=300))
     await r.frames("s", 15)
     await r.frames("q", 22)
@@ -125,6 +132,31 @@ async def test_short_overlap_does_not_barge_and_a_yeah_after_a_real_cut_is_marke
     assert ev["text"] == "yeah" and ev["duration_ms"] == 192
     assert r2.clears == 1                                  # playback clear cannot be undone
     assert r2.s.stats["interruptions"] == 0                # a backchannel is not counted
+
+
+async def test_short_real_request_during_playback_interrupts():
+    """384 ms is under the 450 ms gate. "stop" still takes the floor; the reply is cleared."""
+    llm = FakeLLM([
+        ["Hold on, I am still talking through this whole reply with you right now."],
+        ["Sure, I stopped."],
+    ])
+
+    async def transcribe(audio):
+        return "stop"
+
+    llm.transcribe = transcribe
+    r = Rig(llm, tts=FakeTTS(word_ms=300))
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    assert r.sent and len(llm.calls) == 1
+    await r.frames("s", 12)                                      # 384 ms < 450
+    await r.frames("q", 10)
+    await r.settle()
+    assert r.clears >= 1 and r.s.stats["interruptions"] >= 1
+    assert "user_interrupted" in r.types()
+    assert any(m.get("role") == "user" and m.get("content") == "stop" for m in r.s.history)
+    assert len(llm.calls) >= 2
 
 
 def test_agent_barge_in_is_validated_and_copied_onto_the_turn():

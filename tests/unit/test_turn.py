@@ -64,12 +64,31 @@ def test_barge_in_needs_longer_speech_while_agent_speaks():
     # barge floor, so a short "yeah" never opens a turn (no start, and therefore no abort).
     tm = TurnManager()
     tm.set_agent_speaking(True)
-    assert feed(tm, [(True, 14), (False, 10)]) == []        # 448 ms < 450: ignored
+    # 448 ms ends before the 450 ms gate: not a turn yet, but the session must hear the words.
+    ev = feed(tm, [(True, 14), (False, 10)])
+    assert kinds(ev) == [Ev.OVERLAP_CHECK] and ev[0][1] == 14 * F
     tm2 = TurnManager()
     tm2.set_agent_speaking(True)
     ev = feed(tm2, [(True, 16)])                            # 512 ms: real interruption
     assert kinds(ev) == [Ev.SPEECH_START]
     assert ev[0][1] == 14 * F                               # 15th frame: 480 ms of speech >= 450
+
+
+def test_overlap_check_reports_how_long_the_burst_was():
+    tm = TurnManager()
+    tm.set_agent_speaking(True)
+    for _ in range(14):
+        assert tm.process(0.9) == []
+    ev = tm.process(0.1)
+    assert len(ev) == 1 and ev[0].kind is Ev.OVERLAP_CHECK and ev[0].speech_ms == 14 * F
+    high = TurnManager(TurnConfig(backchannel_ms=192))
+    high.set_agent_speaking(True)
+    opened = []
+    for _ in range(8):
+        opened += high.process(0.9)
+    opened += high.process(0.1)
+    assert Ev.OVERLAP_CHECK not in [e.kind for e in opened]
+    assert opened[0].kind is Ev.SPEECH_START
 
 
 def test_onset_time_is_reported():

@@ -86,9 +86,12 @@ class Runtime:
     def __post_init__(self) -> None:
         self.message_log = MessageLog(self.store)
 
-    def flush_messages(self) -> None:
-        """Block until queued transcripts are in the store. Call via asyncio.to_thread."""
-        self.message_log.flush()
+    def flush_messages(self, call_id: str | None = None) -> None:
+        """Block until queued transcripts are in the store. Call via asyncio.to_thread.
+
+        Pass `call_id` so a different call's failed insert is not reported as this call's.
+        """
+        self.message_log.flush(call_id)
 
     def finalize(self, call_id: str) -> Optional[str]:
         """Called when a call ends: forgets the live session and writes the recording. Returns the WAV path."""

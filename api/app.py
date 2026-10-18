@@ -755,25 +755,38 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         return t
 
     async def finish(call: dict, t: dict, reason: str) -> None:
-        await to_thread(runtime.flush_messages)  # transcript rows are queued; don't read them early
+        # A failed transcript insert must not skip the slot release or leave the call active,
+        # and it must not be reported as a clean hang-up.
+        write_err = None
+        try:
+            await to_thread(runtime.flush_messages, call["id"])  # transcript rows are queued; don't read them early
+        except Exception as exc:  # noqa: BLE001
+            write_err = exc
         limiter.release(call["tenant_id"], call["id"])
-        cur = store.get_call_any(call["id"])
-        if cur["status"] == "active":
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason=reason)
+
+        def _snapshot():
+            cur = store.get_call_any(call["id"])
+            if cur["status"] == "active":
+                store.update_call(call["id"], status="ended", ended=time.time(), end_reason=reason)
+            done = store.get_call_any(call["id"])
+            secs = round((done["ended"] - done["joined"]), 2) if done.get("joined") and done.get("ended") else 0.0
+            transcript = [{"role": m["role"], "text": m["text"], "t": m["t"]} for m in store.messages(call["id"])[:500]]
+            return done, secs, transcript
+
+        done, secs, transcript = await to_thread(_snapshot)
         METRICS.inc("vox_calls_total", medium=call["medium"], reason=reason)
         try:
             runtime.finalize(call["id"])
         except Exception:  # noqa: BLE001  (a failed recording write must not break call teardown)
             METRICS.inc("vox_errors_total", where="finalize")
-        done = store.get_call_any(call["id"])
-        secs = round((done["ended"] - done["joined"]), 2) if done.get("joined") and done.get("ended") else 0.0
-        webhook(t, "call.ended", done, durationSeconds=secs,
-                transcript=[{"role": m["role"], "text": m["text"], "t": m["t"]} for m in store.messages(call["id"])[:500]])
+        webhook(t, "call.ended", done, durationSeconds=secs, transcript=transcript)
+        if write_err is not None:
+            raise write_err
 
     @app.websocket("/ws/calls/{call_id}")
     async def ws_call(ws: WebSocket, call_id: str, token: str = ""):
         await ws.accept()
-        call = store.get_call_any(call_id)
+        call = await to_thread(store.get_call_any, call_id)
         if not call or not hmac.compare_digest(token, call["join_token"]) or call["medium"] != "webSocket":
             await ws.close(4401)
             return
@@ -832,7 +845,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     @app.websocket("/ws/twilio/{call_id}")
     async def ws_twilio(ws: WebSocket, call_id: str):
         await ws.accept()
-        call = store.get_call_any(call_id)
+        call = await to_thread(store.get_call_any, call_id)
         if not call or call["medium"] != "twilio":
             await ws.close(4401)
             return
@@ -845,7 +858,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             return runtime.build_session(call, tr)
 
         tr = TwilioTransport(_TwilioWS(ws), factory)
-        tr.before_end = lambda: store.update_call(call_id, end_reason="agent_hangup")
+        tr.before_end = lambda: to_thread(store.update_call, call_id, end_reason="agent_hangup")
         try:
             await tr.run()
         except _Reject as r:
@@ -857,20 +870,20 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     async def audiosocket_call(reader, writer) -> None:
         """One SIP call arriving from Asterisk over AudioSocket: create the call, admit it, run the agent."""
         from transports.audiosocket import AudioSocketTransport
-        agent = store.get_agent_any(settings.audiosocket_agent)
+        agent = await to_thread(store.get_agent_any, settings.audiosocket_agent)
         if not agent or app.state.draining:
             writer.close()
             return
-        call = store.create_call(agent["tenant_id"], agent["id"], "sip", agent["config"], {})
+        call = await to_thread(store.create_call, agent["tenant_id"], agent["id"], "sip", agent["config"], {})
         state: dict = {}
 
         async def factory(tr, custom):
-            store.update_call(call["id"], metadata={"callSid": custom.get("uuid", ""), "channel": "sip"})
+            await to_thread(store.update_call, call["id"], metadata={"callSid": custom.get("uuid", ""), "channel": "sip"})
             state["t"] = await admit(call)
             return runtime.build_session(call, tr)
 
         tr = AudioSocketTransport(reader, writer, factory)
-        tr.before_end = lambda: store.update_call(call["id"], end_reason="agent_hangup")
+        tr.before_end = lambda: to_thread(store.update_call, call["id"], end_reason="agent_hangup")
         try:
             await tr.run()
         except _Reject:
@@ -894,7 +907,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     @app.on_event("shutdown")
     async def _stop_message_log():
-        await asyncio.to_thread(runtime.message_log.close)
+        await to_thread(runtime.message_log.close)
 
     @app.post("/twilio/resume/{call_id}")
     async def twilio_resume(call_id: str, request: Request):

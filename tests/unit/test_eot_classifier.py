@@ -161,3 +161,79 @@ def test_runtime_classifier_ignores_history_and_uses_weights(monkeypatch, tmp_pa
     fn = rt._eot_sync()
     # silence still has no features, so the loaded filler weight never gets a chance to fire
     assert fn(np.zeros(100, np.int16), [{"role": "user", "content": "um"}]) == 0.5
+
+
+def _fall_and_hum():
+    from tests.unit.test_prosody import clip, tone
+
+    fall = clip(tone(200, 200, 0.6), tone(200, 130, 0.4, 0.3, 0.08))
+    hum = clip(tone(180, 180, 0.5), tone(180, 180, 0.6))
+    return fall, hum
+
+
+def test_classifier_scores_prosody_clips_and_a_loaded_bias_overrides_them(monkeypatch, tmp_path):
+    """Hand priors match eot_prosody on real clips. A loaded finite bias must move the runtime score."""
+    from core.prosody import eot_prosody
+
+    fall, hum = _fall_and_hum()
+    clf = EotClassifier()
+    assert clf.score(fall) == eot_prosody(fall)
+    assert clf.score(hum) == eot_prosody(hum)
+    um = [{"role": "user", "content": "um"}]
+    monkeypatch.setenv("VOX_EOT", "classifier")
+    monkeypatch.delenv("VOX_EOT_MODEL", raising=False)
+    rt = Runtime(object(), lambda v: None, lambda: None, Store())
+    priors = rt._eot_sync()
+    assert priors(fall, []) == eot_prosody(fall)
+    assert priors(hum, um) == eot_prosody(hum)
+    assert priors(fall, []) == priors(fall, um)
+    assert priors(hum, []) == priors(hum, um)
+
+    path = tmp_path / "bias.json"
+    path.write_text(json.dumps({"bias": 20, "slope": 0, "decay": 0, "filler": 0, "voiced": 0}))
+    monkeypatch.setenv("VOX_EOT_MODEL", str(path))
+    loaded = rt._eot_sync()
+    got_empty = loaded(fall, [])
+    got_um = loaded(fall, um)
+    assert got_empty == got_um
+    assert got_empty > 0.99
+    assert got_empty != eot_prosody(fall)
+
+
+def test_published_turn_ends_and_unset_env_defaults(monkeypatch):
+    for name in ("VOX_END_MS", "VOX_EOT_THRESHOLD", "VOX_PATIENT_MS"):
+        monkeypatch.delenv(name, raising=False)
+    c, store, _ = make()
+    k, _ = tenant(c)
+    h = {"X-API-Key": k}
+    made = c.post("/v1/agents", json={"name": "edges", "systemPrompt": "p",
+                                      "turn": {"endMs": 2000, "eotThreshold": 0.05}}, headers=h)
+    assert made.status_code == 200
+    call = c.post("/v1/calls", json={"agentId": made.json()["id"]}, headers=h).json()
+    sess = c.app.state.runtime.build_session(store.get_call_any(call["id"]), _T())
+    assert sess.cfg.turn.end_ms == 2000
+    assert sess.cfg.turn.eot_threshold == 0.05
+    bare = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=h).json()
+    bare_sess = c.app.state.runtime.build_session(store.get_call_any(bare["id"]), _T())
+    assert (bare_sess.cfg.turn.end_ms, bare_sess.cfg.turn.eot_threshold,
+            bare_sess.cfg.turn.patient_end_ms) == (640, 0.8, 1000)
+
+
+def test_truncated_null_and_non_numeric_model_files_keep_the_hand_priors(monkeypatch, tmp_path):
+    from core.prosody import eot_prosody
+
+    fall, _hum = _fall_and_hum()
+    prior = eot_prosody(fall)
+    bodies = (
+        '{"bias": 0.1, "slope":',
+        "null",
+        json.dumps({"bias": "nope", "slope": 9}),
+    )
+    monkeypatch.setenv("VOX_EOT", "classifier")
+    rt = Runtime(object(), lambda v: None, lambda: None, Store())
+    for body in bodies:
+        path = tmp_path / "bad.json"
+        path.write_text(body)
+        assert EotClassifier.load(str(path)).weights == DEFAULT_WEIGHTS
+        monkeypatch.setenv("VOX_EOT_MODEL", str(path))
+        assert rt._eot_sync()(fall, []) == prior

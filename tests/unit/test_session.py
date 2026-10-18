@@ -205,6 +205,39 @@ async def test_tool_call_does_not_run_until_turn_is_committed():
     assert r.tts.texts == ["Let me check.", "Booked for ten."]
 
 
+async def test_tool_round_waits_for_its_own_transcript_when_a_newer_turn_started():
+    """A later turn replaces the session's transcript pointer. This turn must still wait."""
+    release = asyncio.Event()
+
+    async def lookup(args):
+        return {"slot": "10:00"}
+
+    llm = FakeLLM([["Let ", "me ", "check. ", ToolCall("t1", "lookup", {"day": "mon"})],
+                   ["Booked ", "for ", "ten."]])
+
+    async def slow(audio):
+        await release.wait()
+        return "tuesday at eleven"
+
+    llm.transcribe = slow
+    r = Rig(llm, tools={"lookup": lookup})
+    orig = r.s._commit
+
+    def commit(gen):
+        orig(gen)
+        r.s._transcript_task = asyncio.create_task(asyncio.sleep(10))
+
+    r.s._commit = commit
+    await r.frames("s", 15)
+    await r.frames("q", 25)
+    await r.settle()
+    assert len(llm.calls) == 1, "the tool round ran before this turn's transcript was ready"
+    release.set()
+    await r.settle()
+    assert {"role": "user", "content": "tuesday at eleven"} in llm.calls[1]["history"]
+    assert llm.calls[1]["n_audio"] == 0
+
+
 async def test_tool_round_sends_transcript_instead_of_reprefilling_audio():
     async def lookup(args):
         return {"slot": "10:00"}

@@ -365,7 +365,9 @@ class Session:
                     break
                 await gen.commit.wait()  # never run side effects for an uncommitted reply
                 task = getattr(gen, "transcript_task", None)
-                if task is not None and task is self._transcript_task:
+                # Await this generation's transcript even when a newer turn has replaced the
+                # pointer. Skipping it sends the tool round "[inaudible]" instead of the words.
+                if task is not None and not task.done():
                     await task
                 followups.append({"role": "assistant", "content": "".join(text_parts) or None,
                                   "tool_calls": [{"id": c.id, "type": "function",

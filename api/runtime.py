@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from core.asr import HttpASR
 from core.backchannel import BACKCHANNEL_MS
 from core.metrics import METRICS
 from core.recorder import CallRecorder, write_wav16
@@ -18,6 +19,29 @@ from . import tools as toolmod
 from .experiments import VariantLLM, choose_variant
 from .store import Store
 from .writebehind import MessageLog
+
+
+class _LlmWithASR:
+    """Use HttpASR for transcripts. `stream` and `eot_score` still go to the speech model.
+
+    Built only when VOX_ASR_URL is set, so VllmClient.transcribe is unchanged otherwise.
+    """
+
+    def __init__(self, inner, asr: HttpASR) -> None:
+        self._inner = inner
+        self._asr = asr
+
+    def stream(self, history, audio, followups, tools):
+        return self._inner.stream(history, audio, followups, tools)
+
+    def eot_score(self, history, audio):
+        return self._inner.eot_score(history, audio)
+
+    async def transcribe(self, audio) -> str:
+        return await self._asr.transcribe(audio)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 class LimitedTTS:
@@ -340,6 +364,9 @@ class Runtime:
         model_name = str(variant.get("model") or "").strip() if variant else ""
         if model_name and hasattr(self.llm, "model"):
             llm = VariantLLM(self.llm, model_name)
+        asr_url = os.environ.get("VOX_ASR_URL", "").strip()
+        if asr_url:
+            llm = _LlmWithASR(llm, HttpASR(asr_url, self.http))
         eot_async = self._eot_async()
         if llm is not self.llm and eot_async is not None:
             eot_async = lambda audio, history, bound=llm: bound.eot_score(history, audio)

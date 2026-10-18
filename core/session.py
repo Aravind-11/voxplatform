@@ -116,6 +116,9 @@ class _Generation:
         self.speak_lock = asyncio.Lock()  # filler audio and sentence audio must not synthesize at the same time
         self.holding_sentence = False     # dequeued by _synth but not spoken yet (off textq during lookahead)
         self.after: Optional[ToolResult] = None   # deferred call action requested by a tool this reply
+        # Transcript already running when this generation was created. Not this turn's task:
+        # _commit may replace the session pointer before _produce is scheduled.
+        self.prior_transcript: Optional[asyncio.Task] = None
 
 
 class Session:
@@ -149,6 +152,7 @@ class Session:
         self._gen: Optional[_Generation] = None
         self._last_speech_clock = 0.0
         self._transcript_task: Optional[asyncio.Task] = None
+        self._transcript_tasks: set[asyncio.Task] = set()
         self._bg: set[asyncio.Task] = set()
         self._turn_lock = asyncio.Lock()  # feed holds this across its score so the frame is applied first
         self._overlapped = False          # this caller utterance started while the agent was playing
@@ -258,6 +262,7 @@ class Session:
             base = list(self.history)
             self.history.append({"role": "assistant", "content": ""})
             gen = _Generation(np.zeros(0, np.int16), base, self.clock())
+            gen.prior_transcript = self._transcript_task
             gen.committed = True
             gen.commit.set()
             gen.tasks = [asyncio.create_task(self._produce(gen)), asyncio.create_task(self._synth(gen)),
@@ -266,21 +271,38 @@ class Session:
             self._emit("user_transcript", text=text, source="text")
 
     async def close(self) -> None:
-        self._overlap_dropped.update(self._overlap_live)
-        self._overlap_dropped.update(self._overlap_claimed)
-        self._overlap_live.clear()
-        self._overlap_claimed.clear()
-        tasks = [t for t in list(self._overlap_tasks) if not t.done()]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._overlap_tasks.clear()
-        self._cancel_eot()
-        if self._gen:
-            await self._cancel(self._gen)
-        if self._transcript_task:
-            await asyncio.gather(self._transcript_task, return_exceptions=True)
+        try:
+            self._overlap_dropped.update(self._overlap_live)
+            self._overlap_dropped.update(self._overlap_claimed)
+            self._overlap_live.clear()
+            self._overlap_claimed.clear()
+            tasks = [t for t in list(self._overlap_tasks) if not t.done()]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self._overlap_tasks.clear()
+            self._cancel_eot()
+            if self._gen:
+                await self._cancel(self._gen)
+        finally:
+            # Hang-up can land while close() is still in _cancel. Finish transcripts either way.
+            await self._finish_transcripts()
+
+    async def _finish_transcripts(self) -> None:
+        # Every in-flight ASR, not only the latest pointer: a later commit replaces it
+        # while the earlier turn is still "[caller audio]". Shielded, and a cancel of
+        # close() waits the shield out. A bare gather would cancel the transcript.
+        tasks = [t for t in list(self._transcript_tasks) if not t.done()]
+        if not tasks:
+            return
+        try:
+            await asyncio.gather(*(asyncio.shield(t) for t in tasks), return_exceptions=True)
+        except asyncio.CancelledError:
+            pending = [t for t in tasks if not t.done()]
+            if pending:
+                await asyncio.gather(*(asyncio.shield(t) for t in pending), return_exceptions=True)
+            raise
 
     # --------------------------------------------------------------- events
     def _emit(self, type_: str, **data: Any) -> None:
@@ -547,6 +569,7 @@ class Session:
     def _start_generation(self) -> None:
         audio = np.concatenate(self._utt) if self._utt else np.zeros(0, np.int16)
         gen = _Generation(audio, list(self.history), self._last_speech_clock)
+        gen.prior_transcript = self._transcript_task
         gen.tasks = [asyncio.create_task(self._produce(gen)), asyncio.create_task(self._synth(gen)),
                      asyncio.create_task(self._drain(gen))]
         self._gen = gen
@@ -556,7 +579,15 @@ class Session:
         self.history.append({"role": "user", "content": "[caller audio]"})
         self.history.append({"role": "assistant", "content": ""})
         user_idx = len(self.history) - 2
-        self._transcript_task = asyncio.create_task(self._transcribe(gen.audio, user_idx, overlapped, speech_ms))
+        task = asyncio.create_task(self._transcribe(gen.audio, user_idx, overlapped, speech_ms))
+        self._transcript_tasks.add(task)
+        if task.done():
+            self._transcript_tasks.discard(task)
+        else:
+            task.add_done_callback(self._transcript_tasks.discard)
+        self._transcript_task = task
+        gen.transcript_task = task   # so a later turn's task is not the one we await
+        gen.user_idx = user_idx
         gen.commit.set()
 
     def note_overlap_transcript(self, text: str, duration_ms: float) -> None:
@@ -586,7 +617,10 @@ class Session:
             text = "[inaudible]"
             self._emit("error", where="transcribe", error=repr(e))
         self.history[idx]["content"] = text
-        self._emit("user_transcript", text=text)
+        try:
+            self._emit("user_transcript", text=text)
+        except Exception as e:  # noqa: BLE001  (a store write must not skip the tool round)
+            self._emit("error", where="user_transcript", error=repr(e))
         if overlapped and not failed:
             self.note_overlap_transcript(raw, speech_ms)
         elif overlapped and self._overlap_unscored:
@@ -597,25 +631,48 @@ class Session:
             except Exception as e:  # noqa: BLE001  (a dataset write must never break a call)
                 self._emit("error", where="utterance_sink", error=repr(e))
 
+    def _tool_round_history(self, gen: _Generation) -> list[dict]:
+        """This turn's caller audio, as text, prepended to the history the tool round sees.
+
+        `user_idx` is only set for an audio commit. Text turns (keypad) already have the user
+        message in `base_history`, so they are left as they are.
+        """
+        idx = getattr(gen, "user_idx", None)
+        if not isinstance(idx, int) or not (0 <= idx < len(self.history)):
+            return list(gen.base_history)
+        content = self.history[idx].get("content")
+        transcript = "[inaudible]" if content == "[caller audio]" else content
+        return [*gen.base_history, {"role": "user", "content": transcript}]
+
     async def _produce(self, gen: _Generation) -> None:
         followups: list[dict] = []
         # Replaced each round so the short first-clause split stays per round. The name
         # lives outside the loop so a model error can flush the round that failed.
         chunker = SentenceChunker()
         try:
-            if self._transcript_task and not self._transcript_task.done():
-                await self._transcript_task  # previous turn's transcript must be in history
+            # Previous turn only. Reading self._transcript_task here would wait on this turn's
+            # ASR when commit already replaced the pointer, and on 3.11+ cancelling this
+            # generation would cancel the task it is awaiting.
+            prior = gen.prior_transcript
+            if prior is not None and not prior.done():
+                await asyncio.shield(prior)
                 gen.base_history = list(self.history[: len(gen.base_history)])
-            for _round in range(self.cfg.max_tool_rounds + 1):
+            for round_i in range(self.cfg.max_tool_rounds + 1):
                 chunker = SentenceChunker()
                 text_parts: list[str] = []
                 calls: list[ToolCall] = []
                 t_req, first_tok = self.clock(), True
-                # Fitted view for the model only. self.history (and the store transcript) stay complete.
-                # This turn's tool call and result stay whole, so the history view gives up the tokens they take.
+                # One audio clip per request. Round 0 keeps this turn's audio; later rounds send the
+                # transcript (text) and must not re-prefill that clip. The user text stays out of followups.
+                # The fitted view is for the model only. self.history stays complete, and followup
+                # tokens come out of the same budget.
+                if round_i == 0:
+                    hist, audio = gen.base_history, gen.audio
+                else:
+                    hist, audio = self._tool_round_history(gen), np.zeros(0, np.int16)
                 room = self.cfg.max_context_tokens - estimate_messages(followups)
-                model_history = fit_history(gen.base_history, room, self.cfg.history_tail)
-                async for item in self.llm.stream(model_history, gen.audio, followups,
+                model_history = fit_history(hist, room, self.cfg.history_tail)
+                async for item in self.llm.stream(model_history, audio, followups,
                                                   self.cfg.tools_schema):
                     if isinstance(item, ToolCall):
                         calls.append(item)
@@ -633,6 +690,12 @@ class Session:
                 if not calls:
                     break
                 await gen.commit.wait()  # never run side effects for an uncommitted reply
+                task = getattr(gen, "transcript_task", None)
+                # Await this generation's transcript even when a newer turn has replaced the
+                # pointer. Skipping it sends the tool round "[inaudible]" instead of the words.
+                # Shielded: a barge-in cancels this reply and must not cancel the transcript.
+                if task is not None and not task.done():
+                    await asyncio.shield(task)
                 followups.append({"role": "assistant", "content": "".join(text_parts) or None,
                                   "tool_calls": [{"id": c.id, "type": "function",
                                                   "function": {"name": c.name,

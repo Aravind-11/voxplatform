@@ -197,10 +197,15 @@ class Runtime:
             elif e["type"] == "agent_speech":
                 store.add_message(cid, "agent", e["text"], time.time())
             # agent_first_audio carries latency_ms; the other three stages carry ms.
+            # Speculative llm/tts events fire before END_OF_TURN increments stats["turns"].
             if e["type"] in ("llm_first_token", "tts_done", "agent_first_audio", "tool_result"):
                 ms = e["ms"] if "ms" in e else e.get("latency_ms")
                 if ms is not None:
-                    store.add_timing(cid, int(sess.stats["turns"]), e["type"], ms, time.time())
+                    turn = int(sess.stats["turns"])
+                    gen = sess._gen
+                    if gen is not None and not gen.committed:
+                        turn += 1
+                    store.add_timing(cid, turn, e["type"], ms, time.time())
             if forward_events and hasattr(transport, "send_event"):
                 import asyncio
                 asyncio.get_running_loop().create_task(transport.send_event(e))

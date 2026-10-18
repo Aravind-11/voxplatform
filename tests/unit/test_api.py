@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import time
@@ -92,6 +93,46 @@ def test_call_timings_are_tenant_scoped_and_recorded_from_events():
     got = [(r["turn"], r["stage"], r["ms"]) for r in store.timings(call["id"])]
     assert got[2:] == [(3, "llm_first_token", 40.0), (3, "agent_first_audio", 90.0),
                        (3, "tts_done", 15.0), (3, "tool_result", 7.0)]
+
+
+async def test_speculative_stages_share_the_committed_turn():
+    """llm_first_token and tts_done fire while the reply is still speculative, before stats['turns']
+    increments. They belong on the caller turn that is about to commit, with agent_first_audio."""
+    c, store, _ = make()
+    key, _ = tenant(c)
+    call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers={"X-API-Key": key}).json()
+
+    class T:
+        out_rate = 8000
+
+        async def send_audio(self, pcm, rate=8000):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            return None
+
+    sess = c.app.state.runtime.build_session(store.get_call_any(call["id"]), T())
+    speech = np.full(512, 5000, dtype=np.int16)
+    quiet = np.zeros(512, dtype=np.int16)
+    for _ in range(10):
+        await sess.feed(speech)
+    for _ in range(8):
+        await sess.feed(quiet)
+    for _ in range(50):
+        await asyncio.sleep(0)
+    for _ in range(16):
+        await sess.feed(quiet)
+    gen = sess._gen
+    assert gen is not None
+    await asyncio.wait(set(gen.tasks), timeout=2)
+    want = ("llm_first_token", "tts_done", "agent_first_audio")
+    got = {r["stage"]: r["turn"] for r in store.timings(call["id"]) if r["stage"] in want}
+    assert set(got) == set(want)
+    assert set(got.values()) == {1}
+    assert sess.stats["turns"] == 1
 
 
 def test_tenant_isolation():

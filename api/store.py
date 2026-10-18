@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS ledger(
   id {SERIAL}, tenant_id TEXT, t {REAL}, kind TEXT, micros BIGINT, ref TEXT, detail TEXT);
 CREATE INDEX IF NOT EXISTS ledger_tenant ON ledger(tenant_id, id);
 CREATE UNIQUE INDEX IF NOT EXISTS ledger_ref ON ledger(kind, ref);
+CREATE TABLE IF NOT EXISTS numbers(
+  e164 TEXT PRIMARY KEY, tenant_id TEXT, agent_id TEXT);
+CREATE TABLE IF NOT EXISTS sip_setup(
+  uuid TEXT PRIMARY KEY, caller TEXT, exten TEXT, created {REAL});
 """
 
 # columns added after the first release: (table, column, type)
@@ -55,6 +59,11 @@ ROLES = ("admin", "developer", "viewer")      # viewer: read only; developer: re
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(8)}"
+
+
+def normalize_e164(raw: str) -> str:
+    """Drop whitespace and keep a leading '+', so '+1 555 111 0000' matches '+15551110000'."""
+    return "".join(str(raw or "").split())
 
 
 class Store:
@@ -415,3 +424,46 @@ class Store:
 
     def messages(self, call_id: str) -> list[dict]:
         return self._all("SELECT role, text, t FROM messages WHERE call_id=? ORDER BY id", (call_id,))
+
+    # ---- dialed numbers (SIP). e164 is globally unique: one number belongs to one tenant.
+    def put_number(self, tenant_id: str, e164: str, agent_id: str) -> bool:
+        """Point e164 at agent_id for this tenant. A row another tenant already owns is left unchanged.
+        Returns whether this tenant owns the number after the write."""
+        e164 = normalize_e164(e164)
+        # Do not set tenant_id on conflict. Two API nodes can both pass the 409 check before either writes;
+        # the WHERE keeps the first owner, and a same-tenant put can still change agent_id.
+        self._x("INSERT INTO numbers(e164, tenant_id, agent_id) VALUES(?,?,?) "
+                "ON CONFLICT(e164) DO UPDATE SET agent_id=excluded.agent_id "
+                "WHERE numbers.tenant_id=excluded.tenant_id",
+                (e164, tenant_id, agent_id))
+        row = self._one("SELECT tenant_id FROM numbers WHERE e164=?", (e164,))
+        return bool(row and row["tenant_id"] == tenant_id)
+
+    def get_number(self, e164: str) -> Optional[dict]:
+        key = normalize_e164(e164)
+        # _X. posts the dialed digits with no leading '+'. Rows are stored as E.164.
+        if key.isdigit():
+            key = "+" + key
+        r = self._one("SELECT e164, tenant_id, agent_id FROM numbers WHERE e164=?", (key,))
+        return dict(r) if r else None
+
+    def delete_number(self, tenant_id: str, e164: str) -> bool:
+        return self._x("DELETE FROM numbers WHERE e164=? AND tenant_id=?", (normalize_e164(e164), tenant_id)) > 0
+
+    def list_numbers(self, tenant_id: str) -> list[dict]:
+        return self._all("SELECT e164, tenant_id, agent_id FROM numbers WHERE tenant_id=? ORDER BY e164", (tenant_id,))
+
+    # ---- SIP setup rows written by the dialplan just before AudioSocket connects. Older than max_age are ignored.
+    def put_sip_setup(self, uuid: str, caller: str, exten: str, created: Optional[float] = None) -> None:
+        created = time.time() if created is None else created
+        self._x("INSERT INTO sip_setup(uuid, caller, exten, created) VALUES(?,?,?,?) "
+                "ON CONFLICT(uuid) DO UPDATE SET caller=excluded.caller, exten=excluded.exten, created=excluded.created",
+                (uuid, caller, exten, created))
+
+    def get_sip_setup(self, uuid: str, max_age: float = 60.0) -> Optional[dict]:
+        r = self._one("SELECT uuid, caller, exten, created FROM sip_setup WHERE uuid=?", (uuid,))
+        if not r:
+            return None
+        if max_age is not None and time.time() - float(r["created"]) > max_age:
+            return None
+        return dict(r)

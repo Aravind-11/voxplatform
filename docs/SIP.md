@@ -10,9 +10,17 @@
 ```
 caller -> VoxSun -- SIP/RTP --> Asterisk -- AudioSocket (TCP, 8 kHz audio) --> voice engine (this repo)
 ```
-Asterisk (open source) does the SIP and audio-over-IP work. The engine receives each call's audio over a plain TCP connection
+Asterisk (open source) does the SIP and audio-over-IP work. Before AudioSocket opens, the dialplan posts the call
+UUID, the caller number, and the dialed number to `POST /internal/sip/setup` with header `X-Vox-Sip-Token`.
+The engine receives each call's audio over a plain TCP connection
 (`transports/audiosocket.py`) and runs the same agent, tools, interruption handling and storage as the Twilio path.
 Calls are stored with medium `sip`.
+
+`PUT /v1/numbers/{e164}` stores which agent answers that dialed number for the tenant. A fresh setup (60 seconds)
+stores the caller on `metadata.from` and the dialed number on `metadata.to`. The session copies those into
+`CallContext.caller`, `CallContext.callee`, and the `{{caller}}` / `{{callee}}` variables. With no fresh setup,
+or no number row, the call is answered as `VOX_SIP_AGENT`. An empty `VOX_SIP_TOKEN` turns the setup route off
+(404); a wrong token is 403.
 
 ## What is verified and what is not
 | Part | State |
@@ -24,15 +32,16 @@ Calls are stored with medium `sip`.
 
 ## Set it up (once VoxSun gives SIP details)
 1. Fill the uppercase values in `deploy/sip/pjsip.conf` (server, username, password or the provider's IP).
-2. Create the agent that should answer, then in `deploy/.env` set `VOX_AUDIOSOCKET_PORT=9092` and `VOX_SIP_AGENT=<agent id>`.
+2. Create the agent that should answer calls with no number mapping, then in `deploy/.env` set `VOX_AUDIOSOCKET_PORT=9092`, `VOX_SIP_AGENT=<agent id>`, and `VOX_SIP_TOKEN` to a long random secret. Compose passes that same value into Asterisk as `SIP_SETUP_TOKEN`. An empty token leaves `POST /internal/sip/setup` off (404), so every SIP call stays on `VOX_SIP_AGENT`.
 3. `docker compose -f deploy/docker-compose.yml --env-file deploy/.env --profile sip up -d`
-4. Check: `docker compose exec asterisk asterisk -rx "pjsip show registrations"` and `... "module show like audiosocket"`.
-5. Call the VoxSun number. In the engine logs you should see a new `sip` call.
+4. Map a dialed number: `PUT /v1/numbers/{e164}` with body `{"agentId": "<agent id>"}` (E.164, for example `+15551234567`) and the tenant API key. 422 means that agent is not in the tenant. 409 means another tenant already owns the number.
+5. Check: `docker compose exec asterisk asterisk -rx "pjsip show registrations"` and `... "module show like audiosocket"`.
+6. Call the VoxSun number. In the engine logs you should see a new `sip` call on the mapped agent. `{{caller}}` and `{{callee}}` are filled from that setup.
 
-Without Docker: install Asterisk 18+ (needs the AudioSocket modules), copy the four files from `deploy/sip/` to `/etc/asterisk/`, and run the engine with `VOX_AUDIOSOCKET_PORT=9092 VOX_AUDIOSOCKET_AGENT=<id> VOX_AUDIOSOCKET_HOST=127.0.0.1` (change `api1:9092` in `extensions.conf` to `127.0.0.1:9092`).
+Without Docker: install Asterisk 18+ (needs the AudioSocket modules), copy the files from `deploy/sip/` (including `sip_setup.py`) to `/etc/asterisk/`, export `SIP_SETUP_TOKEN` to the same secret, and run the engine with `VOX_AUDIOSOCKET_PORT=9092 VOX_AUDIOSOCKET_AGENT=<id> VOX_AUDIOSOCKET_HOST=127.0.0.1 VOX_SIP_TOKEN=<secret>` (change `api1` in `extensions.conf` to `127.0.0.1` for both AudioSocket and the setup URL).
 
 ## Known limits
-- **Caller number is not passed:** AudioSocket carries only a call UUID. The agent does not know who is calling until we add it (Asterisk can pass it another way; not built).
+- **Caller id characters:** AudioSocket carries only the call UUID. The dialplan posts the caller id and the dialed extension first, and only digits and a leading `+` are forwarded (`+` is sent as `%2B`). Anything else in either value is stripped before the request, so it cannot be run as a shell command. A setup older than 60 seconds is ignored.
 - **One engine node per Asterisk:** the dialplan points at `api1`. A TCP load balancer in front of several nodes is not built, and a call is lost if its node dies (the Twilio path can reconnect a call; the SIP path cannot).
 - **Security:** the AudioSocket port has no authentication. Keep it on a private network and never publish it.
 - **Outbound calls over SIP** (through VoxSun's `calls/initiate`) are not built.

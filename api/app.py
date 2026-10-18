@@ -23,7 +23,7 @@ from transports.twilio import TwilioTransport
 from . import security, tools as toolmod
 from . import openapi_import, retention, variables as varmod
 from .runtime import Runtime
-from .store import ROLES, Store, new_id
+from .store import ROLES, Store, new_id, normalize_e164
 
 
 @dataclass
@@ -42,10 +42,11 @@ class Settings:
     outbound_prefixes: tuple = ()      # e.g. ("+1",) restricts dialing to these country prefixes; empty = any
     static_dir: str = os.path.join(os.path.dirname(__file__), "static")
     audiosocket_port: int = 0          # >0: listen for Asterisk AudioSocket connections (the SIP path) on this TCP port
-    audiosocket_agent: str = ""        # agent id that answers calls arriving on that port
+    audiosocket_agent: str = ""        # agent id that answers calls arriving on that port when no number is mapped
     audiosocket_host: str = "127.0.0.1"  # bind address; keep it private, AudioSocket has no authentication
     node_max_calls: int = 32           # this process; 0 = no node cap. Checked before the per-tenant cap.
     overflow_url: str = ""             # http(s) only; a full or draining node redirects Twilio here instead of speaking
+    sip_token: str = ""                # VOX_SIP_TOKEN; empty disables POST /internal/sip/setup (404)
 
 
 def checked_overflow(url: str) -> str:
@@ -80,6 +81,10 @@ class AgentPatch(BaseModel):
     tools: Optional[list[Union[str, dict[str, Any]]]] = None
     speed: Optional[float] = Field(None, ge=0.7, le=1.3)
     record: Optional[bool] = None
+
+
+class NumberIn(BaseModel):
+    agentId: str
 
 
 class CallIn(BaseModel):
@@ -355,6 +360,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                              {"type": type_, "t": time.time(), "call": public_call(call), **extra})
 
     app.state.draining = False
+    app.state.sip_setups = {}          # uuid -> {caller, exten, created}; same rows as sip_setup, so tests need no extra process
 
     def at_node_cap() -> bool:
         """True when this process must refuse another call.
@@ -498,6 +504,38 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     @app.get("/v1/agents")
     async def list_agents(t: dict = Depends(tenant)):
         return [redacted(a) for a in store.list_agents(t["id"])]
+
+    # ----------------------------------------------------- SIP numbers (dialed number -> agent)
+    def _e164_or_422(raw: str) -> str:
+        num = normalize_e164(raw)
+        if not E164.match(num):
+            raise HTTPException(422, "number must be E.164, e.g. +15551234567")
+        return num
+
+    @app.put("/v1/numbers/{e164}")
+    async def put_number(e164: str, body: NumberIn, t: dict = Depends(tenant_write)):
+        num = _e164_or_422(e164)
+        if not store.get_agent(t["id"], body.agentId):
+            raise HTTPException(422, "agent is not in this tenant")
+        other = store.get_number(num)
+        if other and other["tenant_id"] != t["id"]:
+            raise HTTPException(409, "number is assigned to another tenant")
+        if not store.put_number(t["id"], num, body.agentId):
+            raise HTTPException(409, "number is assigned to another tenant")
+        log(t, "number.put", num, agentId=body.agentId)
+        return {"e164": num, "agentId": body.agentId}
+
+    @app.delete("/v1/numbers/{e164}")
+    async def delete_number(e164: str, t: dict = Depends(tenant_write)):
+        num = _e164_or_422(e164)
+        if not store.delete_number(t["id"], num):
+            raise HTTPException(404, "number not found")
+        log(t, "number.delete", num)
+        return {"deleted": num}
+
+    @app.get("/v1/numbers")
+    async def list_numbers(t: dict = Depends(tenant)):
+        return [{"e164": r["e164"], "agentId": r["agent_id"]} for r in store.list_numbers(t["id"])]
 
     # ------------------------------------------------------------- calls
     @app.post("/v1/calls")
@@ -1026,27 +1064,93 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     app.state.audiosocket_writers = set()
 
+    def require_sip_token(header: str) -> None:
+        """Empty VOX_SIP_TOKEN turns SIP setup off (404). A wrong token is 403, not a silent accept."""
+        if not settings.sip_token:
+            raise HTTPException(404, "not found")
+        if not hmac.compare_digest(header or "", settings.sip_token):
+            raise HTTPException(403, "bad sip token")
+
+    def sip_setup_for(uid: str) -> Optional[dict]:
+        """In-memory row wins when it is fresh; the table covers a lookup from another worker. Older than 60 s is ignored."""
+        now = time.time()
+        mem = app.state.sip_setups.get(uid)
+        if mem and now - float(mem["created"]) <= 60:
+            return mem
+        return store.get_sip_setup(uid, max_age=60)
+
+    @app.post("/internal/sip/setup")
+    async def sip_setup(request: Request, x_vox_sip_token: str = Header(default="")):
+        """Asterisk calls this just before AudioSocket, so the UUID can be tied to the dialed number."""
+        require_sip_token(x_vox_sip_token)
+        form = {k: str(v) for k, v in (await request.form()).items()}
+        uid = form.get("uuid", "").strip()
+        if not uid:
+            raise HTTPException(422, "uuid is required")
+        caller, exten = form.get("caller", ""), form.get("exten", "")
+        created = time.time()
+        store.put_sip_setup(uid, caller, exten, created)
+        stale = [k for k, v in app.state.sip_setups.items() if created - float(v["created"]) > 60]
+        for k in stale:
+            app.state.sip_setups.pop(k, None)
+        app.state.sip_setups[uid] = {"uuid": uid, "caller": caller, "exten": exten, "created": created}
+        return {"ok": True}
+
     async def audiosocket_call(reader, writer) -> None:
-        """One SIP call arriving from Asterisk over AudioSocket: reserve a slot, then admit and run the agent."""
+        """One SIP call from Asterisk.
+
+        A slot is reserved before the UUID read, so a second connection already sees a full node,
+        and no call row exists until that UUID arrives. The setup row maps the UUID to the dialed
+        number, and `numbers` picks the agent. No fresh setup, or no mapping, falls back to
+        settings.audiosocket_agent. If neither resolves, the socket is closed and the slot is released.
+        """
         from transports.audiosocket import AudioSocketTransport
         app.state.audiosocket_writers.add(writer)
         state: dict = {}
         cid = ""
-        agent = None
+        holder = None
         tr = None
         try:
-            agent = store.get_agent_any(settings.audiosocket_agent)
-            if not agent or app.state.draining:
+            if app.state.draining:
+                return
+            default = store.get_agent_any(settings.audiosocket_agent) if settings.audiosocket_agent else None
+            if default is None:
                 return
             # Reserve before reading the UUID. The read awaits, and a second connection must already see a full node.
-            cid, decision = reserve_slot(agent["tenant_id"])
+            cid, decision = reserve_slot(default["tenant_id"])
             if decision != "ok":
                 cid = ""
                 return
+            holder = default
 
             async def factory(transport, custom):
-                call = create_reserved(cid, agent["tenant_id"], agent["id"], "sip", agent["config"],
-                                       {"callSid": custom.get("uuid", ""), "channel": "sip"})
+                nonlocal cid, holder
+                uid = str(custom.get("uuid", ""))
+                setup = sip_setup_for(uid) if uid else None
+                chosen = None
+                if setup:
+                    row = store.get_number(setup.get("exten") or "")
+                    if row:
+                        chosen = store.get_agent(row["tenant_id"], row["agent_id"])
+                        if chosen is None:            # number points at a deleted agent: do not silently use the default
+                            writer.close()
+                            raise EOFError("mapped agent is gone")
+                if chosen is None:
+                    chosen = default
+                if chosen["tenant_id"] != holder["tenant_id"]:
+                    # The placeholder holds this process's only slot. Free it, then take the mapped tenant's.
+                    limiter.release(holder["tenant_id"], cid)
+                    cid, decision = reserve_slot(chosen["tenant_id"])
+                    if decision != "ok":
+                        cid = ""
+                        writer.close()
+                        raise EOFError("node full")
+                    holder = chosen
+                meta = {"callSid": uid, "channel": "sip"}
+                if setup:
+                    meta["from"] = setup.get("caller") or ""
+                    meta["to"] = setup.get("exten") or ""
+                call = create_reserved(cid, chosen["tenant_id"], chosen["id"], "sip", chosen["config"], meta)
                 state["call"] = call
                 state["t"] = admit(call)
                 return runtime.build_session(call, transport)
@@ -1057,6 +1161,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 await tr.run(uuid_timeout=AUDIOSOCKET_UUID_TIMEOUT_S)
             except _Reject:
                 pass
+            except EOFError:
+                pass
             except Exception:  # noqa: BLE001
                 # admit() can raise after the row exists. Cleanup is the finally below; do not
                 # leave this as an unhandled client_connected_cb error with the row still created.
@@ -1065,7 +1171,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             app.state.audiosocket_writers.discard(writer)
             if "t" in state:
                 finish(state["call"], state["t"], "agent_hangup" if tr is not None and tr.ended_by_us else "stream_closed")
-            elif cid:
+            elif cid and holder is not None:
                 # Re-read. A _Reject path (draining, node full) already ended the row; writing
                 # admit_failed over that dict would erase the real reason. A created/active row
                 # is one admit never finished, and it still holds the slot.
@@ -1073,7 +1179,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 if cur and cur["status"] in ("created", "active"):
                     release_open(cur, "admit_failed")
                 else:
-                    limiter.release(agent["tenant_id"], cid)
+                    limiter.release(holder["tenant_id"], cid)
             _abort_writer(writer)
 
     @app.on_event("startup")

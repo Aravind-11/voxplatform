@@ -251,6 +251,75 @@ async def test_second_turn_history_contains_first_transcript():
     assert second[2]["content"] == "First reply."
 
 
+class GatedLLM(FakeLLM):
+    """Holds the first transcribe on `gate` so a later turn can overlap it."""
+
+    def __init__(self, replies):
+        super().__init__(replies)
+        self.gate = asyncio.Event()
+        self.started = asyncio.Event()
+
+    async def transcribe(self, audio):
+        if not self.started.is_set():
+            self.started.set()
+            await self.gate.wait()
+        return await super().transcribe(audio)
+
+
+async def _speculate_while_asr_held():
+    """Commit a turn whose ASR is still running, then start the next speculative reply."""
+    llm = GatedLLM([["Hi."], ["Okay."]])
+    r = Rig(llm)
+    await r.frames("s", 15)
+    await r.frames("q", 23)             # past 640 ms: turn 1 commits and the ASR blocks
+    await r.settle()
+    assert llm.started.is_set() and not r.s._transcript_task.done()
+    assert r.s.history[1]["content"] == "[caller audio]"
+    await r.frames("q", 40)             # short reply finishes; the next speech is not a barge-in
+    await r.frames("s", 15)
+    await r.frames("q", 8)              # turn 2 speculates while turn 1's ASR is in flight
+    await r.settle()
+    assert r.s.stats["speculations"] >= 2
+    assert r.s._transcript_task is not None and not r.s._transcript_task.done()
+    assert [e for e in r.events if e["type"] == "user_transcript"] == []
+    return r, llm
+
+
+async def test_resume_while_asr_is_in_flight_keeps_the_caller_slot():
+    r, llm = await _speculate_while_asr_held()
+    await r.frames("s", 10)             # caller resumes: cancel the speculative reply, not the ASR
+    await r.settle()
+    task = r.s._transcript_task
+    assert r.s.stats["speculations_cancelled"] == 1 and r.clears == 0
+    assert task is not None and not task.cancelled() and not task.done()
+    llm.gate.set()
+    await r.settle()
+    assert r.s.history[1] == {"role": "user", "content": "caller said 1"}
+    assert [e["text"] for e in r.events if e["type"] == "user_transcript"] == ["caller said 1"]
+    await r.frames("q", 30)             # the resumed pause ends and the next reply is generated
+    await r.settle()
+    seen = llm.calls[-1]["history"]
+    assert [m["content"] for m in seen if m["role"] == "user"] == ["caller said 1"]
+    assert all("[caller audio]" not in (m.get("content") or "") for m in seen)
+
+
+async def test_close_while_asr_is_in_flight_keeps_the_caller_slot():
+    r, llm = await _speculate_while_asr_held()
+    closing = asyncio.create_task(r.s.close())
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if closing.done():
+            break
+    # Hang-up cancels the speculative reply, then still waits for this turn's ASR.
+    assert not closing.done()
+    assert not r.s._transcript_task.cancelled()
+    llm.gate.set()
+    await closing
+    assert r.s.history[1] == {"role": "user", "content": "caller said 1"}
+    assert [e["text"] for e in r.events if e["type"] == "user_transcript"] == ["caller said 1"]
+    assert not r.s._transcript_task.cancelled()
+
+
 async def test_speculation_synthesizes_only_first_sentence_before_commit():
     llm = FakeLLM([["One two three four. ", "Five six seven. ", "Eight nine."]])
     r = Rig(llm)

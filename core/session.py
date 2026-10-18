@@ -212,6 +212,8 @@ class Session:
         self._cancel_eot()
         if self._gen:
             await self._cancel(self._gen)
+        # Do not cancel the ASR. _cancel above drops the live reply; this task still has to
+        # replace "[caller audio]" so hang-up stores the line before call.ended is built.
         if self._transcript_task:
             await asyncio.gather(self._transcript_task, return_exceptions=True)
 
@@ -321,7 +323,10 @@ class Session:
         followups: list[dict] = []
         try:
             if self._transcript_task and not self._transcript_task.done():
-                await self._transcript_task  # previous turn's transcript must be in history
+                # Shield so cancelling this reply (speech resume or hang-up) does not cancel the
+                # previous turn's ASR. CancelledError is not an Exception, so an aborted task would
+                # leave the caller slot as "[caller audio]" and never emit user_transcript.
+                await asyncio.shield(self._transcript_task)
                 gen.base_history = list(self.history[: len(gen.base_history)])
             for _round in range(self.cfg.max_tool_rounds + 1):
                 chunker = SentenceChunker()

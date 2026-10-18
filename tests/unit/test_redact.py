@@ -78,3 +78,18 @@ def test_redact_flag_stores_redacted_transcript_and_webhook():
     assert "4111 1111 1111 1111" in raw and "ada@example.com" in raw and "+14155551212" in raw
     patched = c.patch(f"/v1/agents/{plain['id']}", headers=h, json={"redact": True}).json()
     assert patched["config"]["redact"] is True
+
+
+def test_years_and_clock_times_stay_while_cards_and_streets_are_redacted():
+    assert redact_text("See you at 11:00 Dr. Smith") == "See you at 11:00 Dr. Smith"
+    assert redact_text("Meet in 1999 Dr. Adams arrived") == "Meet in 1999 Dr. Adams arrived"
+    assert redact_text("since 1999 St. Louis has grown") == "since 1999 St. Louis has grown"
+    assert redact_text("2000-01-01-12-00-00") == "2000-01-01-12-00-00"
+    assert redact_text("2000 01 01 12 00 00") == "2000 01 01 12 00 00"
+    assert redact_text("paid on 1990-01-01-2000-01-01 thanks") == "paid on 1990-01-01-2000-01-01 thanks"
+    assert redact_text("4111-1111-1111-1111") == "[REDACTED:card]"
+    assert redact_text("4222222222222") == "[REDACTED:card]"
+    assert redact_text("1999-1999-1999-199") == "[REDACTED:card]"
+    assert redact_text("ship to 10 King St. in 1999 at 11:00") == "ship to [REDACTED:address] in 1999 at 11:00"
+    assert redact_text("1999 Oak Dr") == "[REDACTED:address]"
+    assert redact_text("10 St") == "[REDACTED:address]"

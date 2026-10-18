@@ -955,6 +955,13 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if call.get("end_reason") in ("agent_hangup", "transfer", "no_credit"):
             return {"action": "hangup"}
         meta = call["metadata"] if isinstance(call["metadata"], dict) else json.loads(call["metadata"] or "{}")
+        # This process still has the socket. Ending it here frees the slot while the session
+        # keeps running, and the next AudioSocket opens a second call on the same caller.
+        if call["id"] in runtime.live:
+            raise HTTPException(409, "call is still connected")
+        # A retry of this POST must not orphan the row the first attempt already created.
+        if call["status"] == "created" and meta.get("resumedFrom"):
+            return {"callId": call["id"], "agentId": call["agent_id"]}
         n = int(meta.get("resumes", 0))
         if n >= MAX_RESUMES:
             METRICS.inc("vox_call_resume_refused_total")

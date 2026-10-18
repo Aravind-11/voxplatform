@@ -208,6 +208,31 @@ def test_next_audiosocket_keeps_the_recovered_transcript():
         assert store.get_call_any(new_id)["status"] == "ended" and lim.total_active() == 0
 
 
+def test_sip_recover_leaves_a_live_call_alone_and_a_retry_returns_the_same_row():
+    """Recover while this node still holds the socket must not free the slot or open a second call.
+    A second POST of a recover that already created the continuation returns that row."""
+    c, store, lim = make(Settings(admin_key="adm", public_base_url=BASE, twilio_auth_token="tok", sip_token="sip-secret"))
+    k, tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "n", "greeting": "Hello!"}, headers={"X-API-Key": k}).json()
+    call = store.create_call(tid, a["id"], "sip", a["config"], {"callSid": "sip-live", "channel": "sip"})
+    store.update_call(call["id"], status="active", joined=time.time())
+    assert lim.acquire(tid, call["id"], 5)
+    c.app.state.runtime.live[call["id"]] = (object(), object())
+    headers = {"X-Vox-Sip-Token": "sip-secret"}
+    refused = c.post("/sip/recover", json={"uuid": "sip-live"}, headers=headers)
+    assert refused.status_code == 409
+    assert store.get_call_any(call["id"])["status"] == "active"
+    assert lim.total_active() == 1
+    assert len(store.list_calls(tid)) == 1
+    del c.app.state.runtime.live[call["id"]]
+    first = c.post("/sip/recover", json={"uuid": "sip-live"}, headers=headers)
+    assert first.status_code == 200
+    again = c.post("/sip/recover", json={"uuid": "sip-live"}, headers=headers)
+    assert again.status_code == 200 and again.json()["callId"] == first.json()["callId"]
+    assert len(store.list_calls(tid)) == 2
+    assert lim.total_active() == 0
+
+
 def test_unknown_or_browser_calls_just_hang_up_and_draining_node_refuses():
     c, store, _ = make()
     k, tid = tenant(c)

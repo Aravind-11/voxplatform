@@ -58,10 +58,14 @@ def test_turn_holds_speech_start_for_backchannel_ms_while_agent_speaks():
     ev = feed(fresh, [(True, 16)])
     assert kinds(ev) == [Ev.SPEECH_START] and ev[0][1] == 14 * F     # 15th frame reaches 480 ms
 
-    low = TurnManager(TurnConfig(backchannel_ms=BACKCHANNEL_MS["low"]))
+    low = TurnManager(TurnConfig(backchannel_ms=700))                 # literal low gate, not the dict
     low.set_agent_speaking(True)
     ev = feed(low, [(True, 21), (False, 8)])                         # 672 ms < 700
     assert kinds(ev) == [Ev.OVERLAP_CHECK] and ev[0][1] == (21 + 5) * F
+    opened = TurnManager(TurnConfig(backchannel_ms=700))
+    opened.set_agent_speaking(True)
+    ev = feed(opened, [(True, 22)])                                  # 22nd frame reaches 704 ms
+    assert kinds(ev) == [Ev.SPEECH_START] and ev[0][1] == 21 * F
     # not speaking: backchannel_ms does not move the normal 96 ms start
     ev = feed(TurnManager(TurnConfig(backchannel_ms=700)), [(True, 4)])
     assert kinds(ev) == [Ev.SPEECH_START] and ev[0][1] == 2 * F
@@ -140,6 +144,79 @@ async def test_short_overlap_does_not_barge_and_a_yeah_after_a_real_cut_is_marke
     assert ev["text"] == "yeah" and ev["duration_ms"] == 192
     assert r2.clears == 1                                  # playback clear cannot be undone
     assert r2.s.stats["interruptions"] == 0                # a backchannel is not counted
+
+
+async def test_empty_inaudible_or_failed_transcript_leaves_playback_up():
+    """384 ms over a playing reply. No words, "[inaudible]", or a transcribe error is not a turn."""
+    reply = ["Hold on, I am still talking through this whole reply with you right now."]
+
+    async def run(later, failed=False):
+        llm = FakeLLM([reply])
+        n = {"n": 0}
+
+        async def transcribe(audio):
+            n["n"] += 1
+            if n["n"] == 1:
+                return "hello"
+            if failed:
+                raise RuntimeError("asr down")
+            return later
+
+        llm.transcribe = transcribe
+        r = Rig(llm, tts=FakeTTS(word_ms=1000))
+        await r.frames("s", 15)
+        await r.frames("q", 22)
+        await r.settle()
+        assert r.sent and len(llm.calls) == 1
+        old = r.s._gen
+        await r.frames("s", 12)                                      # 384 ms < 450
+        await r.frames("q", 8)
+        await r.settle()
+        assert r.clears == 0 and old is not None and not old.cancelled and r.s._gen is old
+        assert r.s._overlap_claimed == {} and r.s._overlap_live == {}
+        assert r.s.stats["turns"] == 1
+        assert _user_texts(r) == ["hello"]
+        if failed:
+            assert any(e["type"] == "error" and e.get("where") == "overlap_transcribe" for e in r.events)
+        else:
+            assert not any(e["type"] == "error" and e.get("where") == "overlap_transcribe" for e in r.events)
+
+    await run("")
+    await run("[inaudible]")
+    await run("", failed=True)
+
+
+async def test_low_gate_keeps_512ms_yeah_and_still_takes_stop():
+    """512 ms is under the 700 ms low gate and over the 450 ms default, so the session has to
+    pass that gate into the classifier. "yeah" stays a backchannel; "stop" still takes the floor."""
+    reply = ["Hold on, I am still talking through this whole reply with you right now."]
+    for word, barges in (("yeah", False), ("stop", True)):
+        llm = FakeLLM([reply, ["Sure, I stopped."]])
+
+        async def transcribe(audio, word=word):
+            if len(audio) and bool((audio == 7000).any()):
+                return word
+            return "hello"
+
+        llm.transcribe = transcribe
+        r = Rig(llm, tts=FakeTTS(word_ms=1000),
+                cfg=SessionConfig(tts_poll_s=0, turn=TurnConfig(backchannel_ms=700)))
+        await r.frames("s", 15)
+        await r.frames("q", 22)
+        await r.settle()
+        assert r.sent and len(llm.calls) == 1
+        old = r.s._gen
+        await _feed_value(r, np.full(512, 7000, np.int16), 16)       # 512 ms
+        await r.frames("q", 8)
+        await r.settle()
+        if barges:
+            assert r.clears >= 1 and old.cancelled and len(llm.calls) >= 2
+            assert "stop" in _user_texts(r)
+        else:
+            assert r.clears == 0 and len(llm.calls) == 1
+            assert old is not None and not old.cancelled and r.s._gen is old
+            assert _user_texts(r) == ["hello"]
+            assert any(e["type"] == "backchannel" and e.get("text") == "yeah" for e in r.events)
 
 
 async def test_short_real_request_during_playback_interrupts():
@@ -441,6 +518,15 @@ async def test_real_turn_keeps_audio_from_an_inflight_overlap_check():
         await r.frames("q", 10)
         await r.settle()
         assert any(len(a) and bool((a == 7000).any()) for a in audios)
+        # The overlap transcript is still blocked. Releasing it must not start another
+        # turn: the real turn already took this audio.
+        calls = len(r.llm.calls)
+        gate.set()
+        await r.settle()
+        assert all(m.get("content") != "stop" for m in r.s.history)
+        assert calls == 2 and len(r.llm.calls) == calls
+        assert r.s._overlap_dropped == {1}
+        assert r.s._overlap_live == {} and r.s._overlap_claimed == {}
     finally:
         gate.set()
 
@@ -599,8 +685,9 @@ def test_agent_barge_in_is_validated_and_copied_onto_the_turn():
 
     rt = Runtime(ApiLLM(), lambda v: ApiTTS(), FakeVAD, store)
     call = store.create_call(tid, aid, "webSocket", store.get_agent(tid, aid)["config"], {})
-    assert rt.build_session(call, T()).cfg.turn.backchannel_ms == BACKCHANNEL_MS["high"]
+    # Literals, not BACKCHANNEL_MS: a dict edit must not move the expectation with the code.
+    assert rt.build_session(call, T()).cfg.turn.backchannel_ms == 192
     low = store.create_call(tid, None, "webSocket", {"systemPrompt": "x", "bargeIn": "low"}, {})
-    assert rt.build_session(low, T()).cfg.turn.backchannel_ms == BACKCHANNEL_MS["low"]
+    assert rt.build_session(low, T()).cfg.turn.backchannel_ms == 700
     plain = store.create_call(tid, None, "webSocket", {"systemPrompt": "x"}, {})
-    assert rt.build_session(plain, T()).cfg.turn.backchannel_ms == BACKCHANNEL_MS["normal"]
+    assert rt.build_session(plain, T()).cfg.turn.backchannel_ms == 450

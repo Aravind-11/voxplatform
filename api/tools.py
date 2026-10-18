@@ -75,6 +75,8 @@ READBACK_INSTRUCTION = ("Critical slots (names, dates, times, numbers, amounts) 
                         "in the agent's own words before a tool that changes state.")
 _SLOT_MARKS = ("book", "create", "update", "delete", "transfer", "purchase")
 _READBACK_STEP = "Read these values back to the caller before calling the tool."
+# Sentence marks and currency only. A sign, accounting parentheses, percent, or unicode minus is part of the amount.
+_SLOT_EDGE = ".,!?;:'\"$£€"
 
 
 def needs_slot_guard(specs: list) -> bool:
@@ -101,16 +103,12 @@ def _assistant_text(ctx) -> str:
 
 
 def _slot_tokens(text: str) -> list[str]:
-    """Whitespace tokens; only edge punctuation is stripped, so 9:10 and 100.50 stay atomic."""
+    """Whitespace tokens. Only sentence marks and currency are stripped at the edges, so 9:10 stays atomic and -100.50 does not become 100.50."""
     tokens: list[str] = []
     for raw in str(text).lower().split():
-        i, j = 0, len(raw)
-        while i < j and not raw[i].isalnum():
-            i += 1
-        while j > i and not raw[j - 1].isalnum():
-            j -= 1
-        if i < j:
-            tokens.append(raw[i:j])
+        token = raw.strip(_SLOT_EDGE)
+        if token:
+            tokens.append(token)
     return tokens
 
 

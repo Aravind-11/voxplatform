@@ -440,6 +440,15 @@ async def test_runtime_readback_uses_the_assistant_history():
     ("anne-marie", "anne"),
     ("twenty-one", "twenty"),
     ("two-thirty", "two"),
+    # A sign, accounting parentheses, or a percent is a different amount from the bare number.
+    ("100.50", "-100.50"),
+    ("100.50", "100.50-"),
+    ("20", "\u221220"),
+    ("20", "--20"),
+    ("100", "(100)"),
+    ("100", "(-100)"),
+    ("15", "15%"),
+    ("15", "+15"),
 ])
 async def test_readback_does_not_match_a_different_slot_hidden_by_punctuation(said, value):
     _, run = _guarded_booker(said)
@@ -451,6 +460,30 @@ async def test_clock_time_with_a_trailing_period_still_passes_the_guard():
     _, run = _guarded_booker("Tuesday at 11:00.")
     first = await run({"day": "tuesday", "time": "11:00"})
     assert first["executed"] is False and "read these details back" in first["next_step"].lower()
+
+
+def test_currency_edge_still_matches_the_bare_amount():
+    # Shorter than the guard's length cutoff, so this locks the tokenizer itself.
+    assert toolmod._slot_was_said("20", "$20") and toolmod._slot_was_said("$20", "20")
+    assert toolmod._slot_was_said("100", "£100") and toolmod._slot_was_said("100", "€100.")
+
+
+async def test_slot_guard_refuses_plain_book_slot_when_the_readback_lookup_raises():
+    # A lookup error is empty text, not a skip: tuesday 11:00 must still be free afterwards.
+    ctx = toolmod.CallContext()
+    ctx.guard_slots = True
+
+    def lookup():
+        raise RuntimeError("history unavailable")
+
+    ctx.last_assistant_text = lookup
+    _, fns = toolmod.build(["book_slot"], ctx, None)
+    out = await fns["book_slot"]({"day": "tuesday", "time": "11:00"})
+    assert out == {"executed": False, "next_step": toolmod._READBACK_STEP,
+                   "details": {"day": "tuesday", "time": "11:00"}}
+    ctx.last_assistant_text = "Tuesday at 11:00"
+    assert await fns["book_slot"]({"day": "tuesday", "time": "11:00"}) == {
+        "booked": True, "day": "tuesday", "time": "11:00"}
 
 
 async def test_slot_guard_covers_named_state_changes_but_not_reads_or_hangup(allow_private):

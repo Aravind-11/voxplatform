@@ -143,6 +143,7 @@ class Session:
         self._overlap_live: dict[int, list[np.ndarray]] = {}
         self._overlap_claimed: dict[int, list[np.ndarray]] = {}
         self._overlap_dropped: set[int] = set()
+        self._overlap_commit_lock = asyncio.Lock()  # one real overlap commits at a time
         self.stats = {"turns": 0, "speculations": 0, "speculations_cancelled": 0, "interruptions": 0}
 
     # ------------------------------------------------------------------ input
@@ -344,6 +345,7 @@ class Session:
         Empty audio, a failed transcript, and a backchannel leave the reply playing. Real words
         ("stop", "no") interrupt and start a turn on this audio even if a later burst has already
         started. If a real turn starts first, that turn keeps this audio and the result is ignored.
+        Once the words are real, a later clear or transcript error still commits the turn.
         """
         raw = ""
         try:
@@ -369,32 +371,110 @@ class Session:
         frames = self._overlap_live.pop(token, None)
         if frames is not None:
             self._overlap_claimed[token] = frames
+        committed = False
+        try:
+            async with self._overlap_commit_lock:
+                if self._overlap_stale(token):
+                    return
+                committed = await self._commit_real_overlap(audio, speech_ms, token)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if not committed:
+                self._release_overlap_token(token)
+
+    async def _commit_real_overlap(self, audio: np.ndarray, speech_ms: float, token: int) -> bool:
+        """Interrupt whatever is playing and commit this overlap as its own turn.
+
+        Returns False when a real turn already took the audio. Clear and the previous
+        transcript are awaited here; if either fails the utterance is still committed.
+        Callers serialize this so a second overlap sees the generation the first one started.
+        """
         g = self._gen
         did_interrupt = False
-        if g and not g.cancelled:
-            if g.committed and self._agent_active():
-                await self._interrupt(g)
-                did_interrupt = True
-            else:
+        unscored_before = self._overlap_unscored
+        overlapped_before = self._overlapped
+        try:
+            if g and not g.cancelled:
+                if g.committed and self._agent_active():
+                    await self._interrupt(g)
+                    did_interrupt = True
+                else:
+                    await self._cancel(g)
+                    if self._gen is g:
+                        self._gen = None
+            if self._overlap_stale(token):
+                return False
+            # Commit replaces _transcript_task. Wait for the one already in flight first, or the
+            # model is sent "[caller audio]" for the turn the caller just finished.
+            prior = self._transcript_task
+            if prior is not None and not prior.done():
+                await prior
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._emit("error", where="overlap_commit", error=repr(e))
+            if self._overlap_stale(token):
+                return False
+            did_interrupt = await self._recover_overlap_interrupt(
+                g, did_interrupt, unscored_before, overlapped_before)
+        if self._overlap_stale(token):
+            return False
+        self._land_overlap_turn(audio, speech_ms, token, did_interrupt)
+        return True
+
+    async def _recover_overlap_interrupt(self, g: Optional[_Generation], did_interrupt: bool,
+                                         unscored_before: int, overlapped_before: bool) -> bool:
+        """Cancel a reply _interrupt did not finish stopping. The overlap turn still commits."""
+        if g is not None and not g.cancelled:
+            # _interrupt counts the barge before clear_audio. Roll that back if clear never returned,
+            # then stop the reply locally so it cannot keep playing.
+            self._overlap_unscored = unscored_before
+            self._overlapped = overlapped_before
+            try:
                 await self._cancel(g)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                self._emit("error", where="overlap_cancel", error=repr(e))
+            if self._gen is g:
                 self._gen = None
-        if self._overlap_stale(token):
-            return
-        # Commit replaces _transcript_task. Wait for the one already in flight first, or the
-        # model is sent "[caller audio]" for the turn the caller just finished.
-        prior = self._transcript_task
-        if prior is not None and not prior.done():
-            await prior
-        if self._overlap_stale(token):
-            return
+            heard, cut = self.tracker.heard()
+            self.history = trim_history(self.history, heard, cut)
+            self.tracker.reset()
+            self._overlapped = True
+            self._overlap_unscored = unscored_before + 1
+            self.stats["interruptions"] += 1
+            try:
+                self._emit("user_interrupted", heard=heard, cut=cut)
+            except Exception as e:  # noqa: BLE001
+                self._emit("error", where="overlap_interrupt", error=repr(e))
+            return True
+        # Interrupt already cancelled playback and counted it, then a later step (the prior
+        # transcript) failed. Keep that count so the new turn's transcript can close it.
+        if self._overlap_unscored > unscored_before:
+            return True
+        return did_interrupt
+
+    def _land_overlap_turn(self, audio: np.ndarray, speech_ms: float, token: int,
+                           did_interrupt: bool) -> None:
         self._overlap_claimed.pop(token, None)
         self.stats["turns"] += 1
-        self._emit("user_end_of_turn")
+        try:
+            self._emit("user_end_of_turn")
+        except Exception as e:  # noqa: BLE001 — handler must not drop a turn that already qualified
+            self._emit("error", where="overlap_commit", error=repr(e))
         self._utt = [audio] if len(audio) else []
         self._start_generation()
         self._commit(self._gen, overlapped=did_interrupt, speech_ms=speech_ms)
         self._utt = []
         self._overlapped = False
+
+    def _release_overlap_token(self, token: int) -> None:
+        """Forget audio this check will not commit, so a later turn cannot prepend it."""
+        self._overlap_dropped.add(token)
+        self._overlap_live.pop(token, None)
+        self._overlap_claimed.pop(token, None)
 
     def _cancel_eot(self) -> None:
         t, self._eot_task = self._eot_task, None

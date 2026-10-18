@@ -445,6 +445,139 @@ async def test_real_turn_keeps_audio_from_an_inflight_overlap_check():
         gate.set()
 
 
+def _user_texts(r):
+    return [m.get("content") for m in r.s.history if m.get("role") == "user"]
+
+
+async def test_clear_failure_still_commits_stop_and_forgets_the_claim():
+    """clear_audio raising after the words are known must not leave the old reply running
+    or keep the overlap audio claimed for a later turn to prepend."""
+
+    async def transcribe(audio):
+        if len(audio) and bool((audio == 7000).any()):
+            return "stop"
+        return "hello"
+
+    r = await _agent_playing(transcribe, [
+        ["Hold on, I am still talking through this whole reply with you right now."],
+        ["Sure, I stopped."],
+    ])
+    old = r.s._gen
+
+    async def clear():
+        raise RuntimeError("clear failed")
+
+    r.s.clear_audio = clear
+    try:
+        await _feed_value(r, np.full(512, 7000, np.int16), 12)
+        await r.frames("q", 8)
+        await r.settle()
+        assert "stop" in _user_texts(r)
+        assert old.cancelled and r.s._gen is not old
+        assert r.s._overlap_claimed == {} and r.s._overlap_live == {}
+        assert r.s._overlap_unscored == 0
+        assert r.s.stats["turns"] == 2
+        assert any(e["type"] == "error" for e in r.events)
+    finally:
+        await r.s.close()
+
+
+async def test_prior_transcript_failure_still_commits_stop():
+    """The previous turn's user_transcript handler is store.add_message. If it raises, the
+    overlap has already interrupted; "stop" must still become a turn and not stay claimed."""
+    gate = asyncio.Event()
+
+    async def transcribe(audio):
+        if len(audio) and bool((audio == 7000).any()):
+            return "stop"
+        await gate.wait()
+        return "hello"
+
+    r = await _agent_playing(transcribe, [
+        ["Hold on, I am still talking through this whole reply with you right now."],
+        ["Sure, I stopped."],
+    ])
+    old = r.s._gen
+
+    def on_event(e):
+        r.events.append(e)
+        if e["type"] == "user_transcript" and e.get("text") == "hello":
+            raise RuntimeError("add_message failed")
+
+    r.s.on_event = on_event
+    try:
+        await _feed_value(r, np.full(512, 7000, np.int16), 12)
+        await r.frames("q", 8)
+        await r.settle()
+        assert r.clears == 1 and old.cancelled
+        assert "stop" not in _user_texts(r)
+        gate.set()
+        await r.settle()
+        assert "stop" in _user_texts(r)
+        assert "hello" in _user_texts(r)
+        assert r.s._gen is not old and not r.s._gen.cancelled
+        assert r.s._overlap_claimed == {} and r.s._overlap_live == {}
+        assert r.s._overlap_unscored == 0
+        assert r.s.stats["turns"] == 2
+        assert len(r.llm.calls) >= 2
+        assert any(e["type"] == "error" for e in r.events)
+    finally:
+        gate.set()
+        await r.s.close()
+
+
+async def test_two_real_overlaps_do_not_leave_an_extra_generation():
+    """Both transcripts unblock while the previous turn's transcript is still running.
+    Both phrases are turns. Only the later reply stays live, and hang-up cancels it too."""
+    overlap_gate = asyncio.Event()
+    prior_gate = asyncio.Event()
+
+    async def transcribe(audio):
+        if len(audio) and bool((audio == 7000).any()) and not bool((audio == 4000).any()):
+            await overlap_gate.wait()
+            return "stop"
+        if len(audio) and bool((audio == 4000).any()) and not bool((audio == 7000).any()):
+            await overlap_gate.wait()
+            return "cancel the order"
+        await prior_gate.wait()
+        return "hello"
+
+    r = await _agent_playing(transcribe, [
+        ["Hold on, I am still talking through this whole reply with you right now."],
+        ["Sure, I stopped."],
+        ["The order is cancelled."],
+    ])
+    started = []
+    orig = r.s._start_generation
+
+    def start_generation():
+        orig()
+        started.append(r.s._gen)
+
+    r.s._start_generation = start_generation
+    try:
+        await _feed_value(r, np.full(512, 7000, np.int16), 12)
+        await r.frames("q", 8)
+        await _feed_value(r, np.full(512, 4000, np.int16), 12)
+        await r.frames("q", 8)
+        await r.settle()
+        overlap_gate.set()
+        await r.settle()
+        assert len(r.llm.calls) == 1
+        assert "stop" not in _user_texts(r) and "cancel the order" not in _user_texts(r)
+        prior_gate.set()
+        await r.settle()
+        assert "stop" in _user_texts(r) and "cancel the order" in _user_texts(r)
+        assert len(started) == 2
+        assert [g for g in started if not g.cancelled] == [r.s._gen]
+        await r.s.close()
+        assert all(g.cancelled for g in started)
+    finally:
+        overlap_gate.set()
+        prior_gate.set()
+        await r.s.close()
+
+
 def test_agent_barge_in_is_validated_and_copied_onto_the_turn():
     c, store, _ = make()
     k, tid = tenant(c)

@@ -133,7 +133,15 @@ def test_sip_recover_seeds_history_from_the_lost_audiosocket_call():
     assert lim.acquire(tid, call["id"], 5)
     store.add_message(call["id"], "agent", "Hello, how can I help?", time.time())
     store.add_message(call["id"], "user", "I want Tuesday at eleven.", time.time())
-    assert c.post("/sip/recover", json={"uuid": "sip-uuid-1"}).status_code == 403
+    # A wrong token must not resume first. Checking only 403 would still pass after the row was ended.
+    assert len(store.list_calls(tid)) == 1 and lim.total_active() == 1
+    for bad in ({}, {"X-Vox-Sip-Token": "wrong"}):
+        denied = c.post("/sip/recover", json={"uuid": "sip-uuid-1"}, headers=bad)
+        assert denied.status_code == 403
+        assert len(store.list_calls(tid)) == 1
+        held = store.get_call_any(call["id"])
+        assert held["status"] == "active" and held.get("end_reason") is None
+        assert lim.total_active() == 1
     r = c.post("/sip/recover", json={"uuid": "sip-uuid-1"}, headers={"X-Vox-Sip-Token": "sip-secret"})
     assert r.status_code == 200 and r.json()["agentId"] == a["id"] and r.json()["callId"] != call["id"]
     old = store.get_call_any(call["id"])
@@ -150,7 +158,12 @@ def test_sip_recover_seeds_history_from_the_lost_audiosocket_call():
     refused = c.post("/sip/recover", json={"uuid": "sip-uuid-2"}, headers={"X-Vox-Sip-Token": "sip-secret"})
     assert refused.status_code == 200 and refused.json()["action"] == "hangup"
     assert not [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == hung["id"]]
-    assert c.post("/sip/recover", json={"uuid": "missing"}, headers={"X-Vox-Sip-Token": "sip-secret"}).status_code == 404
+    before_missing = len(store.list_calls(tid))
+    missing = c.post("/sip/recover", json={"uuid": "missing"}, headers={"X-Vox-Sip-Token": "sip-secret"})
+    assert missing.status_code == 404
+    assert len(store.list_calls(tid)) == before_missing
+    assert not any(row["metadata"].get("callSid") == "missing" for row in store.list_calls(tid))
+    assert store.find_call_by_sid("missing", medium="sip") is None
     off, *_ = make()
     assert off.post("/sip/recover", json={"uuid": "sip-uuid-1"}, headers={"X-Vox-Sip-Token": "sip-secret"}).status_code == 404
 
@@ -495,6 +508,54 @@ def test_rejected_resume_keeps_the_same_continuation_and_transcript():
                 pass
             sock.close()
         assert _poll(lambda: lab.store.get_call_any(cid)["status"] == "ended")
+        assert lab.lim.total_active() == 0
+
+
+def test_last_allowed_resume_stays_when_that_continuation_never_joined():
+    """resumes=2 is still allowed. A cap check before the never-joined return would hang this row up."""
+    lab = _sip_lab()
+    uid = str(uuid.uuid4())
+    parent = _lost_sip(lab, uid, status="stream_lost")
+    cont = lab.store.create_call(lab.tid, lab.ag["id"], "sip", lab.ag["config"],
+                                 {"callSid": uid, "channel": "sip", "from": "+15550001", "to": "+15550002",
+                                  "resumedFrom": parent["id"], "resumes": 2})
+    assert lab.store.find_call_by_sid(uid, medium="sip")["id"] == cont["id"]
+    assert cont["status"] == "created" and cont.get("joined") is None and cont.get("end_reason") is None
+    headers = {"X-Vox-Sip-Token": "sip-secret"}
+    with lab.client(lab.app) as c:
+        before = len(lab.store.list_calls(lab.tid))
+        assert before == 2 and lab.lim.total_active() == 0
+        kept = c.post("/sip/recover", json={"uuid": uid}, headers=headers)
+        assert kept.status_code == 200 and kept.json()["callId"] == cont["id"]
+        row = lab.store.get_call_any(cont["id"])
+        assert row["status"] == "created" and row.get("end_reason") is None and row.get("joined") is None
+        assert row["metadata"]["resumes"] == 2
+        assert len(lab.store.list_calls(lab.tid)) == before and lab.lim.total_active() == 0
+        # Admit wrote the refusal and died before restore. The cap must not spend this resume.
+        lab.store.update_call(cont["id"], status="ended", ended=time.time(), end_reason="concurrency_limit")
+        again = c.post("/sip/recover", json={"uuid": uid}, headers=headers)
+        assert again.status_code == 200 and again.json()["callId"] == cont["id"]
+        row = lab.store.get_call_any(cont["id"])
+        assert row["status"] == "created" and row.get("end_reason") is None and row.get("joined") is None
+        assert row.get("ended") is None and row["metadata"]["resumes"] == 2
+        assert len(lab.store.list_calls(lab.tid)) == before and lab.lim.total_active() == 0
+        sock = _open_uuid(lab, uid)
+        try:
+            live = _wait_live(lab, cont["id"])
+            body = _history(live[0])
+            assert ("assistant", "Hello, how can I help?") in body
+            assert ("user", "I want Tuesday at eleven.") in body
+            assert lab.store.get_call_any(cont["id"])["metadata"]["resumes"] == 2
+            assert len(lab.store.list_calls(lab.tid)) == before
+            assert lab.lim.total_active() == 1
+        finally:
+            try:
+                sock.sendall(lab.audio.pack(lab.audio.KIND_HANGUP))
+            except OSError:
+                pass
+            sock.close()
+        assert _poll(lambda: lab.store.get_call_any(cont["id"])["status"] == "ended")
+        assert len(lab.store.list_calls(lab.tid)) == before
         assert lab.lim.total_active() == 0
 
 

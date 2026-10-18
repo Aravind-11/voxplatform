@@ -1,9 +1,11 @@
 """VAD scoring stays off the event loop and batches frames that share a loop beat."""
 import asyncio
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import pytest
 
 from api.runtime import Runtime
 from api.store import Store
@@ -56,6 +58,31 @@ async def test_same_beat_probs_run_inside_one_executor_call():
         assert seen == [1, 1]
     finally:
         pool.shutdown(wait=True)
+
+
+async def test_cancelling_the_batch_unblocks_the_callers():
+    """A cancelled scorer must not leave the frames that joined that batch awaiting forever."""
+    pool = _SpyPool()
+    try:
+        sched = VADScheduler(pool)
+
+        class Slow:
+            def prob(self, frame):
+                time.sleep(0.4)
+                return 0.2
+
+        caller = asyncio.create_task(sched.prob(Slow(), FRAME))
+        await asyncio.sleep(0)   # prob() queues the frame and schedules the flush
+        await asyncio.sleep(0)   # the flush creates the batch task
+        batch = [t for t in asyncio.all_tasks() if t.get_name() == "vox-vad-batch"]
+        assert batch, "the batch task was not scheduled"
+        batch[0].cancel()
+        done, pending = await asyncio.wait({caller}, timeout=1)
+        assert not pending
+        with pytest.raises(RuntimeError, match="vad scoring was cancelled"):
+            caller.result()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 async def test_slow_prob_does_not_stall_the_event_loop():
@@ -132,3 +159,45 @@ def test_runtime_session_uses_the_process_scheduler_and_rigs_do_not():
     bare = Session(llm=object(), tts=object(), vad=Inline(), send_audio=T.send_audio, clear_audio=T.clear,
                    clock=lambda: 0.0, cfg=SessionConfig())
     assert bare.vad_scheduler is None
+
+
+async def test_executor_shutdown_fails_queued_scores_instead_of_hanging():
+    """Cancelling a queued executor job must not leave feed() awaiting a future that is never set."""
+    gate = threading.Event()
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vad-shutdown")
+    started = threading.Event()
+
+    def block():
+        started.set()
+        gate.wait(3)
+
+    pool.submit(block)
+    assert started.wait(1)
+    sched = VADScheduler(pool)
+
+    class V:
+        def prob(self, frame):
+            return 0.4
+
+    a = asyncio.create_task(sched.prob(V(), FRAME))
+    b = asyncio.create_task(sched.prob(V(), FRAME))
+    try:
+        queued = False
+        for _ in range(50):
+            if pool._work_queue.qsize() >= 1:
+                queued = True
+                break
+            await asyncio.sleep(0.01)
+        assert queued  # job is sitting behind the blocked worker, not running yet
+        pool.shutdown(wait=False, cancel_futures=True)
+        _done, pending = await asyncio.wait({a, b}, timeout=0.5)
+        assert not pending
+        for task in (a, b):
+            with pytest.raises(RuntimeError, match="vad scoring was cancelled"):
+                task.result()
+    finally:
+        gate.set()
+        for task in (a, b):
+            if not task.done():
+                task.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)

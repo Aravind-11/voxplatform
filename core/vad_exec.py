@@ -70,6 +70,14 @@ class VADScheduler:
         async def finish() -> None:
             try:
                 vals = await loop.run_in_executor(self._executor, _score, items)
+            except asyncio.CancelledError:
+                # CancelledError is not an Exception. Fail the frames here too: a task
+                # cancelled before it starts never enters this function, and the done
+                # callback below covers that. Re-raise so the cancellation still sticks.
+                for fut in futs:
+                    if not fut.done():
+                        fut.set_exception(RuntimeError("vad scoring was cancelled"))
+                raise
             except Exception as exc:  # noqa: BLE001
                 for fut in futs:
                     if not fut.done():
@@ -83,7 +91,17 @@ class VADScheduler:
                 else:
                     fut.set_exception(val)
 
-        asyncio.create_task(finish())
+        task = asyncio.create_task(finish(), name="vox-vad-batch")
+
+        def _abandoned(done: asyncio.Task) -> None:
+            # Cancel-before-start never runs finish(), so the caller futures would stay pending.
+            if not done.cancelled() and done.exception() is None:
+                return
+            for fut in futs:
+                if not fut.done():
+                    fut.set_exception(RuntimeError("vad scoring was cancelled"))
+
+        task.add_done_callback(_abandoned)
 
 
 async def watch_loop_lag(metrics: Any) -> None:

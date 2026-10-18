@@ -667,6 +667,49 @@ def test_sip_outbound_originates_on_asterisk_and_not_twilio(monkeypatch):
                    headers={"X-Vox-Sip-Token": "s3cret"}).status_code == 404
 
 
+def test_sip_outbound_needs_no_twilio_and_sends_ari_basic_auth(monkeypatch):
+    """channel=sip originates with ARI basic auth and a fromNumber. Twilio account settings are not required.
+    Dropping auth= on originate, or refusing sip without Twilio credentials, fails this test."""
+    import base64
+    from urllib.parse import parse_qs, urlparse
+    from api import security
+    from api.app import create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from starlette.testclient import TestClient
+    from test_api import FakeLLM as L, FakeTTS as T, FakeVAD
+    monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
+    monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
+    monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "secret")
+    monkeypatch.delenv("TWILIO_ACCOUNT_SID", raising=False)
+    monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append(req)
+        return httpx.Response(200, json={"id": "chan-sip"})
+
+    store = Store()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = Runtime(L(), lambda v: T(), FakeVAD, store, http=http)
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com")
+    assert settings.twilio_account_sid == "" and settings.twilio_auth_token == "" and settings.twilio_number == ""
+    c = TestClient(create_app(store, rt, security.ConcurrencyLimiter(2), None, settings))
+    k, _tid = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    r = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15552223333", "channel": "sip",
+                                           "fromNumber": "+15559998888"}, headers=H(k))
+    assert r.status_code == 200, r.text
+    req = seen[-1]
+    url = str(req.url)
+    assert url.startswith("http://asterisk:8088/ari/channels") and "api.twilio.com" not in url
+    assert req.headers["authorization"] == "Basic " + base64.b64encode(b"ari:secret").decode()
+    q = {k_: v[0] for k_, v in parse_qs(urlparse(url).query).items()}
+    assert q["endpoint"] == "PJSIP/+15552223333@voxsun" and q["callerId"] == "+15559998888" and q["app"] == "vox"
+    call = store.get_call_any(r.json()["id"])
+    assert call["medium"] == "sip" and call["metadata"]["from"] == "+15559998888"
+
+
 def test_sip_amd_hangs_up_when_the_voicemail_cannot_be_spoken(monkeypatch):
     monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
     c, store, rt = make_outbound(lambda req: httpx.Response(200, json={"id": "chan-9"}), sip_token="s3cret")
@@ -1073,7 +1116,7 @@ def test_sip_machine_hangup_retries_unless_the_delete_finished(monkeypatch):
 
 
 def test_empty_answered_by_does_not_erase_machine_end(monkeypatch):
-    """An empty AnsweredBy must not clear machine_end, including one posted while originate is in flight.
+    """An empty or whitespace AnsweredBy must not clear machine_end, including one posted while originate is in flight.
     The originated channel is still deleted. A later non-empty value may replace the stored one."""
     monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
     monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
@@ -1095,6 +1138,11 @@ def test_empty_answered_by_does_not_erase_machine_end(monkeypatch):
                 first = await client.post(f"/sip/amd/{cid}", data={"AnsweredBy": "machine_end_beep"}, headers=headers)
                 app_box["first"] = (first.status_code, first.json())
                 app_box["n1"] = len(deleted)
+                spaces = await client.post(f"/sip/amd/{cid}", data={"AnsweredBy": "   "}, headers=headers)
+                app_box["spaces"] = (spaces.status_code, spaces.json())
+                spaces_json = await client.post(f"/sip/amd/{cid}", json={"AnsweredBy": "   "}, headers=headers)
+                app_box["spaces_json"] = (spaces_json.status_code, spaces_json.json())
+                app_box["n_spaces"] = len(deleted)
                 second = await client.post(
                     f"/sip/amd/{cid}", content=b"not-json",
                     headers={**headers, "Content-Type": "application/json"})
@@ -1114,8 +1162,10 @@ def test_empty_answered_by_does_not_erase_machine_end(monkeypatch):
     cid = r.json()["id"]
     meta = store.get_call_any(cid)["metadata"]
     assert app_box["first"][0] == 200 and app_box["mid"] == "machine_end_beep"
-    assert app_box["second"] == (200, {"action": "none", "answeredBy": "machine_end_beep"})
-    assert app_box["n1"] == app_box["n2"]
+    kept_machine = {"action": "none", "answeredBy": "machine_end_beep"}
+    assert app_box["spaces"] == (200, kept_machine) and app_box["spaces_json"] == (200, kept_machine)
+    assert app_box["second"] == (200, kept_machine)
+    assert app_box["n1"] == app_box["n_spaces"] == app_box["n2"] and app_box["n1"] >= 1
     assert meta["answeredBy"] == "machine_end_beep" and meta.get("callSid")
     assert deleted and any(meta["callSid"] in url for url in deleted)
     token = {"X-Vox-Sip-Token": "s3cret"}
@@ -1139,7 +1189,12 @@ def test_empty_answered_by_does_not_erase_machine_end(monkeypatch):
     n2 = len(deleted)
     again = c.post(f"/sip/amd/{row['id']}", content=b"", headers={**token, "Content-Type": "application/json"})
     assert again.json() == {"action": "none", "answeredBy": "machine_end_beep"}
+    form_spaces = c.post(f"/sip/amd/{row['id']}", data={"AnsweredBy": "   "}, headers=token)
+    json_spaces = c.post(f"/sip/amd/{row['id']}", json={"AnsweredBy": "   "}, headers=token)
+    assert form_spaces.json() == {"action": "none", "answeredBy": "machine_end_beep"}
+    assert json_spaces.json() == {"action": "none", "answeredBy": "machine_end_beep"}
     assert store.get_call_any(row["id"])["metadata"]["answeredBy"] == "machine_end_beep"
+    assert any(url.endswith("/ari/channels/chan-z") for url in deleted)
     assert len(deleted) == n2
 
 

@@ -248,8 +248,9 @@ async def test_sip_transfer_stores_the_target_instead_of_a_409_redirect(monkeypa
     monkeypatch.setenv("ASTERISK_ARI_URL", "http://asterisk:8088")
     monkeypatch.setenv("ASTERISK_ARI_USER", "ari")
     monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "pw")
-    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACx")
-    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "t")
+    # A SIP transfer uses the dialplan, not Twilio. Requiring those credentials must fail this test.
+    monkeypatch.delenv("TWILIO_ACCOUNT_SID", raising=False)
+    monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     store = Store()
     rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store, http=http, public_url="https://vox.example.com")
@@ -288,7 +289,10 @@ async def test_sip_transfer_stores_the_target_instead_of_a_409_redirect(monkeypa
     sess = rt.build_session(row, Phone())
     result = await sess.tools["transfer"]({"to": "billing"})
     assert isinstance(result, ToolResult) and result.content == {"transferring": "billing"}
-    assert seen == []
+    assert seen == [] and ended == []
+    # The number is stored before the deferred hangup. A write that lives only in after() is too late:
+    # the model has already been told the transfer started, and the dialplan would GET nothing.
+    assert store.get_call_any(row["id"])["metadata"]["transferTo"] == "+15551230001"
     sess.on_event = events.append
     await sess._run_action(result)
     assert ended == ["end"] and seen == []
@@ -305,6 +309,19 @@ async def test_sip_transfer_stores_the_target_instead_of_a_409_redirect(monkeypa
     assert "GotoIf($[${LEN(${VOX_XFER})} < 8]?done)" in after
     assert "Dial(PJSIP/${VOX_XFER})" in after and "@voxsun" not in after and "/redirect" not in after
     assert "n(done),Hangup()" in after
+    # CURLOPT(httpheader) is cumulative and stays set across AudioSocket. Both CURLs must send the token.
+    # A header that is missing, moved after a CURL, or cleared before the transfer GET fails closed (403).
+    token_line = "Set(CURLOPT(httpheader)=X-Vox-Sip-Token: ${ENV(VOX_SIP_TOKEN)})"
+    type_line = "Set(CURLOPT(httpheader)=Content-Type: application/x-www-form-urlencoded)"
+    assert token_line in dialplan and type_line in dialplan
+    i_token, i_type = dialplan.index(token_line), dialplan.index(type_line)
+    i_bind = dialplan.index("CURL(http://api1:8080/sip/bind,")
+    i_audio = dialplan.index("AudioSocket(")
+    i_xfer = dialplan.index("/sip/transfer?uuid=${AS_UUID}")
+    assert max(i_token, i_type) < i_bind < i_audio < i_xfer
+    assert dialplan[min(i_token, i_type):i_xfer].count("CURLOPT(httpheader)") == 2
+    tools = (Path(__file__).resolve().parents[2] / "docs/TOOLS.md").read_text()
+    assert "A SIP transfer needs `ASTERISK_ARI_URL` and does not need `TWILIO_ACCOUNT_SID` or `TWILIO_AUTH_TOKEN`." in tools
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

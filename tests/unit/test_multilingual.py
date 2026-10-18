@@ -115,3 +115,6 @@ def test_agent_language_is_added_to_the_system_prompt():
     sess2 = rt.build_session(call2, T())
     assert "Spanish" not in sess2.history[0]["content"]
     assert sess2.cfg.error_phrase == ERROR_PHRASE["en"]
+    call3 = store.create_call(tid, None, "webSocket", {"systemPrompt": "Be brief.", "language": "de"}, {})
+    sess3 = rt.build_session(call3, T())
+    assert sess3.cfg.error_phrase == ERROR_PHRASE["en"]

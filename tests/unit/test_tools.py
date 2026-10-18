@@ -245,8 +245,11 @@ async def test_confirmation_in_a_later_turn_with_same_details_runs_it_once():
     assert ctx.audit_log == [("tool.confirmed", {"name": "book_slot",
                                                  "args": {"day": "tuesday", "time": "11:00"},
                                                  "transcript": "yes, that's right"})]
-    again = await run({"day": "tuesday", "time": "11:00", "confirmed": True})
-    assert again["executed"] is False and len(ctx.audit_log) == 1            # one confirmation = one action
+    ctx.turn = 2                                                              # next caller turn, still a plain yes
+    ctx.last_user_text = lambda: "yes"
+    later = await run({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert "booked" not in later and later["executed"] is False               # one confirmation is not a second action
+    assert len(ctx.audit_log) == 1
 
 
 async def test_failed_audit_returns_the_tool_result_and_does_not_repeat_it():
@@ -279,8 +282,11 @@ async def test_failed_audit_returns_the_tool_result_and_does_not_repeat_it():
     assert out == {"booked": True, "day": "tuesday", "time": "11:00"}
     assert calls == [{"day": "tuesday", "time": "11:00"}]                     # ran even though the audit insert failed
     assert ctx.audit_log == []
-    again = await run({"day": "tuesday", "time": "11:00", "confirmed": True})
-    assert again["executed"] is False and calls == [{"day": "tuesday", "time": "11:00"}]
+    ctx.turn = 2                                                              # first call after success is a later turn
+    ctx.last_user_text = lambda: "yes"
+    later = await run({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert calls == [{"day": "tuesday", "time": "11:00"}] and later["executed"] is False
+    assert ctx.audit_log == []                                                # the failed insert is still the only attempt
 
 
 async def test_raising_tool_writes_no_audit_and_same_turn_retry_runs():
@@ -451,8 +457,10 @@ async def test_closed_store_audit_still_returns_the_booking_once():
     store.close()
     out = await fn({"day": "tuesday", "time": "11:00", "confirmed": True})
     assert out == {"booked": True, "day": "tuesday", "time": "11:00"}
-    again = await fn({"day": "tuesday", "time": "11:00", "confirmed": True})
-    assert again["executed"] is False and "booked" not in again
+    sess.stats["turns"] = 2
+    sess.history.append({"role": "user", "content": "yes"})
+    later = await fn({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert "booked" not in later and later["executed"] is False               # a second book_slot would set booked false
 
 
 def test_tool_options_validate():

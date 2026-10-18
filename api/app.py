@@ -21,6 +21,7 @@ from core.tts import DEFAULT_VOICE, LANG_NAME, VOICES
 from transports.browser import BrowserTransport
 from transports.twilio import TwilioTransport
 from . import security, tools as toolmod
+from . import experiments as expmod
 from . import openapi_import, retention, variables as varmod
 from .runtime import Runtime
 from .store import ROLES, Store, new_id, normalize_e164
@@ -69,6 +70,7 @@ class AgentIn(BaseModel):
     tools: list[Union[str, dict[str, Any]]] = Field(default_factory=list)
     speed: float = Field(1.0, ge=0.7, le=1.3)
     record: bool = False                            # stereo recording of calls; you need the caller's consent
+    experiment: Optional[dict[str, Any]] = None     # optional A/B: {id, variants:[{id, weight, voice?, systemPrompt?, model?}]}
 
 
 class AgentPatch(BaseModel):
@@ -81,6 +83,7 @@ class AgentPatch(BaseModel):
     tools: Optional[list[Union[str, dict[str, Any]]]] = None
     speed: Optional[float] = Field(None, ge=0.7, le=1.3)
     record: Optional[bool] = None
+    experiment: Optional[dict[str, Any]] = None
 
 
 class NumberIn(BaseModel):
@@ -302,6 +305,22 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             out["warnings"] = warnings
         return out
 
+    def check_variant_voices(experiment, language) -> None:
+        """Every variant voice must pass the same voice/language check as the agent voice."""
+        if not isinstance(experiment, dict):
+            return
+        for variant in experiment.get("variants") or []:
+            if isinstance(variant, dict) and variant.get("voice"):
+                check_voice(variant["voice"], language)
+
+    def check_experiment(experiment: dict, language=None) -> dict:
+        try:
+            cleaned = expmod.validate_experiment(experiment)
+        except expmod.ExperimentError as e:
+            raise HTTPException(422, str(e)) from e
+        check_variant_voices(cleaned, language)
+        return cleaned
+
     def check_voice(voice, language=None) -> None:
         if voice is not None and voice not in VOICES:
             raise HTTPException(422, f"unknown voice {voice!r}; see GET /v1/voices")
@@ -317,18 +336,28 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     def call_variables(cfg: dict, supplied, *, strict: bool) -> dict:
         """Validated call-supplied variables. With strict=True (an API-created call) a placeholder that nothing fills is
-        a 422, so a typo never reaches a live conversation."""
+        a 422, so a typo never reaches a live conversation. Every variant system prompt counts, not only the agent prompt."""
         try:
             given = varmod.validate(supplied)
             varmod.validate(cfg.get("variables") or {})
         except varmod.VariableError as e:
             raise HTTPException(422, str(e)) from e
         if strict:
-            gone = varmod.missing([cfg.get("systemPrompt", ""), cfg.get("greeting", "")], {**(cfg.get("variables") or {}), **given})
+            texts = [cfg.get("systemPrompt", ""), cfg.get("greeting", "")]
+            exp = cfg.get("experiment")
+            if isinstance(exp, dict):
+                for variant in exp.get("variants") or []:
+                    if isinstance(variant, dict) and isinstance(variant.get("systemPrompt"), str):
+                        texts.append(variant["systemPrompt"])
+            gone = varmod.missing(texts, {**(cfg.get("variables") or {}), **given})
             if gone:
-                raise HTTPException(422, f"the agent's prompt or greeting uses {{{{{gone[0]}}}}} (and {len(gone) - 1} more) "
-                                         f"but no value was given: missing {gone}")
+                raise HTTPException(422, f"the agent's prompt, greeting, or a variant uses {{{{{gone[0]}}}}} "
+                                         f"(and {len(gone) - 1} more) but no value was given: missing {gone}")
         return given
+
+    def caller_metadata(raw: dict) -> dict:
+        """experiment, variant, and promptSuffix are server writes. A caller cannot pin a bucket or extend the prompt."""
+        return {k: v for k, v in raw.items() if k not in ("experiment", "variant", "promptSuffix")}
 
     def pick_voice(cur_voice, cur_lang, new_voice, new_lang, voice_given: bool):
         """Effective (voice, language) after a change. Setting only a language switches to that language's default voice."""
@@ -462,8 +491,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     async def create_agent(body: AgentIn, t: dict = Depends(tenant_write)):
         check_tools(body.tools, t["id"])
         cfg0 = body.model_dump(exclude={"name"})
+        exp = cfg0.pop("experiment", None)
         cfg0["voice"], cfg0["language"] = pick_voice("af_heart", None, body.voice, body.language, "voice" in body.model_fields_set)
         check_voice(cfg0["voice"], cfg0["language"])
+        if exp is not None:
+            cfg0["experiment"] = check_experiment(exp, cfg0["language"])
         call_variables(cfg0, None, strict=False)
         a = store.create_agent(t["id"], body.name, cfg0)
         log(t, "agent.create", a["id"], name=body.name)
@@ -487,6 +519,15 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             if v is not None:
                 cfg[k] = v
                 changed.append(k)
+        if "experiment" in body.model_fields_set:
+            if body.experiment is None:
+                cfg.pop("experiment", None)
+            else:
+                cfg["experiment"] = check_experiment(body.experiment, eff_lang)
+            changed.append("experiment")
+        else:
+            # A language-only patch does not resend the experiment; variant voices still have to speak it.
+            check_variant_voices(cfg.get("experiment"), eff_lang)
         call_variables(cfg, None, strict=False)
         if eff_voice != cfg.get("voice"):
             cfg["voice"] = eff_voice
@@ -537,6 +578,29 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     async def list_numbers(t: dict = Depends(tenant)):
         return [{"e164": r["e164"], "agentId": r["agent_id"]} for r in store.list_numbers(t["id"])]
 
+    @app.get("/v1/experiments/{experiment_id}")
+    async def experiment_report(experiment_id: str, t: dict = Depends(tenant)):
+        """Per-variant call counts for this tenant. First-audio means need stored timings, which this build does not keep."""
+        counts: dict[str, int] = {}
+        known = False
+        for agent in store.list_agents(t["id"]):
+            exp = (agent.get("config") or {}).get("experiment") or {}
+            if isinstance(exp, dict) and exp.get("id") == experiment_id:
+                known = True
+                for variant in exp.get("variants") or []:
+                    if isinstance(variant, dict) and variant.get("id"):
+                        counts.setdefault(str(variant["id"]), 0)
+        for call in store.list_calls(t["id"], 1000):
+            meta = call.get("metadata") or {}
+            if not isinstance(meta, dict) or meta.get("experiment") != experiment_id:
+                continue
+            known = True
+            vid = str(meta.get("variant") or "")
+            counts[vid] = counts.get(vid, 0) + 1
+        if not known:
+            raise HTTPException(404, "experiment not found")
+        return {"id": experiment_id, "variants": [{"id": vid, "calls": counts[vid]} for vid in sorted(counts)]}
+
     # ------------------------------------------------------------- calls
     @app.post("/v1/calls")
     async def create_call(body: CallIn, t: dict = Depends(tenant_write)):
@@ -556,8 +620,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         base["voice"], base["language"] = pick_voice(base.get("voice", "af_heart"), base.get("language"), body.voice,
                                                       body.language, "voice" in body.model_fields_set)
         check_voice(base["voice"], base["language"])
-        call = store.create_call(t["id"], body.agentId, "webSocket", base,
-                                 {**body.metadata, **({"variables": given_vars} if given_vars else {})})
+        meta = caller_metadata(body.metadata)
+        if given_vars:
+            meta["variables"] = given_vars
+        call = store.create_call(t["id"], body.agentId, "webSocket", base, meta)
         return public_call(call, with_join=True)
 
     @app.get("/v1/calls")
@@ -1278,7 +1344,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if body.record is not None:
             cfg["record"] = body.record
         given_vars = call_variables(cfg, body.variables, strict=True)
-        meta = {**body.metadata, "direction": "outbound", "from": caller_id, "to": body.to}
+        meta = caller_metadata(body.metadata)
+        meta["direction"] = "outbound"
+        meta["from"] = caller_id
+        meta["to"] = body.to
         if given_vars:
             meta["variables"] = given_vars
         if body.voicemailMessage:
@@ -1395,10 +1464,18 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if decision != "ok":
             return Response(busy_twiml(), media_type="text/xml")   # no new row while this process is full
         who = re.sub(r"[^\w -]", "", to)[:40] or "that person"
+        # A variant system prompt replaces cfg["systemPrompt"] in build_session, so the notes are also stored as
+        # promptSuffix. Append to a suffix only when it is already the tail of this prompt; anything else was not
+        # written by a previous failed transfer and must not be carried onto the next call.
+        note = f"\nThe caller asked to be transferred to {who}, who did not answer. Offer to help or to take a message."
         cfg = dict(call["config"])
         cfg["greeting"] = f"Sorry, {who} is not available right now. Is there anything else I can help you with?"
-        cfg["systemPrompt"] = (cfg.get("systemPrompt") or "") + f"\nThe caller asked to be transferred to {who}, who did not answer. Offer to help or to take a message."
-        meta = {**call["metadata"], "resumedFrom": call_id}
+        base_prompt = cfg.get("systemPrompt") or ""
+        prev = call["metadata"].get("promptSuffix") if isinstance(call.get("metadata"), dict) else None
+        if not (isinstance(base_prompt, str) and isinstance(prev, str) and prev and base_prompt.endswith(prev)):
+            prev = ""
+        cfg["systemPrompt"] = base_prompt + note
+        meta = {**call["metadata"], "resumedFrom": call_id, "promptSuffix": prev + note}
         resumed = create_reserved(cid, call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
         resumed_sid = str(form.get("CallSid", "") or (resumed["metadata"] or {}).get("callSid") or "")
         if not await bind_status_callback(resumed["id"], resumed_sid):

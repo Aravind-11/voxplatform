@@ -13,6 +13,7 @@ from core.recorder import CallRecorder, write_wav16
 from core.session import Session, SessionConfig
 from core.turn import TurnConfig
 from . import tools as toolmod
+from .experiments import VariantLLM, choose_variant
 from .store import Store
 
 
@@ -34,8 +35,8 @@ class LimitedTTS:
             yield p
 
 
-def _count(e: dict) -> None:
-    """Session events -> Prometheus metrics."""
+def _count(e: dict, variant: str = "") -> None:
+    """Session events -> Prometheus metrics. `variant` labels turns only; other series stay unlabeled."""
     t = e["type"]
     if t == "agent_first_audio":
         METRICS.observe("vox_first_audio_ms", e["latency_ms"])
@@ -50,7 +51,11 @@ def _count(e: dict) -> None:
     elif t == "user_interrupted":
         METRICS.inc("vox_interruptions_total")
     elif t == "user_end_of_turn":
-        METRICS.inc("vox_turns_total")
+        # The label is one sample in the shared scrape. A line break would render as a second sample.
+        if variant and "\n" not in variant and "\r" not in variant:
+            METRICS.inc("vox_turns_total", variant=variant)
+        else:
+            METRICS.inc("vox_turns_total")
     elif t == "error":
         METRICS.inc("vox_errors_total", where=str(e.get("where", "")))
 
@@ -118,6 +123,52 @@ class Runtime:
             out += self.store.messages(cid)
         return out[-keep:]
 
+    def _assigned_variant(self, call: dict, experiment: dict) -> dict:
+        """Variant for this call.
+
+        A resume or a failed transfer is a new call row. Walk `resumedFrom` (same tenant, at most 4 rows, the same
+        cap as `_earlier_messages`) and bucket off that root id so the conversation keeps one variant. Reuse an
+        ancestor's recorded variant id only when it still belongs to this experiment. This call's own metadata
+        `variant` is not an assignment.
+        """
+        variants = [v for v in (experiment.get("variants") or []) if isinstance(v, dict)]
+        by_id = {v.get("id"): v for v in variants if isinstance(v.get("id"), str)}
+        chain: list[dict] = []
+        seen: set[str] = set()
+        cur_id = str(call.get("id") or "")
+        tid = call.get("tenant_id")
+        pending: Optional[dict] = call
+        while cur_id and cur_id not in seen and len(chain) < 4:
+            seen.add(cur_id)
+            if pending is not None and str(pending.get("id") or "") == cur_id:
+                row = pending
+            else:
+                row = self.store.get_call_any(cur_id)
+            pending = None
+            if not row or row.get("tenant_id") != tid:
+                break
+            chain.append(row)
+            raw = row.get("metadata") or {}
+            if isinstance(raw, str):
+                raw = json.loads(raw or "{}")
+            nxt = raw.get("resumedFrom") if isinstance(raw, dict) else None
+            if not isinstance(nxt, str) or not nxt:
+                break
+            cur_id = nxt
+        for row in chain[1:]:
+            raw = row.get("metadata") or {}
+            if isinstance(raw, str):
+                raw = json.loads(raw or "{}")
+            if not isinstance(raw, dict):
+                continue
+            vid = raw.get("variant")
+            # Own metadata.variant is ignored above. An ancestor's recorded id counts only while this experiment
+            # still has that id. Caller creates do not get to write it; build_session does.
+            if isinstance(vid, str) and vid in by_id:
+                return dict(by_id[vid])
+        root_id = str(chain[-1]["id"]) if chain else str(call.get("id") or "")
+        return choose_variant(experiment, root_id)
+
     @staticmethod
     def _eot_mode() -> str:
         return os.environ.get("VOX_EOT", "")
@@ -141,6 +192,19 @@ class Runtime:
         if isinstance(meta, str):
             import json
             meta = json.loads(meta or "{}")
+        variant = None
+        experiment = cfg.get("experiment")
+        if isinstance(experiment, dict) and experiment.get("variants"):
+            variant = self._assigned_variant(call, experiment)
+            # The call dict can be older than the row: SIP writes the channel id after this object was loaded.
+            stored = (self.store.get_call_any(call["id"]) or {}).get("metadata") or {}
+            if isinstance(stored, str):
+                stored = json.loads(stored or "{}")
+            if not isinstance(stored, dict):
+                stored = {}
+            meta = {**stored, **meta, "experiment": experiment.get("id"), "variant": variant.get("id")}
+            call["metadata"] = meta
+            self.store.update_call(call["id"], metadata=meta)
         sid, token = os.environ.get("TWILIO_ACCOUNT_SID", ""), os.environ.get("TWILIO_AUTH_TOKEN", "")
         ctx = toolmod.CallContext(call_id=call["id"], caller=str(meta.get("from", "")), callee=str(meta.get("to", "")),
                                   call_sid=getattr(transport, "call_sid", "") or str(meta.get("callSid", "")),
@@ -173,7 +237,19 @@ class Runtime:
         values = {**{k: str(v) for k, v in (cfg.get("variables") or {}).items()},
                   **{k: str(v) for k, v in (meta.get("variables") or {}).items()},
                   "caller": str(meta.get("from", "")), "callee": str(meta.get("to", "")), "callId": call["id"]}
-        prompt = varmod.render(cfg.get("systemPrompt") or SessionConfig.system_prompt, values)
+        prompt_src = cfg.get("systemPrompt") or SessionConfig.system_prompt
+        variant_prompt = str(variant.get("systemPrompt") or "").strip() if variant else ""
+        configured = cfg.get("systemPrompt") if isinstance(cfg.get("systemPrompt"), str) else ""
+        if variant_prompt:
+            prompt_src = str(variant["systemPrompt"])   # non-empty variant prompt replaces the agent prompt
+        prompt = varmod.render(prompt_src, values)
+        # The failed-transfer addendum lives on cfg["systemPrompt"] and metadata promptSuffix. Append that suffix
+        # only when a variant prompt replaced the configured prompt and the configured prompt already ends with it.
+        # A voice-only variant already has the notes inline; a client suffix that is not that tail is not a note.
+        if variant_prompt:
+            suffix = meta.get("promptSuffix") if isinstance(meta, dict) else None
+            if isinstance(suffix, str) and suffix.strip() and configured.endswith(suffix):
+                prompt += varmod.render(suffix, values)
         resumed = bool(meta.get("resumedFrom"))
         from core.tts import LANG_NAME
         if cfg.get("language") in LANG_NAME:
@@ -191,10 +267,12 @@ class Runtime:
                                              patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000"))))
         store, cid = self.store, call["id"]
 
+        variant_id = str(variant["id"]) if variant else ""
+
         def on_event(e: dict) -> None:
             if os.environ.get('VOX_LOG_EVENTS'):
                 print('EV', cid, e, flush=True)
-            _count(e)
+            _count(e, variant_id)
             if e["type"] == "user_transcript":
                 store.add_message(cid, "user", e["text"], time.time())
             elif e["type"] == "agent_speech":
@@ -203,16 +281,26 @@ class Runtime:
                 import asyncio
                 asyncio.get_running_loop().create_task(transport.send_event(e))
 
-        tts = self.make_tts(cfg.get("voice", "af_heart"))
+        voice = cfg.get("voice", "af_heart")
+        if variant and variant.get("voice"):
+            voice = variant["voice"]
+        tts = self.make_tts(voice)
         if hasattr(tts, "speed"):
             tts.speed = float(cfg.get("speed", 1.0))
         lim = int(os.environ.get("VOX_TTS_CONCURRENCY", "4"))
         if lim > 0:
             tts = LimitedTTS(tts, lim)
-        sess = Session(llm=self.llm, tts=tts, vad=self.make_vad(),
+        llm = self.llm
+        model_name = str(variant.get("model") or "").strip() if variant else ""
+        if model_name and hasattr(self.llm, "model"):
+            llm = VariantLLM(self.llm, model_name)
+        eot_async = self._eot_async()
+        if llm is not self.llm and eot_async is not None:
+            eot_async = lambda audio, history, bound=llm: bound.eot_score(history, audio)
+        sess = Session(llm=llm, tts=tts, vad=self.make_vad(),
                        send_audio=transport.send_audio, clear_audio=transport.clear, clock=self.clock,
                        cfg=scfg, tools=fns, on_event=on_event, eot_fn=self._eot_sync(),
-                       eot_async=self._eot_async(), recorder=recorder, on_utterance=on_utt)
+                       eot_async=eot_async, recorder=recorder, on_utterance=on_utt)
 
         async def voicemail(message: str) -> None:
             await sess.say_and_wait(message)

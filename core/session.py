@@ -187,16 +187,13 @@ class Session:
         deadline = self.clock() + timeout_s * 1000.0
         await asyncio.wait({gen.tasks[-1]}, timeout=timeout_s)         # the drain task: every sentence sent
         # Until the first ack, buffered_ms follows the local clock and can hit zero while Twilio
-        # still has the audio. Voicemail hangs up when this returns, so pending marks hold it
-        # open until they are acked or mark_timeout_ms after the clock estimate.
-        mark_deadline = self.tracker.ends_at() + self.cfg.mark_timeout_ms
+        # still has the audio. Voicemail hangs up when this returns. The give-up is re-read each
+        # pass: ends_at moves when more audio is armed while this sleeps.
         while not gen.cancelled and self.clock() < deadline:
-            if self.tracker.pending_marks:
-                if self.clock() >= mark_deadline:
-                    break
-            elif self.tracker.buffered_ms() <= 0:
-                break
-            await asyncio.sleep(0.05)
+            if self._playback_blocking():
+                await asyncio.sleep(0.05)
+                continue
+            break
 
     def seed_history(self, messages: list[dict]) -> None:
         """Restores earlier turns ({"role": "user"|"agent", "text"}) before the call starts, so a call that was
@@ -433,16 +430,24 @@ class Session:
         except Exception as e:  # noqa: BLE001
             self._emit("error", where="call_action", error=repr(e))
 
+    def _playback_blocking(self) -> bool:
+        """True while a hang-up or say_and_wait should keep holding.
+
+        Armed marks, and a send that raised (bytes may already be buffered, with no echo coming),
+        hold until mark_timeout_ms after the live clock estimate. ends_at moves when more audio
+        is armed, so this is read on every pass of the wait.
+        """
+        now = self.clock()
+        if self.tracker.pending_marks or self.tracker._unconfirmed:
+            return now < self.tracker.ends_at() + self.cfg.mark_timeout_ms
+        return self.tracker.buffered_ms() > 0
+
     async def _finish_action(self, gen: _Generation) -> None:
         hard = self.clock() + 30000.0
         # Marks lag the local clock (Twilio jitter). Wait until every armed mark is acked, but not
         # forever: a lost mark must not keep the goodbye from hanging up.
-        mark_deadline = self.tracker.ends_at() + self.cfg.mark_timeout_ms
         while self.clock() < hard:
-            if self.tracker.pending_marks:
-                if self.clock() >= mark_deadline:
-                    break
-            elif self.tracker.buffered_ms() <= 0:
+            if not self._playback_blocking():
                 break
             await asyncio.sleep(0.05)
         a, gen.after = gen.after, None      # taken only now: a barge-in during the wait still sees it
@@ -476,13 +481,25 @@ class Session:
                 gen.first_audio_sent = True
                 self._emit("agent_first_audio",
                            latency_ms=self.clock() - gen.speech_end_clock)
-            mark = await self.send_audio(pcm, self.cfg.out_rate)
-            if self.recorder is not None:
+            failed = False
+            try:
+                mark = await self.send_audio(pcm, self.cfg.out_rate)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # Frames may already be queued (Twilio writes media, then the mark). Keep the
+                # chunk on the clock so lookahead cannot spin and the hang-up still covers it.
+                self._emit("error", where="send_audio", error=repr(e))
+                mark = None
+                failed = True
+            if self.recorder is not None and not failed:
                 self.recorder.agent(pcm, self.cfg.out_rate)
             dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
             self.tracker.on_sent(text, dur)
             if isinstance(mark, str) and mark:
                 self.tracker.arm_mark(mark)
+            if failed:
+                self.tracker._unconfirmed = True
             gen.pending_ms -= dur
             gen.spoken.append(text)
             self._emit("agent_speech", text=text)

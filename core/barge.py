@@ -9,8 +9,9 @@ interruption we can then work out which chunks finished playing and how far into
 current chunk playback got. A transport that echoes playback marks (Twilio `mark`) corrects
 that estimate: until the first mark of this playback returns, the clock still applies; after
 it, a chunk counts as heard only when its mark was acked. A missing mark stops blocking the
-call `mark_timeout_ms` after the clock estimate. Chunks from a playback that has finished are
-not part of the next one.
+call `mark_timeout_ms` after the clock estimate. A send that raises is the same window: the
+bytes may already be in the transport buffer and no echo is coming. Chunks from a playback
+that has finished are not part of the next one.
 """
 from __future__ import annotations
 
@@ -36,6 +37,7 @@ class PlaybackTracker:
     acked_through: int = -1             # highest acked chunk index; -1 until the first ack
     acked_ms: float = 0.0               # end time (clock domain) of the furthest acked chunk
     _acked: set[int] = field(default_factory=set)
+    _unconfirmed: bool = False          # send raised; audio may be buffered with no mark to ack
 
     def on_sent(self, text: str, dur_ms: float) -> None:
         now = self.clock() + self.output_latency_ms
@@ -83,6 +85,9 @@ class PlaybackTracker:
         return max(0.0, self._free_at - self.clock())
 
     def is_playing(self) -> bool:
+        # A failed send has no mark, but the bytes may still be playing out past the clock estimate.
+        if self._unconfirmed and self.clock() < self.ends_at() + self.mark_timeout_ms:
+            return True
         if self.pending_marks or self._acked:
             return self._blocking_on_marks()
         return bool(self._chunks) and self.clock() < self._free_at
@@ -94,6 +99,7 @@ class PlaybackTracker:
         self._acked.clear()
         self.acked_through = -1
         self.acked_ms = 0.0
+        self._unconfirmed = False
 
     def heard(self) -> tuple[str, bool]:
         """Return (text the caller heard so far, whether the last chunk was cut mid-way)."""

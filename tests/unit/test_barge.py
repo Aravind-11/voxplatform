@@ -399,6 +399,126 @@ async def test_later_turn_barge_in_hears_only_that_turn_until_its_own_mark():
     assert r.s.history[-1]["content"] == expect + " [interrupted]"
 
 
+async def test_hangup_deadline_follows_audio_armed_while_waiting():
+    """A goodbye already inside _finish_action must not keep the deadline it snapshotted.
+
+    say() while that wait sleeps appends another chunk (playback is still in progress, so the
+    tracker is not reset). Hanging up at the pre-say ends_at cuts audio Twilio has not acked.
+    """
+    ended = []
+
+    async def hang(args):
+        async def after():
+            ended.append(1)
+        return ToolResult({"ok": True}, after=after, strict=True)
+
+    llm = FakeLLM([["Goodbye now. ", ToolCall("h", "hang", {})]])
+    r = Rig(llm, tts=FakeTTS(word_ms=400), tools={"hang": hang},
+            cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500, max_tool_rounds=0))
+    _mark_sending(r)
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    assert r.s._gen.produce_done and r.s._gen.after is not None and ended == []
+    assert set(r.s.tracker.pending_marks) == {"m1"}
+    base = r.s.tracker.ends_at()
+    r.s.say("one two three four five six seven eight nine ten.")
+    await r.settle()
+    assert set(r.s.tracker.pending_marks) == {"m1", "m2"}
+    assert r.s.tracker.ends_at() > base and r.s.tracker.is_playing()
+    r.clk.t = base + r.s.cfg.mark_timeout_ms
+    await asyncio.sleep(0.3)
+    assert ended == [] and "m2" in r.s.tracker.pending_marks and r.s.tracker.is_playing()
+    r.clk.t = r.s.tracker.ends_at() + r.s.cfg.mark_timeout_ms
+    await asyncio.sleep(0.3)
+    assert ended == [1]
+
+
+async def test_say_and_wait_deadline_follows_audio_armed_while_waiting():
+    """Overlapping say_and_wait must not return on a deadline taken before a held sentence is sent."""
+    r = Rig(FakeLLM([["x."]]), tts=FakeTTS(word_ms=200),
+            cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500, tts_lookahead_ms=500))
+    _mark_sending(r)
+    r.s.say("Hello there friend. How can I help you today?")
+    await r.settle()
+    assert r.tts.texts == ["Hello there friend."] and set(r.s.tracker.pending_marks) == {"m1"}
+    task = asyncio.create_task(r.s.say_and_wait("Short voicemail."))
+    await r.settle()
+    assert r.tts.texts == ["Hello there friend.", "Short voicemail."]
+    assert set(r.s.tracker.pending_marks) == {"m1", "m2"} and not task.done()
+    base = r.s.tracker.ends_at()
+    # Buffered audio has fallen to the lookahead, so the greeting's second sentence is armed.
+    r.clk.t = base - r.s.cfg.tts_lookahead_ms
+    await asyncio.sleep(0.3)
+    assert r.tts.texts == ["Hello there friend.", "Short voicemail.", "How can I help you today?"]
+    assert set(r.s.tracker.pending_marks) == {"m1", "m2", "m3"}
+    assert r.s.tracker.ends_at() > base and not task.done()
+    r.clk.t = base + r.s.cfg.mark_timeout_ms
+    await asyncio.sleep(0.3)
+    assert not task.done() and r.s.tracker.is_playing()
+    assert set(r.s.tracker.pending_marks) == {"m1", "m2", "m3"}
+    r.clk.t = r.s.tracker.ends_at() + r.s.cfg.mark_timeout_ms
+    await asyncio.sleep(0.3)
+    assert task.done() and task.exception() is None
+
+
+async def test_send_failure_tracks_the_chunk_and_still_runs_the_hangup():
+    """send_audio raising must not leave pending_ms stuck above lookahead or drop a strict hang-up.
+
+    The failed chunk is still tracked (clock fallback: no mark came back). A later sentence is
+    sent once that buffer drains, and the action runs only after the unconfirmed playback window
+    — not while the first send is still ahead of the clock, and not never.
+    """
+    ended = []
+
+    async def hang(args):
+        async def after():
+            ended.append(1)
+        return ToolResult({"ok": True}, after=after, strict=True)
+
+    sends = {"n": 0}
+    llm = FakeLLM([[
+        "Goodbye now friend. ",
+        "Please wait a little longer now. ",
+        ToolCall("h", "hang", {}),
+    ]])
+    r = Rig(llm, tts=FakeTTS(word_ms=800), tools={"hang": hang},
+            cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500, tts_lookahead_ms=1500,
+                              max_tool_rounds=0))
+
+    async def send(pcm, rate):
+        sends["n"] += 1
+        if sends["n"] == 1:
+            raise RuntimeError("socket closed")
+        r.sent.append((r.clk.t, len(pcm), rate))
+        return None
+
+    r.s.send_audio = send
+    await r.frames("s", 15)
+    await r.frames("q", 22)
+    await r.settle()
+    gen = r.s._gen
+    assert any(e["type"] == "error" and e["where"] == "send_audio" for e in r.events)
+    assert gen.pending_ms <= r.s.cfg.tts_lookahead_ms
+    assert [c.text for c in r.s.tracker._chunks] == ["Goodbye now friend."]
+    assert r.tts.texts == ["Goodbye now friend."]
+    assert ended == [] and gen.after is not None and not gen.produce_done
+    assert not gen.tasks[-1].done()
+    r.clk.t = r.s.tracker.ends_at() - r.s.cfg.tts_lookahead_ms
+    await asyncio.sleep(0.3)
+    assert r.tts.texts == ["Goodbye now friend.", "Please wait a little longer now."]
+    assert gen.pending_ms <= r.s.cfg.tts_lookahead_ms and ended == []
+    # Past the clock estimate, still inside the cushion for audio that may already be buffered.
+    r.clk.t = r.s.tracker.ends_at() + 1
+    await asyncio.sleep(0.3)
+    assert ended == [] and r.s.tracker.is_playing()
+    r.clk.t = r.s.tracker.ends_at() + r.s.cfg.mark_timeout_ms
+    await asyncio.sleep(0.3)
+    assert ended == [1]
+    drain = gen.tasks[-1]
+    assert drain.done() and not drain.cancelled() and drain.exception() is None
+
+
 async def test_say_and_inject_drop_a_finished_playback_before_their_own_audio():
     r = Rig(FakeLLM([["One two three four five."]]), tts=FakeTTS(word_ms=200),
             cfg=SessionConfig(tts_poll_s=0))

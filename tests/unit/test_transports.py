@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 
 from core.audio import mulaw_to_pcm16, pcm16_to_mulaw
+from core.session import Session, SessionConfig
 from core.tts import KokoroTTS
+from tests.unit.test_session import Clock, EnergyVAD, FakeLLM, FakeTTS
 from transports.browser import BrowserTransport
 from transports.twilio import TwilioTransport
 
@@ -117,6 +119,50 @@ async def test_twilio_rejects_non_8k_output():
     tr = TwilioTransport(FakeTwilioWS([]), None)
     with pytest.raises(AssertionError):
         await tr.send_audio(np.zeros(10, dtype=np.int16), 24000)
+
+
+class MarkFailWS:
+    """Accepts media frames, then raises when the playback mark is written."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_text(self, s):
+        obj = json.loads(s)
+        if obj.get("event") == "mark":
+            raise RuntimeError("mark failed")
+        self.sent.append(obj["event"])
+
+    async def close(self):
+        return None
+
+
+async def test_failed_mark_write_holds_say_and_wait_until_the_mark_timeout():
+    """Media is already queued when the mark write raises. say_and_wait must not return on the
+    local clock: voicemail would hang up while that audio is still in Twilio's buffer."""
+    ws = MarkFailWS()
+    tr = TwilioTransport(ws, None)
+    tr.stream_sid = "MZ1"
+    clk = Clock()
+    events = []
+    sess = Session(llm=FakeLLM([["x."]]), tts=FakeTTS(word_ms=500), vad=EnergyVAD(),
+                   send_audio=tr.send_audio, clear_audio=tr.clear, clock=clk,
+                   on_event=events.append,
+                   cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500))
+    task = asyncio.create_task(sess.say_and_wait("Please call us back."))
+    for _ in range(400):
+        await asyncio.sleep(0)
+    assert ws.sent == ["media", "media"]
+    assert [c.text for c in sess.tracker._chunks] == ["Please call us back."]
+    assert sess.tracker.pending_marks == {}
+    assert any(e["type"] == "error" and e["where"] == "send_audio" for e in events)
+    assert not task.done()
+    clk.t = sess.tracker.ends_at() + 1
+    await asyncio.sleep(0.3)
+    assert not task.done() and sess.tracker.is_playing()
+    clk.t = sess.tracker.ends_at() + sess.cfg.mark_timeout_ms
+    await asyncio.sleep(0.3)
+    assert task.done() and task.exception() is None
 
 
 class FakeBrowserWS:

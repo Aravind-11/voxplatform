@@ -209,6 +209,10 @@ def test_dialplan_requests_slin16_on_the_audiosocket_channel():
     assert "Dial(AudioSocket/api1:9092/${UUID()}/c(slin16))" in code
     assert "AudioSocket(" not in code
     assert "audioreadformat" not in code
+    assert "Goto(_X.,1)" not in code
+    assert "Goto(${EXTEN:1},1)" in code
+    modules = open("deploy/sip/modules.conf", encoding="utf-8").read()
+    assert "load = chan_audiosocket.so" in modules
 
 
 def test_full_sip_call_through_the_app_creates_a_call_speaks_back_and_hangs_up():

@@ -1327,9 +1327,9 @@ async def test_inflight_speech_frame_drops_a_ready_eot_verdict():
 async def test_inflight_speech_frame_does_not_interrupt_inject_text():
     """Keypad text injected while a barge-in frame is scoring must not be barged by that frame.
 
-    The agent is already speaking, so the barge threshold is 192 ms. Five speech frames leave
-    run_ms at 160. The sixth is on the worker; inject_text during that score used to install the
-    digit turn and then lose it when the frame resumed and interrupted the new generation.
+    The agent is already speaking, so the backchannel gate is 450 ms. Fourteen speech frames
+    leave run_ms at 448. The fifteenth is on the worker; inject_text during that score used to
+    install the digit turn and then lose it when the frame resumed and interrupted the new generation.
     """
     llm = FakeLLM([["Got it."]])
     r, gate, pool = _scheduler_rig(llm, tts=FakeTTS(word_ms=400))
@@ -1337,8 +1337,8 @@ async def test_inflight_speech_frame_does_not_interrupt_inject_text():
     try:
         await r.s.say("Hello from the agent this is long.")
         await r.settle()
-        await r.frames("s", 5)              # 160 ms < 192 ms barge-in while the greeting still plays
-        assert r.s._agent_active() and r.s.turn._run_ms == 160 and not r.s.turn.in_turn
+        await r.frames("s", 14)             # 448 ms < 450 ms backchannel gate while the greeting still plays
+        assert r.s._agent_active() and r.s.turn._run_ms == 448 and not r.s.turn.in_turn
         assert "user_interrupted" not in r.types()
         gate.arm()
         feed_task = asyncio.create_task(r.s.feed(SPEECH))
@@ -1374,8 +1374,8 @@ async def test_inflight_speech_frame_does_not_interrupt_say():
     try:
         await r.s.say("Hello from the agent this is long.")
         await r.settle()
-        await r.frames("s", 5)
-        assert r.s._agent_active() and r.s.turn._run_ms == 160 and not r.s.turn.in_turn
+        await r.frames("s", 14)             # 448 ms < 450 ms backchannel gate while the greeting still plays
+        assert r.s._agent_active() and r.s.turn._run_ms == 448 and not r.s.turn.in_turn
         gate.arm()
         feed_task = asyncio.create_task(r.s.feed(SPEECH))
         await _wait_gate(gate)
@@ -1405,7 +1405,7 @@ async def test_say_and_wait_playback_stays_interruptible():
     task = asyncio.create_task(r.s.say_and_wait("Please call us back later today."))
     await r.settle()
     assert r.sent
-    await asyncio.wait_for(r.frames("s", 6), 2)   # 192 ms crosses the barge-in threshold while audio is queued
+    await asyncio.wait_for(r.frames("s", 16), 2)  # 512 ms crosses the 450 ms backchannel gate while audio is queued
     await r.settle()
     assert r.clears == 1 and r.s.stats["interruptions"] == 1
     await asyncio.wait_for(task, 2)

@@ -252,14 +252,20 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         except toolmod.ToolConfigError as e:
             raise HTTPException(422, str(e)) from e
 
-    def check_experiment(experiment: dict) -> dict:
+    def check_variant_voices(experiment, language) -> None:
+        """Every variant voice must pass the same voice/language check as the agent voice."""
+        if not isinstance(experiment, dict):
+            return
+        for variant in experiment.get("variants") or []:
+            if isinstance(variant, dict) and variant.get("voice"):
+                check_voice(variant["voice"], language)
+
+    def check_experiment(experiment: dict, language=None) -> dict:
         try:
             cleaned = expmod.validate_experiment(experiment)
         except expmod.ExperimentError as e:
             raise HTTPException(422, str(e)) from e
-        for variant in cleaned["variants"]:
-            if variant.get("voice"):
-                check_voice(variant["voice"])
+        check_variant_voices(cleaned, language)
         return cleaned
 
     def check_voice(voice, language=None) -> None:
@@ -404,10 +410,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         check_tools(body.tools, t["id"])
         cfg0 = body.model_dump(exclude={"name"})
         exp = cfg0.pop("experiment", None)
-        if exp is not None:
-            cfg0["experiment"] = check_experiment(exp)
         cfg0["voice"], cfg0["language"] = pick_voice("af_heart", None, body.voice, body.language, "voice" in body.model_fields_set)
         check_voice(cfg0["voice"], cfg0["language"])
+        if exp is not None:
+            cfg0["experiment"] = check_experiment(exp, cfg0["language"])
         call_variables(cfg0, None, strict=False)
         a = store.create_agent(t["id"], body.name, cfg0)
         log(t, "agent.create", a["id"], name=body.name)
@@ -435,8 +441,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             if body.experiment is None:
                 cfg.pop("experiment", None)
             else:
-                cfg["experiment"] = check_experiment(body.experiment)
+                cfg["experiment"] = check_experiment(body.experiment, eff_lang)
             changed.append("experiment")
+        else:
+            # A language-only patch does not resend the experiment; variant voices still have to speak it.
+            check_variant_voices(cfg.get("experiment"), eff_lang)
         call_variables(cfg, None, strict=False)
         if eff_voice != cfg.get("voice"):
             cfg["voice"] = eff_voice
@@ -1072,12 +1081,18 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if app.state.draining:
             return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we cannot take your call right now.</Say><Hangup/></Response>', media_type="text/xml")
         who = re.sub(r"[^\w -]", "", to)[:40] or "that person"
-        # Kept on metadata as well as the prompt: a variant system prompt replaces cfg["systemPrompt"] in build_session.
+        # A variant system prompt replaces cfg["systemPrompt"] in build_session, so the notes are also stored as
+        # promptSuffix. Append to a suffix only when it is already the tail of this prompt; anything else was not
+        # written by a previous failed transfer and must not be carried onto the next call.
         note = f"\nThe caller asked to be transferred to {who}, who did not answer. Offer to help or to take a message."
         cfg = dict(call["config"])
         cfg["greeting"] = f"Sorry, {who} is not available right now. Is there anything else I can help you with?"
-        cfg["systemPrompt"] = (cfg.get("systemPrompt") or "") + note
-        meta = {**call["metadata"], "resumedFrom": call_id, "promptSuffix": note}
+        base_prompt = cfg.get("systemPrompt") or ""
+        prev = call["metadata"].get("promptSuffix") if isinstance(call.get("metadata"), dict) else None
+        if not (isinstance(base_prompt, str) and isinstance(prev, str) and prev and base_prompt.endswith(prev)):
+            prev = ""
+        cfg["systemPrompt"] = base_prompt + note
+        meta = {**call["metadata"], "resumedFrom": call_id, "promptSuffix": prev + note}
         resumed = store.create_call(call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
         return Response(stream_twiml(resumed), media_type="text/xml")
 

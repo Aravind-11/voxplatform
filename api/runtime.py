@@ -227,14 +227,16 @@ class Runtime:
                   "caller": str(meta.get("from", "")), "callee": str(meta.get("to", "")), "callId": call["id"]}
         prompt_src = cfg.get("systemPrompt") or SessionConfig.system_prompt
         variant_prompt = str(variant.get("systemPrompt") or "").strip() if variant else ""
+        configured = cfg.get("systemPrompt") if isinstance(cfg.get("systemPrompt"), str) else ""
         if variant_prompt:
             prompt_src = str(variant["systemPrompt"])   # non-empty variant prompt replaces the agent prompt
         prompt = varmod.render(prompt_src, values)
-        # The failed-transfer addendum lives in cfg["systemPrompt"] and in metadata promptSuffix. Append the
-        # suffix only when the variant prompt replaced that field; a voice-only variant already has it inline.
+        # The failed-transfer addendum lives on cfg["systemPrompt"] and metadata promptSuffix. Append that suffix
+        # only when a variant prompt replaced the configured prompt and the configured prompt already ends with it.
+        # A voice-only variant already has the notes inline; a client suffix that is not that tail is not a note.
         if variant_prompt:
             suffix = meta.get("promptSuffix") if isinstance(meta, dict) else None
-            if isinstance(suffix, str) and suffix.strip():
+            if isinstance(suffix, str) and suffix.strip() and configured.endswith(suffix):
                 prompt += varmod.render(suffix, values)
         resumed = bool(meta.get("resumedFrom"))
         from core.tts import LANG_NAME

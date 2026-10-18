@@ -424,3 +424,165 @@ def test_turn_metric_labels_the_variant_without_dropping_the_unlabeled_series():
     text = METRICS.render()
     assert any(line.startswith("vox_turns_total ") for line in text.splitlines())
     assert 'vox_turns_total{variant="A"}' in text
+
+
+def _transfer_note(who):
+    return f"\nThe caller asked to be transferred to {who}, who did not answer. Offer to help or to take a message."
+
+
+def _fail_transfer(c, call_id, to):
+    path, q = f"/twilio/transfer-result/{call_id}", f"to={to}"
+    form = {"DialCallStatus": "no-answer"}
+    r = c.post(f"{path}?{q}", data=form, headers=sign(f"https://vox.example.com{path}?{q}", form))
+    assert r.status_code == 200 and "<Connect>" in r.text, r.text
+    return r
+
+
+def _resumed_from(store, tid, parent_id):
+    rows = [x for x in store.list_calls(tid, 100) if (x.get("metadata") or {}).get("resumedFrom") == parent_id]
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_second_failed_transfer_keeps_every_note_and_a_voice_only_variant_does_not_repeat_them():
+    """A second failed transfer must not drop the first note when the variant prompt replaces the agent prompt."""
+    c, store, _ = make()
+    key, tid = tenant(c)
+    h = {"X-API-Key": key}
+    billing, sales = _transfer_note("billing"), _transfer_note("sales")
+    exp = {"id": "exp1", "variants": [
+        {"id": "A", "weight": 1, "voice": "af_heart", "systemPrompt": "PROMPT-A", "model": "model-a"}]}
+    agent = c.post("/v1/agents", json={"name": "a", "systemPrompt": "Be brief.", "greeting": "Hello!",
+                                       "experiment": exp}, headers=h)
+    assert agent.status_code == 200
+    call = store.create_call(tid, agent.json()["id"], "twilio", agent.json()["config"],
+                             {"from": "+1555", "to": "+1666"})
+    _fail_transfer(c, call["id"], "billing")
+    child = _resumed_from(store, tid, call["id"])
+    _fail_transfer(c, child["id"], "sales")
+    grand = _resumed_from(store, tid, child["id"])
+    assert grand["config"]["systemPrompt"] == "Be brief." + billing + sales
+    assert grand["metadata"]["promptSuffix"] == billing + sales
+    assert grand["metadata"]["from"] == "+1555"
+    rt = Runtime(FakeLLM(), lambda voice: FakeTTS(), FakeVAD, store)
+    assert rt.build_session(grand, T()).history[0]["content"] == "PROMPT-A" + billing + sales
+
+    voice_only = {"id": "exp-voice", "variants": [{"id": "A", "weight": 1, "voice": "af_bella"}]}
+    agent2 = c.post("/v1/agents", json={"name": "b", "systemPrompt": "Be brief.", "experiment": voice_only}, headers=h)
+    assert agent2.status_code == 200
+    call2 = store.create_call(tid, agent2.json()["id"], "twilio", agent2.json()["config"], {"from": "+1555"})
+    _fail_transfer(c, call2["id"], "billing")
+    child2 = _resumed_from(store, tid, call2["id"])
+    _fail_transfer(c, child2["id"], "sales")
+    grand2 = _resumed_from(store, tid, child2["id"])
+    heard = rt.build_session(grand2, T()).history[0]["content"]
+    assert heard == "Be brief." + billing + sales
+    assert heard.count("did not answer") == 2
+
+
+def test_client_prompt_suffix_is_not_rendered_unless_the_configured_prompt_ends_with_it():
+    """metadata.promptSuffix is a transfer addendum only when cfg systemPrompt already ends with that text."""
+    c, store, _ = make()
+    key, tid = tenant(c)
+    h = {"X-API-Key": key}
+    injected = "\nINJECTED by client"
+    exp = {"id": "exp1", "variants": [{"id": "A", "weight": 1, "systemPrompt": "VARIANT", "voice": "af_heart"}]}
+    agent = c.post("/v1/agents", json={"name": "n", "systemPrompt": "BASE", "experiment": exp}, headers=h)
+    assert agent.status_code == 200
+    aid = agent.json()["id"]
+    created = c.post("/v1/calls", json={"agentId": aid, "systemPrompt": "OVERRIDE",
+                                        "metadata": {"promptSuffix": injected, "from": "+1555"}}, headers=h)
+    assert created.status_code == 200
+    rt = Runtime(FakeLLM(), lambda voice: FakeTTS(), FakeVAD, store)
+    call = store.get_call_any(created.json()["id"])
+    assert rt.build_session(call, T()).history[0]["content"] == "VARIANT"
+    _fail_transfer(c, call["id"], "billing")
+    child = _resumed_from(store, tid, call["id"])
+    note = _transfer_note("billing")
+    assert child["metadata"]["promptSuffix"] == note
+    assert injected not in child["config"]["systemPrompt"]
+    assert rt.build_session(child, T()).history[0]["content"] == "VARIANT" + note
+
+    blank = c.post("/v1/calls", json={"agentId": aid, "metadata": {"promptSuffix": "   "}}, headers=h)
+    assert blank.status_code == 200
+    assert rt.build_session(store.get_call_any(blank.json()["id"]), T()).history[0]["content"] == "VARIANT"
+    tail = store.create_call(tid, aid, "webSocket",
+                             {"systemPrompt": "BASE" + note, "experiment": agent.json()["config"]["experiment"]},
+                             {"promptSuffix": note})
+    assert rt.build_session(tail, T()).history[0]["content"] == "VARIANT" + note
+
+    def handler(req):
+        return httpx.Response(201, json={"sid": "CA1"})
+    store2 = Store()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt2 = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store2, http=http)
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                        twilio_account_sid="ACtest", twilio_number="+15550001111")
+    c2 = TestClient(create_app(store2, rt2, security.ConcurrencyLimiter(2), None, settings))
+    key2, _ = tenant(c2)
+    h2 = {"X-API-Key": key2}
+    agent2 = c2.post("/v1/agents", json={"name": "n", "systemPrompt": "BASE", "experiment": exp}, headers=h2)
+    assert agent2.status_code == 200
+    placed = c2.post("/v1/calls/outbound", json={"agentId": agent2.json()["id"], "to": "+15552223333",
+                                                 "metadata": {"promptSuffix": injected}}, headers=h2)
+    assert placed.status_code == 200
+    outbound = store2.get_call_any(placed.json()["id"])
+    assert rt2.build_session(outbound, T()).history[0]["content"] == "VARIANT"
+
+
+def test_variant_voice_must_speak_the_agent_language_on_create_and_on_a_language_only_patch(monkeypatch):
+    monkeypatch.delenv("VOX_NO_ESPEAK", raising=False)
+    c, store, _ = make()
+    key, tid = tenant(c)
+    h = {"X-API-Key": key}
+    english = {"id": "exp1", "variants": [
+        {"id": "A", "weight": 1, "voice": "af_heart"},
+        {"id": "B", "weight": 1, "voice": "af_bella"}]}
+    spanish = {"id": "exp-es", "variants": [
+        {"id": "A", "weight": 1, "voice": "ef_dora"},
+        {"id": "B", "weight": 1, "voice": "em_alex"}]}
+    before = len(store.list_agents(tid))
+    mismatch = c.post("/v1/agents", json={"name": "n", "language": "es", "experiment": english}, headers=h)
+    assert mismatch.status_code == 422
+    assert "af_heart" in mismatch.json()["detail"] and "speaks en" in mismatch.json()["detail"]
+    inverse = c.post("/v1/agents", json={"name": "n", "language": "en", "voice": "af_heart", "experiment": {
+        "id": "exp1", "variants": [{"id": "A", "weight": 1, "voice": "ef_dora"}]}}, headers=h)
+    assert inverse.status_code == 422 and "speaks es" in inverse.json()["detail"] and "ef_dora" in inverse.json()["detail"]
+    unknown = c.post("/v1/agents", json={"name": "n", "language": "es", "experiment": {
+        "id": "exp1", "variants": [{"id": "A", "weight": 1, "voice": "not_a_voice"}]}}, headers=h)
+    assert unknown.status_code == 422 and "unknown voice" in unknown.json()["detail"]
+    assert len(store.list_agents(tid)) == before
+
+    saved = c.post("/v1/agents", json={"name": "n", "language": "es", "experiment": spanish}, headers=h)
+    assert saved.status_code == 200
+    cfg = saved.json()["config"]
+    assert cfg["language"] == "es" and cfg["voice"] == "ef_dora"
+    assert [v["voice"] for v in cfg["experiment"]["variants"]] == ["ef_dora", "em_alex"]
+    aid = saved.json()["id"]
+    keep = store.get_agent_any(aid)
+    swapped = c.patch(f"/v1/agents/{aid}", json={"experiment": english}, headers=h)
+    assert swapped.status_code == 422 and "speaks en" in swapped.json()["detail"]
+    assert store.get_agent_any(aid)["config"] == keep["config"]
+
+    en = c.post("/v1/agents", json={"name": "en", "systemPrompt": "BASE", "experiment": english}, headers=h)
+    assert en.status_code == 200
+    eid = en.json()["id"]
+    frozen = store.get_agent_any(eid)
+    lang = c.patch(f"/v1/agents/{eid}", json={"language": "es"}, headers=h)
+    assert lang.status_code == 422 and "speaks en" in lang.json()["detail"] and "af_heart" in lang.json()["detail"]
+    assert store.get_agent_any(eid)["config"] == frozen["config"]
+    assert store.get_agent_any(eid)["config"].get("language") in (None, "en")
+    assert store.get_agent_any(eid)["config"]["experiment"]["variants"][0]["voice"] == "af_heart"
+
+    greeted = c.patch(f"/v1/agents/{aid}", json={"greeting": "Hola"}, headers=h)
+    assert greeted.status_code == 200 and greeted.json()["config"]["language"] == "es"
+    assert greeted.json()["config"]["experiment"]["variants"][0]["voice"] == "ef_dora"
+    snap = store.get_agent_any(aid)
+    back = c.patch(f"/v1/agents/{aid}", json={"language": "en"}, headers=h)
+    assert back.status_code == 422 and "speaks es" in back.json()["detail"]
+    assert store.get_agent_any(aid)["config"] == snap["config"]
+
+    cleared = c.patch(f"/v1/agents/{aid}", json={"experiment": None, "language": "en"}, headers=h)
+    assert cleared.status_code == 200
+    assert "experiment" not in cleared.json()["config"]
+    assert cleared.json()["config"]["language"] == "en" and cleared.json()["config"]["voice"] == "af_heart"

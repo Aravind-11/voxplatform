@@ -159,7 +159,13 @@ class Session:
         elif not agent:
             self._overlap_audio.clear()
         (self._utt if self.turn.in_turn else self._pre).append(frame)
-        for ev in self.turn.process(prob):
+        events = self.turn.process(prob)
+        # A cough under the barge floor never opens a check. Drop it, or the next yeah is
+        # transcribed glued to that audio with the silence between them removed.
+        if (prob < self.cfg.turn.threshold and not self.turn.in_turn
+                and not any(ev.kind is Ev.OVERLAP_CHECK for ev in events)):
+            self._overlap_audio.clear()
+        for ev in events:
             await self._handle(ev)
 
     async def start(self) -> None:
@@ -241,9 +247,12 @@ class Session:
     async def _handle(self, ev: TurnEvent) -> None:
         if ev.kind is Ev.SPEECH_START:
             # A real turn supersedes an in-flight "was that just yeah?" transcript.
+            # _pre is 320 ms, shorter than the backchannel gate, so the start of a barge that
+            # had to wait out the gate is only in the overlap buffer.
             self._overlap_token += 1
-            self._overlap_audio.clear()
-            self._utt = list(self._pre)
+            held = self._overlap_audio
+            self._utt = list(held) if len(held) > len(self._pre) else list(self._pre)
+            self._overlap_audio = []
             self._pre.clear()
             g = self._gen
             if g and g.committed and self._agent_active():
@@ -317,6 +326,13 @@ class Session:
             else:
                 await self._cancel(g)
                 self._gen = None
+        if token != self._overlap_token:
+            return
+        # Commit replaces _transcript_task. Wait for the one already in flight first, or the
+        # model is sent "[caller audio]" for the turn the caller just finished.
+        prior = self._transcript_task
+        if prior is not None and not prior.done():
+            await prior
         if token != self._overlap_token:
             return
         self.stats["turns"] += 1

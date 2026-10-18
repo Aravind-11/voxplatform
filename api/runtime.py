@@ -209,9 +209,17 @@ class Runtime:
                        cfg=scfg, tools=fns, on_event=on_event, eot_fn=self._eot_sync(),
                        eot_async=self._eot_async(), recorder=recorder, on_utterance=on_utt)
 
+        speaking = False
+
         async def voicemail(message: str) -> None:
-            await sess.say_and_wait(message)
-            await transport.end()
+            nonlocal speaking
+            if speaking:
+                return
+            speaking = True
+            try:
+                await sess.say_and_wait(message)
+            finally:
+                await transport.end()
         ctx.voicemail = voicemail
         # AMD may be delivered on another node, or on the Redis listener thread. Schedule onto
         # the loop that owns this session; there is no loop when a sync test builds a session.
@@ -225,8 +233,19 @@ class Runtime:
                     if not isinstance(msg, dict) or msg.get("op") != "voicemail":
                         return
                     text = msg.get("text") or ""
-                    if text:
-                        asyncio.run_coroutine_threadsafe(_vm(str(text)), _loop)
+                    if not text:
+                        return
+                    fut = asyncio.run_coroutine_threadsafe(_vm(str(text)), _loop)
+
+                    def _retrieved(done) -> None:
+                        if done.cancelled():
+                            return
+                        try:
+                            done.result()
+                        except Exception:  # noqa: BLE001  (retrieved so the failure is not logged as abandoned)
+                            METRICS.inc("vox_errors_total", where="voicemail")
+
+                    fut.add_done_callback(_retrieved)
                 self._drop_bus(call["id"])
                 self.bus.subscribe(call["id"], on_bus)
                 self._bus_handlers[call["id"]] = on_bus

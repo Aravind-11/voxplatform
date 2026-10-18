@@ -1049,12 +1049,26 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             live = runtime.live.get(call_id)
             if live:
                 sess, transport = live
+                if getattr(sess, "_vm_once", False):
+                    return {"action": "voicemail", "delivered": True}
+                sess._vm_once = True
 
                 async def go():
-                    await sess.say_and_wait(msg)
-                    await transport.end()
+                    try:
+                        await sess.say_and_wait(msg)
+                    finally:
+                        await transport.end()
+
+                def _retrieved(done) -> None:
+                    if done.cancelled():
+                        return
+                    try:
+                        done.exception()
+                    except Exception:  # noqa: BLE001
+                        METRICS.inc("vox_errors_total", where="voicemail")
+
                 import asyncio
-                asyncio.get_running_loop().create_task(go())
+                asyncio.get_running_loop().create_task(go()).add_done_callback(_retrieved)
                 return {"action": "voicemail", "delivered": True}
             bus = getattr(runtime, "bus", None)
             delivered = bool(bus.publish(call_id, {"op": "voicemail", "text": msg})) if bus is not None else False

@@ -682,6 +682,91 @@ async def test_amd_voicemail_is_spoken_by_the_runtime_that_owns_the_call():
         LimitedTTS._sem = None
 
 
+async def test_voicemail_hangs_up_when_speech_fails_and_ignores_a_second_amd():
+    """A TTS failure must still hang up, and a second AMD must not start another message over the first."""
+    import asyncio
+    from api import security
+    from api.callbus import LocalCallBus
+    from api.runtime import LimitedTTS, Runtime
+    from test_session import EnergyVAD, FakeLLM, FakeTTS
+
+    bus = LocalCallBus()
+    c, store, _rt = make_outbound(lambda r: httpx.Response(201, json={"sid": "CA1"}))
+    k, _ = tenant(c)
+    a = c.post("/v1/agents", json={"name": "a"}, headers=H(k)).json()
+    o = c.post("/v1/calls/outbound", json={"agentId": a["id"], "to": "+15551234567",
+                                           "voicemailMessage": "please call back"}, headers=H(k)).json()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    says: list[str] = []
+    ended: list[str] = []
+
+    class T:
+        out_rate = 8000
+        call_sid = "CA1"
+
+        async def send_audio(self, pcm, rate):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            ended.append("END")
+
+    LimitedTTS._sem = None
+    try:
+        other = Runtime(FakeLLM([["x"]]), lambda v: FakeTTS(), EnergyVAD, store, bus=bus)
+        sess = other.build_session(store.get_call_any(o["id"]), T())
+
+        async def say(msg):
+            says.append(msg)
+            started.set()
+            await release.wait()
+            raise RuntimeError("tts down")
+
+        sess.say_and_wait = say
+        assert bus.publish(o["id"], {"op": "voicemail", "text": "one"})
+        assert bus.publish(o["id"], {"op": "voicemail", "text": "two"})
+        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.sleep(0.05)
+        assert says == ["one"]
+        release.set()
+        for _ in range(40):
+            if ended:
+                break
+            await asyncio.sleep(0.05)
+        assert ended == ["END"]
+    finally:
+        LimitedTTS._sem = None
+        release.set()
+
+    # The webhook on the node that owns the socket has the same duty.
+    spoke: list[str] = []
+
+    class S:
+        async def say_and_wait(self, m):
+            spoke.append(m)
+            raise RuntimeError("tts down")
+
+    class Tr:
+        async def end(self):
+            spoke.append("END")
+
+    _rt.live[o["id"]] = (S(), Tr())
+    url = f"https://vox.example.com/twilio/amd/{o['id']}"
+    machine = {"AnsweredBy": "machine_end_beep"}
+    sig = {"X-Twilio-Signature": security.twilio_signature("tok", url, machine)}
+    assert c.post(f"/twilio/amd/{o['id']}", data=machine, headers=sig).json()["delivered"] is True
+    again = c.post(f"/twilio/amd/{o['id']}", data=machine, headers=sig)
+    assert again.json()["delivered"] is True
+    for _ in range(40):
+        if spoke.count("END") >= 1:
+            break
+        time.sleep(0.05)
+    assert spoke == ["please call back", "END"]
+
+
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)
 def test_drain_stops_new_calls_but_reports_readiness():
     from test_api import speech, silence

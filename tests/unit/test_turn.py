@@ -48,6 +48,15 @@ def test_unconfident_scorer_waits_full_end_ms():
     assert t[Ev.END_OF_TURN] == (19 + 20) * F
 
 
+def test_confident_scorer_does_not_outwait_a_shorter_end_ms():
+    # end_ms 200 is under fast_end_ms 320: a clear ending must not be held longer than an uncertain one.
+    cfg = TurnConfig(end_ms=200)
+    unsure = dict(feed(TurnManager(cfg, eot_scorer=lambda: 0.1), [(True, 20), (False, 30)]))
+    sure = dict(feed(TurnManager(cfg, eot_scorer=lambda: 0.9), [(True, 20), (False, 30)]))
+    assert unsure[Ev.END_OF_TURN] == (19 + 7) * F          # 224 ms of silence, first frame at or past 200
+    assert sure[Ev.END_OF_TURN] <= unsure[Ev.END_OF_TURN]
+
+
 def test_short_noise_burst_is_ignored():
     assert feed(TurnManager(), [(False, 5), (True, 2), (False, 40)]) == []
 

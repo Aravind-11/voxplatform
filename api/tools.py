@@ -220,10 +220,10 @@ def build(specs: list, ctx: Optional[CallContext] = None, client: Any = None):
     for d in validate_specs(specs):
         if "demo" in d:
             sch, fn = DEMO_SCHEMAS[d["demo"]], demo[d["demo"]]
+            if d["demo"] == "book_slot":          # changes state; check_availability is a read and is not counted
+                fn = _with_budget(fn, ctx)        # inside confirmation: a read-back that does not run is free
             if d.get("confirm"):
                 sch, fn = with_confirmation(fn, sch, ctx)
-            if d["demo"] == "book_slot":          # changes state; check_availability is a read and is not counted
-                fn = _with_budget(fn, ctx)
             schemas[d["demo"]], fns[d["demo"]] = sch, fn
         elif "builtin" in d:
             key = d.get("name") or d["builtin"]
@@ -233,8 +233,8 @@ def build(specs: list, ctx: Optional[CallContext] = None, client: Any = None):
             schemas[key], fns[key] = builtin_tools.schema(d), fn
         else:
             sch, fn = http_tools.schema(d), http_tools.make_http_tool(d, ctx, client)
+            fn = _with_budget(fn, ctx)            # inside confirmation, so the proposal does not spend a slot
             if d.get("confirm"):
                 sch, fn = with_confirmation(fn, sch, ctx)
-            fn = _with_budget(fn, ctx)
             schemas[d["name"]], fns[d["name"]] = sch, fn
     return list(schemas.values()), fns

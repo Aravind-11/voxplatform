@@ -320,6 +320,29 @@ async def test_injection_phrase_blocks_book_slot_before_it_runs():
     assert (await fns["check_availability"]({"day": "tuesday"}))["free"] == ["11:00"]
 
 
+async def test_unconfirmed_proposal_does_not_spend_the_side_effect_budget():
+    """A read-back is not a side effect. Budget 1 must still be able to book on the confirming call."""
+    ctx = toolmod.CallContext()
+    ctx.tool_budget = 1
+    ctx.turn = 0
+    ctx.turn_fn = lambda: ctx.turn
+    _, fns = toolmod.build([{"tool": "book_slot", "confirm": True}], ctx)
+    first = await fns["book_slot"]({"day": "tuesday", "time": "11:00"})
+    assert first["executed"] is False
+    assert ctx.tool_calls == 0
+    ctx.turn = 1
+    booked = await fns["book_slot"]({"day": "tuesday", "time": "11:00", "confirmed": True})
+    assert booked == {"booked": True, "day": "tuesday", "time": "11:00"}
+    assert ctx.tool_calls == 1
+    ctx.turn = 2
+    proposed = await fns["book_slot"]({"day": "monday", "time": "09:00"})
+    assert proposed["executed"] is False and ctx.tool_calls == 1
+    ctx.turn = 3
+    blocked = await fns["book_slot"]({"day": "monday", "time": "09:00", "confirmed": True})
+    assert blocked == {"error": "tool call budget for this call is used up"}
+    assert ctx.tool_calls == 1
+
+
 async def test_ordinary_book_tuesday_still_confirms_when_there_is_no_injection():
     ctx = Ctx()
     ctx.turn = 0

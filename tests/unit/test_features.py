@@ -810,6 +810,10 @@ def test_node_cap_refuses_the_second_call_and_frees_when_the_first_ends():
             "streamSid": "MZ1", "callSid": "CA1", "customParameters": {"token": tw["join_token"]}}}))
         # The follow-up yields so admit() has marked this reserved id active before the assert.
         ws.send_text(json.dumps({"event": "mark", "streamSid": "MZ1", "mark": {"name": "m0"}}))
+        # admit() reads the tenant off the loop, so the mark returns before that reserved id is active.
+        deadline = time.time() + 2
+        while time.time() < deadline and store.get_call_any(tw["id"])["status"] != "active":
+            time.sleep(0.02)
         assert store.get_call_any(tw["id"])["status"] == "active"   # already reserved: not a second slot
         assert lim.local_active() == 1
         ws.send_text(json.dumps({"event": "stop", "streamSid": "MZ1"}))
@@ -817,6 +821,9 @@ def test_node_cap_refuses_the_second_call_and_frees_when_the_first_ends():
     c3 = c.post("/v1/calls", json={}, headers=h).json()
     with c.websocket_connect(c3["joinUrl"].replace("wss://vox.example.com", "")) as ws3:
         ws3.send_bytes(silence(1)[0])
+        deadline = time.time() + 2
+        while time.time() < deadline and store.get_call_any(c3["id"])["status"] != "active":
+            time.sleep(0.02)
         assert store.get_call_any(c3["id"])["status"] == "active" and lim.local_active() == 1
     assert lim.local_active() == 0 and store.get_call_any(c3["id"])["end_reason"] == "hangup"
 
@@ -840,6 +847,9 @@ def test_full_node_does_not_start_another_twilio_or_outbound_call():
     held = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=h).json()
     with c.websocket_connect(held["joinUrl"].replace("wss://vox.example.com", "")) as ws:
         ws.send_bytes(silence(1)[0])
+        deadline = time.time() + 2
+        while time.time() < deadline and lim.local_active() != 1:
+            time.sleep(0.02)
         assert lim.local_active() == 1
         before = len(store.list_calls(tid))
         form = twilio_form()
@@ -877,6 +887,9 @@ def test_full_node_does_not_start_another_twilio_or_outbound_call():
         tws.send_text(json.dumps({"event": "start", "streamSid": "MZ2", "start": {
             "streamSid": "MZ2", "callSid": "CA2", "customParameters": {"token": new["join_token"]}}}))
         tws.send_text(json.dumps({"event": "mark", "streamSid": "MZ2", "mark": {"name": "m0"}}))
+        deadline = time.time() + 2
+        while time.time() < deadline and store.get_call_any(new["id"])["status"] != "active":
+            time.sleep(0.02)
         assert store.get_call_any(new["id"])["status"] == "active" and lim.local_active() == 1
         tws.send_text(json.dumps({"event": "stop", "streamSid": "MZ2"}))
     assert lim.local_active() == 0
@@ -893,6 +906,9 @@ def test_full_node_does_not_start_another_twilio_or_outbound_call():
     b2 = c2.post("/v1/calls", json={}, headers=h2).json()
     with c2.websocket_connect(b2["joinUrl"].replace("wss://vox.example.com", "")) as ws2:
         ws2.send_bytes(silence(1)[0])
+        deadline = time.time() + 2
+        while time.time() < deadline and c2.app.state.limiter.local_active() != 1:
+            time.sleep(0.02)
         assert c2.app.state.limiter.local_active() == 1
         before2 = len(store2.list_calls(tid2))
         denied = c2.post("/v1/calls/outbound", json={"agentId": a2["id"], "to": "+15552223333"}, headers=h2)
@@ -912,6 +928,9 @@ def test_failed_transfer_does_not_create_a_call_when_the_node_is_full():
     held = c.post("/v1/calls", json={}, headers=h).json()
     with c.websocket_connect(held["joinUrl"].replace("wss://vox.example.com", "")) as ws:
         ws.send_bytes(silence(1)[0])
+        deadline = time.time() + 2
+        while time.time() < deadline and lim.local_active() != 1:
+            time.sleep(0.02)
         assert lim.local_active() == 1
         path, q = f"/twilio/transfer-result/{ended['id']}", "to=billing"
         miss = {"DialCallStatus": "no-answer"}
@@ -939,6 +958,9 @@ def test_failed_transfer_does_not_create_a_call_when_the_node_is_full():
         tws.send_text(json.dumps({"event": "start", "streamSid": "MZ9", "start": {
             "streamSid": "MZ9", "callSid": "CA9", "customParameters": {"token": new["join_token"]}}}))
         tws.send_text(json.dumps({"event": "mark", "streamSid": "MZ9", "mark": {"name": "m0"}}))
+        deadline = time.time() + 2
+        while time.time() < deadline and store.get_call_any(new["id"])["status"] != "active":
+            time.sleep(0.02)
         assert store.get_call_any(new["id"])["status"] == "active" and lim.local_active() == 1
         tws.send_text(json.dumps({"event": "stop", "streamSid": "MZ9"}))
     assert store.get_call_any(new["id"])["end_reason"] != "node_full"
@@ -1207,6 +1229,11 @@ def test_node_cap_zero_admits_a_second_call_and_healthz_stays_ready():
         ws1.send_bytes(silence(1)[0])
         with c.websocket_connect(path(second)) as ws2:
             ws2.send_bytes(silence(1)[0])
+            deadline = time.time() + 2
+            while time.time() < deadline and not (
+                    store.get_call_any(first["id"])["status"] == "active"
+                    and store.get_call_any(second["id"])["status"] == "active"):
+                time.sleep(0.02)
             assert store.get_call_any(first["id"])["status"] == "active"
             assert store.get_call_any(second["id"])["status"] == "active"
             assert lim.local_active() == 2

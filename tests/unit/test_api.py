@@ -459,6 +459,10 @@ def test_redis_release_failure_still_ends_the_call_and_frees_the_slot():
     path = call["joinUrl"].replace("wss://vox.example.com", "")
     with c.websocket_connect(path) as ws:
         ws.send_bytes(silence(1)[0])
+        # admit() reads the tenant off the loop, so this send returns before the row is active.
+        deadline = time.time() + 2
+        while time.time() < deadline and store.get_call_any(call["id"])["status"] != "active":
+            time.sleep(0.02)
         assert store.get_call_any(call["id"])["status"] == "active"
         assert lim.local_active() == 1
     done = store.get_call_any(call["id"])
@@ -467,6 +471,9 @@ def test_redis_release_failure_still_ends_the_call_and_frees_the_slot():
     call2 = c.post("/v1/calls", json={}, headers=h).json()
     with c.websocket_connect(call2["joinUrl"].replace("wss://vox.example.com", "")) as ws:
         ws.send_bytes(silence(1)[0])
+        deadline = time.time() + 2
+        while time.time() < deadline and store.get_call_any(call2["id"])["status"] != "active":
+            time.sleep(0.02)
         assert store.get_call_any(call2["id"])["status"] == "active"
         assert lim.local_active() == 1
 

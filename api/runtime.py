@@ -17,6 +17,7 @@ from core.vad_exec import VADScheduler
 from . import tools as toolmod
 from .experiments import VariantLLM, choose_variant
 from .store import Store
+from .writebehind import MessageLog
 
 
 class LimitedTTS:
@@ -108,6 +109,27 @@ class Runtime:
         if self.bus is not None and handler is not None:
             self.bus.unsubscribe(call_id, handler)
 
+    def __post_init__(self) -> None:
+        self.message_log = MessageLog(self.store)
+
+    def flush_messages(self, call_id: str | None = None) -> None:
+        """Block until queued transcripts are in the store. Call via asyncio.to_thread.
+
+        Pass `call_id` so a different call's failed insert is not reported as this call's.
+        """
+        self.message_log.flush(call_id)
+
+    def wait_messages(self) -> None:
+        """Block until queued transcripts are visible. Call via asyncio.to_thread.
+
+        Unlike `flush_messages`, this leaves a failed insert for `finish` to raise.
+        """
+        self.message_log.wait()
+
+    def peek_message_error(self, call_id: str | None = None) -> BaseException | None:
+        """This call's insert failure, still stored so flush_messages can raise it."""
+        return self.message_log.peek_error(call_id)
+
     def finalize(self, call_id: str) -> Optional[str]:
         """Called when a call ends: forgets the live session and writes the recording. Returns the WAV path."""
         self._drop_bus(call_id)
@@ -121,7 +143,11 @@ class Runtime:
         return path
 
     def _earlier_messages(self, call_id: str, keep: int = 40) -> list[dict]:
-        """Transcript of the call this one continues (following the chain of reconnects), oldest first, last `keep`."""
+        """Transcript of the call this one continues (following the chain of reconnects), oldest first, last `keep`.
+
+        Waits until queued rows are written. Must not run on the event loop.
+        """
+        self.message_log.wait()
         chain: list[str] = []
         cur = call_id
         while cur and len(chain) < 4:
@@ -284,7 +310,8 @@ class Runtime:
                                              patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000")),
                                              backchannel_ms=BACKCHANNEL_MS.get(str(cfg.get("bargeIn") or "normal"),
                                                                                 BACKCHANNEL_MS["normal"])))
-        store, cid = self.store, call["id"]
+        cid = call["id"]
+        log = self.message_log
 
         variant_id = str(variant["id"]) if variant else ""
 
@@ -293,9 +320,9 @@ class Runtime:
                 print('EV', cid, e, flush=True)
             _count(e, variant_id)
             if e["type"] == "user_transcript":
-                store.add_message(cid, "user", e["text"], time.time())
+                log.add(cid, "user", e["text"], time.time())
             elif e["type"] == "agent_speech":
-                store.add_message(cid, "agent", e["text"], time.time())
+                log.add(cid, "agent", e["text"], time.time())
             if forward_events and hasattr(transport, "send_event"):
                 import asyncio
                 asyncio.get_running_loop().create_task(transport.send_event(e))

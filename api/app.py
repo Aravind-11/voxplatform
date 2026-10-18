@@ -1,6 +1,7 @@
 """HTTP/WebSocket API. Auth: X-API-Key (tenant), X-Admin-Key (tenant provisioning)."""
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import os
@@ -27,6 +28,7 @@ from . import openapi_import, retention, variables as varmod
 from .callbus import make_bus
 from .runtime import Runtime
 from .store import ROLES, Store, new_id, normalize_e164
+from .writebehind import to_thread
 
 
 @dataclass
@@ -435,7 +437,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             if fn is None:
                 continue
             try:
-                fn()
+                # A pool checkout can block for the pool timeout. That must not freeze the loop.
+                if name == "db":
+                    await to_thread(fn)
+                else:
+                    fn()
                 checks[name] = True
             except Exception:  # noqa: BLE001
                 checks[name] = False
@@ -670,9 +676,21 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
 
     @app.get("/v1/calls/{call_id}/messages")
     async def call_messages(call_id: str, t: dict = Depends(tenant)):
-        if not store.get_call(t["id"], call_id):
+        if not await to_thread(store.get_call, t["id"], call_id):
             raise HTTPException(404, "call not found")
-        return store.messages(call_id)
+
+        def _read():
+            runtime.wait_messages()  # a row still in the writer is not an empty transcript
+            # Peek: finish still has to raise this, so a reader must not pop it.
+            err = runtime.peek_message_error(call_id)
+            if err is not None:
+                return err
+            return store.messages(call_id)
+
+        got = await to_thread(_read)
+        if isinstance(got, BaseException):
+            raise HTTPException(500, f"{type(got).__name__}: {got}")
+        return got
 
     @app.get("/v1/usage")
     async def usage(days: int = 30, t: dict = Depends(tenant)):
@@ -952,27 +970,77 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             store.update_call(call["id"], status="ended", ended=time.time(), end_reason=reason)
             limiter.release(call["tenant_id"], call["id"])
 
-    def admit(call: dict) -> dict:
-        """Common admission: status, drain, per-node cap, then per-tenant concurrency. Raises _Reject."""
+    async def _release_unheld(call: dict) -> None:
+        """Drop a reservation the socket never adopted. A row already active keeps its slot."""
+        try:
+            cur = await to_thread(store.get_call_any, call["id"])
+        except Exception:  # noqa: BLE001
+            cur = None
+        if cur is not None and cur.get("status") == "active":
+            return
+        try:
+            limiter.release(call["tenant_id"], call["id"])
+        except Exception:  # noqa: BLE001
+            METRICS.inc("vox_errors_total", where="limiter_release")
+
+    async def admit(call: dict) -> dict:
+        """Status, drain, claim, per-node cap, then per-tenant concurrency. Raises _Reject.
+
+        Store calls run in a worker. webhook() stays on this task: dispatcher.spawn needs a running loop.
+        The created->active claim uses update_call_if_status, which does not call update_call. A second
+        update_call(status="active") runs only after the slot is held, so a lock on that write still
+        releases the ceiling.
+        """
         if call["status"] != "created":
             raise _Reject(4401, "call not joinable")
         if app.state.draining:
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="draining")
-            limiter.release(call["tenant_id"], call["id"])  # no-op unless a webhook already reserved this id
+            ended = await to_thread(store.update_call_if_status, call["id"], "created",
+                                    status="ended", ended=time.time(), end_reason="draining")
+            if ended:
+                try:
+                    limiter.release(call["tenant_id"], call["id"])  # no-op unless a webhook reserved this id
+                except Exception:  # noqa: BLE001
+                    METRICS.inc("vox_errors_total", where="limiter_release")
+            else:
+                await _release_unheld(call)
             raise _Reject(1013, "node is draining")
-        t = store.get_tenant(call["tenant_id"])
+        t = await to_thread(store.get_tenant, call["tenant_id"])
+        # The status check above is from before get_tenant. A drain in that gap takes no slot.
+        if app.state.draining:
+            ended = await to_thread(store.update_call_if_status, call["id"], "created",
+                                    status="ended", ended=time.time(), end_reason="draining")
+            if ended:
+                try:
+                    limiter.release(call["tenant_id"], call["id"])
+                except Exception:  # noqa: BLE001
+                    METRICS.inc("vox_errors_total", where="limiter_release")
+            else:
+                await _release_unheld(call)
+            raise _Reject(1013, "node is draining")
         cap = t["concurrency_limit"] or settings.default_concurrency
-        # Node cap and tenant cap are one locked check. A refusal takes no slot, and two
-        # admits cannot both pass a process that is one call under the cap.
+        joined = time.time()
+        claimed = await to_thread(
+            store.update_call_if_status, call["id"], "created",
+            status="active", joined=joined)
+        if not claimed:
+            # The winner already holds the slot once the row is active. A busy/ended row never
+            # took a websocket slot; releasing that id is a no-op unless a webhook reserved it.
+            await _release_unheld(call)
+            raise _Reject(4401, "call not joinable")
+        # Node cap and tenant cap are one locked check. An id reserved before the socket returns
+        # "ok" and is not counted twice.
         decision = limiter.try_admit(call["tenant_id"], call["id"], cap, settings.node_max_calls)
         if decision != "ok":
             full = decision == "node"
-            store.update_call(call["id"], status="ended", ended=time.time(),
-                              end_reason="node_full" if full else "concurrency_limit")
+            # The claim above stamped joined. A refusal never joined: clear it so a SIP continuation
+            # is still "never joined" and restore_continuation can put the row back to created.
+            await to_thread(store.update_call, call["id"], status="ended", ended=time.time(),
+                            end_reason="node_full" if full else "concurrency_limit", joined=None)
             raise _Reject(1013, "node full" if full else "concurrency limit")
         try:
-            store.update_call(call["id"], status="active", joined=time.time())
-            webhook(t, "call.started", store.get_call_any(call["id"]))
+            await to_thread(store.update_call, call["id"], status="active", joined=joined)
+            fresh = await to_thread(store.get_call_any, call["id"])
+            webhook(t, "call.started", fresh)
         except Exception:  # noqa: BLE001  (slot is held; finish runs only after admit returns)
             METRICS.inc("vox_errors_total", where="admit")
             try:
@@ -980,7 +1048,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             except Exception:  # noqa: BLE001
                 pass
             try:
-                store.update_call(call["id"], status="ended", ended=time.time(), end_reason="error")
+                await to_thread(store.update_call, call["id"], status="ended", ended=time.time(), end_reason="error")
             except Exception:  # noqa: BLE001  (database still down: the slot is already released)
                 pass
             raise _Reject(1011, "unavailable")
@@ -997,41 +1065,111 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         store.delete_sip_setup(uid)
         app.state.sip_setups.pop(uid, None)
 
-    def finish(call: dict, t: dict, reason: str) -> None:
+    async def finish(call: dict, t: dict, reason: str) -> None:
+        # A failed transcript insert must not skip the slot release or leave the call active,
+        # and it must not be reported as a clean hang-up.
+        write_err = None
+        try:
+            await to_thread(runtime.flush_messages, call["id"])
+        except Exception as exc:  # noqa: BLE001
+            write_err = exc
+        end_reason = "transcript_failed" if write_err is not None else reason
         try:
             limiter.release(call["tenant_id"], call["id"])
         except Exception:  # noqa: BLE001  (a Redis blip must not skip ending the call)
             METRICS.inc("vox_errors_total", where="limiter_release")
-        cur = store.get_call_any(call["id"])
-        if cur["status"] == "active":
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason=reason)
-        METRICS.inc("vox_calls_total", medium=call["medium"], reason=reason)
+
+        def _mark_ended():
+            # Drop the live session before the ended row is visible. A caller that polls for
+            # status=ended (the AudioSocket hang-up test) must not still find the session.
+            try:
+                runtime.finalize(call["id"])
+            except Exception:  # noqa: BLE001
+                METRICS.inc("vox_errors_total", where="finalize")
+            # A dead read must not skip the write, and one failed update is retried so the
+            # row does not stay active after the slot is gone.
+            last: BaseException | None = None
+            for _attempt in range(2):
+                try:
+                    cur = None
+                    try:
+                        cur = store.get_call_any(call["id"])
+                    except Exception as exc:  # noqa: BLE001
+                        last = exc
+                    # Resume may already have ended the row as stream_lost. A failed insert still
+                    # has to replace that reason; leaving it reports a lost transcript as a cut-off.
+                    must_record_failure = write_err is not None and (
+                        cur is None or cur.get("status") == "active" or cur.get("end_reason") != "transcript_failed")
+                    if cur is None or cur.get("status") == "active" or must_record_failure:
+                        store.update_call(call["id"], status="ended", ended=time.time(), end_reason=end_reason)
+                    done = store.get_call_any(call["id"])
+                    if done is not None and done.get("status") != "active":
+                        if write_err is not None and done.get("end_reason") != "transcript_failed":
+                            last = RuntimeError("transcript failure was not recorded")
+                            continue
+                        drop_sip_setup(done or call)
+                        secs = round((done["ended"] - done["joined"]), 2) if done.get("joined") and done.get("ended") else 0.0
+                        return done, secs
+                except Exception as exc:  # noqa: BLE001
+                    last = exc
+            if last is not None:
+                raise last
+            raise RuntimeError("call did not end")
+
+        def _transcript():
+            return [{"role": m["role"], "text": m["text"], "t": m["t"]} for m in store.messages(call["id"])[:500]]
+
+        snap_err = None
+        done, secs = None, 0.0
         try:
-            runtime.finalize(call["id"])
-        except Exception:  # noqa: BLE001  (a failed recording write must not break call teardown)
-            METRICS.inc("vox_errors_total", where="finalize")
-        done = store.get_call_any(call["id"])
-        drop_sip_setup(done or call)
-        secs = round((done["ended"] - done["joined"]), 2) if done.get("joined") and done.get("ended") else 0.0
-        webhook(t, "call.ended", done, durationSeconds=secs,
-                transcript=[{"role": m["role"], "text": m["text"], "t": m["t"]} for m in store.messages(call["id"])[:500]])
+            done, secs = await to_thread(_mark_ended)
+        except Exception as exc:  # noqa: BLE001
+            snap_err = exc
+        transcript: list = []
+        read_err = None
+        if done is not None:
+            try:
+                transcript = await to_thread(_transcript)
+            except Exception as exc:  # noqa: BLE001
+                read_err = exc
+        if done is not None:
+            METRICS.inc("vox_calls_total", medium=call["medium"], reason=end_reason)
+            extra: dict = {}
+            failures = []
+            if write_err is not None:
+                failures.append(f"{type(write_err).__name__}: {write_err}")
+            if read_err is not None:
+                failures.append(f"{type(read_err).__name__}: {read_err}")
+            if failures:
+                extra["error"] = "; ".join(failures)
+            # An unread transcript is not an empty one: omitting it keeps a retry from
+            # delivering [] for rows that are still in the table.
+            if read_err is None:
+                extra["transcript"] = transcript
+            webhook(t, "call.ended", done, durationSeconds=secs, **extra)
+        if write_err is not None:
+            raise write_err
+        if snap_err is not None:
+            raise snap_err
+        if read_err is not None:
+            raise read_err
 
     @app.websocket("/ws/calls/{call_id}")
     async def ws_call(ws: WebSocket, call_id: str, token: str = ""):
         await ws.accept()
-        call = store.get_call_any(call_id)
+        call = await to_thread(store.get_call_any, call_id)
         if not call or not hmac.compare_digest(token, call["join_token"]) or call["medium"] != "webSocket":
             await ws.close(4401)
             return
         try:
-            t = admit(call)
+            t = await admit(call)
         except _Reject as r:
             await ws.close(r.code, r.reason)
             return
         reason = "hangup"
         try:
             async def factory(tr):
-                return runtime.build_session(call, tr, forward_events=True)
+                return await to_thread(runtime.build_session, call, tr, True)
             await BrowserTransport(_BrowserWS(ws), factory).run()
         except WebSocketDisconnect:
             pass
@@ -1039,7 +1177,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             reason = "error"
             raise
         finally:
-            finish(call, t, reason)
+            await finish(call, t, reason)
 
     # ---------------------------------------------------------- telephony
     def stream_twiml(call: dict) -> str:
@@ -1107,7 +1245,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 raise HTTPException(403, "bad twilio signature")
         if app.state.draining:
             return Response(busy_twiml(), media_type="text/xml")   # no call row: nothing was admitted
-        agent = store.get_agent_any(agent_id)
+        agent = await to_thread(store.get_agent_any, agent_id)
         if not agent:
             raise HTTPException(404, "agent not found")
         call_sid = str(form.get("CallSid", "") or "").strip()
@@ -1115,14 +1253,14 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if not call_sid:
             return Response(HANGUP_TWIML, media_type="text/xml")
         # Twilio retries this URL when our response is lost. The first row already holds the slot.
-        existing = store.find_open_twilio_call(agent["tenant_id"], call_sid)
+        existing = await to_thread(store.find_open_twilio_call, agent["tenant_id"], call_sid)
         if existing:
             return Response(stream_twiml(existing), media_type="text/xml")
         # Hold the slot before handing Twilio a stream URL, or the next webhook still sees a free node.
         cid, decision = reserve_slot(agent["tenant_id"])
         if decision != "ok":
             return Response(busy_twiml(), media_type="text/xml")   # no call row: nothing was admitted
-        call = create_reserved(cid, agent["tenant_id"], agent_id, "twilio", agent["config"],
+        call = await to_thread(create_reserved, cid, agent["tenant_id"], agent_id, "twilio", agent["config"],
                                {"from": form.get("From", ""), "to": form.get("To", ""), "callSid": call_sid})
         if not await bind_status_callback(call["id"], call_sid):
             return _drop_unbound(call)
@@ -1131,7 +1269,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
     @app.websocket("/ws/twilio/{call_id}")
     async def ws_twilio(ws: WebSocket, call_id: str):
         await ws.accept()
-        call = store.get_call_any(call_id)
+        call = await to_thread(store.get_call_any, call_id)
         if not call or call["medium"] != "twilio":
             await ws.close(4401)
             return
@@ -1140,11 +1278,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         async def factory(tr, custom):
             if not hmac.compare_digest(str(custom.get("token", "")), call["join_token"]):
                 raise _Reject(4401, "bad token")
-            state["t"] = admit(call)
-            return runtime.build_session(call, tr)
+            state["t"] = await admit(call)
+            return await to_thread(runtime.build_session, call, tr)
 
         tr = TwilioTransport(_TwilioWS(ws), factory)
-        tr.before_end = lambda: store.update_call(call_id, end_reason="agent_hangup")
+        tr.before_end = lambda: to_thread(store.update_call, call_id, end_reason="agent_hangup")
         try:
             await tr.run()
         except _Reject as r:
@@ -1152,8 +1290,8 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             await ws.close(r.code, r.reason)
         finally:
             if "t" in state:
-                finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
-            elif state.get("rejected") and (store.get_call_any(call_id) or {}).get("status") != "active":
+                await finish(call, state["t"], "agent_hangup" if tr.ended_by_us else "stream_closed")
+            elif state.get("rejected") and (await to_thread(store.get_call_any, call_id) or {}).get("status") != "active":
                 # Bad token, drain, or a cap refusal: drop a reservation the socket never adopted.
                 # A clean close before "start" keeps the slot so /twilio/resume can hand it to the new leg.
                 limiter.release(call["tenant_id"], call["id"])
@@ -1218,7 +1356,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         try:
             if app.state.draining:
                 return
-            default = store.get_agent_any(settings.audiosocket_agent) if settings.audiosocket_agent else None
+            default = await to_thread(store.get_agent_any, settings.audiosocket_agent) if settings.audiosocket_agent else None
             if default is None:
                 return
             # Reserve before reading the UUID. The read awaits, and a second connection must already see a full node.
@@ -1248,15 +1386,15 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                         holder = None
                     state["call"] = call
                     try:
-                        state["t"] = admit(call)
+                        state["t"] = await admit(call)
                     except _Reject:
                         # admit marks the row ended before raising. A continuation that never joined holds no
                         # slot; leaving it ended spends a resume and the next socket mints a blank call.
-                        fresh = store.get_call_any(call["id"])
+                        fresh = await to_thread(store.get_call_any, call["id"])
                         if fresh is not None and never_joined_continuation(fresh, sip_meta(fresh)):
-                            restore_continuation(fresh)
+                            await to_thread(restore_continuation, fresh)
                         raise
-                    return runtime.build_session(call, transport)
+                    return await to_thread(runtime.build_session, call, transport)
                 if not cid or holder is None:
                     writer.close()
                     raise EOFError("node full")
@@ -1288,13 +1426,14 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 if setup:
                     meta["from"] = setup.get("caller") or ""
                     meta["to"] = dialed
-                call = create_reserved(cid, chosen["tenant_id"], chosen["id"], "sip", chosen["config"], meta)
+                call = await to_thread(create_reserved, cid, chosen["tenant_id"], chosen["id"], "sip", chosen["config"], meta)
                 state["call"] = call
-                state["t"] = admit(call)
-                return runtime.build_session(call, transport)
+                state["t"] = await admit(call)
+                return await to_thread(runtime.build_session, call, transport)
 
             tr = AudioSocketTransport(reader, writer, factory, sample_rate=settings.audiosocket_rate)
-            tr.before_end = lambda: state.get("call") and store.update_call(state["call"]["id"], end_reason="agent_hangup")
+            tr.before_end = lambda: (
+                to_thread(store.update_call, state["call"]["id"], end_reason="agent_hangup") if state.get("call") else None)
             try:
                 await tr.run(uuid_timeout=AUDIOSOCKET_UUID_TIMEOUT_S)
             except _Reject:
@@ -1308,27 +1447,29 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         finally:
             app.state.audiosocket_writers.discard(writer)
             if "t" in state:
-                finish(state["call"], state["t"], "agent_hangup" if tr is not None and tr.ended_by_us else "stream_closed")
+                await finish(state["call"], state["t"], "agent_hangup" if tr is not None and tr.ended_by_us else "stream_closed")
             elif cid and holder is not None:
-                # Re-read. A _Reject path (draining, node full) already ended the row; writing
-                # admit_failed over that dict would erase the real reason. A created/active row
-                # is one admit never finished, and it still holds the slot.
-                cur = store.get_call_any(state["call"]["id"]) if state.get("call") else None
-                if cur and cur["status"] in ("created", "active"):
-                    release_open(cur, "admit_failed")
-                else:
-                    limiter.release(holder["tenant_id"], cid)
-                    # admit() records a failed active-status write as "error" so a browser websocket
-                    # still ends with that reason. This SIP leg never started, so the reason is admit_failed.
-                    # draining, node_full, and concurrency_limit are left as admit() wrote them.
-                    if cur and cur.get("end_reason") == "error":
-                        try:
-                            store.update_call(cur["id"], end_reason="admit_failed")
-                        except Exception:  # noqa: BLE001
-                            pass
-                # finish() drops the setup row for an admitted call. A rejected leg must not leave it either.
-                if cur or state.get("call"):
-                    drop_sip_setup(cur or state.get("call"))
+                def _release_placeholder() -> None:
+                    # Re-read. A _Reject path (draining, node full) already ended the row; writing
+                    # admit_failed over that dict would erase the real reason. A created/active row
+                    # is one admit never finished, and it still holds the slot.
+                    cur = store.get_call_any(state["call"]["id"]) if state.get("call") else None
+                    if cur and cur["status"] in ("created", "active"):
+                        release_open(cur, "admit_failed")
+                    else:
+                        limiter.release(holder["tenant_id"], cid)
+                        # admit() records a failed active-status write as "error" so a browser websocket
+                        # still ends with that reason. This SIP leg never started, so the reason is admit_failed.
+                        # draining, node_full, and concurrency_limit are left as admit() wrote them.
+                        if cur and cur.get("end_reason") == "error":
+                            try:
+                                store.update_call(cur["id"], end_reason="admit_failed")
+                            except Exception:  # noqa: BLE001
+                                pass
+                    if cur or state.get("call"):
+                        drop_sip_setup(cur or state.get("call"))
+
+                await to_thread(_release_placeholder)
             _abort_writer(writer)
 
     @app.on_event("startup")
@@ -1350,6 +1491,10 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         if srv:
             await srv.wait_closed()
 
+    @app.on_event("shutdown")
+    async def _stop_message_log():
+        await to_thread(runtime.message_log.close)
+
     @app.post("/twilio/resume/{call_id}")
     async def twilio_resume(call_id: str, request: Request):
         """Twilio lands here when a call's media stream has ended but the caller is still on the line. If the agent
@@ -1357,36 +1502,99 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         healthy node with the conversation so far, at most MAX_RESUMES times per call."""
         form = {k: str(v) for k, v in (await request.form()).items()}
         twilio_check(request, form)
-        call = store.get_call_any(call_id)
+        call = await to_thread(store.get_call_any, call_id)
         if not call or call["medium"] != "twilio" or call.get("end_reason") in ("agent_hangup", "transfer", "no_credit"):
             return Response(HANGUP_TWIML, media_type="text/xml")
         # The call is already over. Reconnecting would reserve another leg nobody answers.
         if form.get("CallStatus", "") in TERMINAL_CALL_STATUS:
-            release_open(call, form["CallStatus"])
+            status_name = form["CallStatus"]
+
+            def _end_terminal() -> None:
+                cur = store.get_call_any(call_id) or call
+                if cur.get("status") in ("created", "active"):
+                    store.update_call(call_id, status="ended", ended=time.time(), end_reason=status_name)
+                    try:
+                        limiter.release(cur["tenant_id"], cur["id"])
+                    except Exception:  # noqa: BLE001
+                        METRICS.inc("vox_errors_total", where="limiter_release")
+
+            await to_thread(_end_terminal)
             return Response(HANGUP_TWIML, media_type="text/xml")
         if app.state.draining:
-            release_open(call, "stream_lost")   # same slot release as a full node; Twilio gets TwiML, not a 503
+            # Busy TwiML, not a 503. The snapshot from before this await must not pick the reason.
+            def _end_drained() -> None:
+                runtime.wait_messages()
+                err = runtime.peek_message_error(call_id)
+                cur = store.get_call_any(call_id) or call
+                if cur.get("end_reason") == "transcript_failed" and cur.get("status") != "active":
+                    return
+                reason = "transcript_failed" if (err is not None or cur.get("end_reason") == "transcript_failed") else "stream_lost"
+                if cur.get("status") in ("created", "active"):
+                    store.update_call(call_id, status="ended", ended=time.time(), end_reason=reason)
+                    try:
+                        limiter.release(cur["tenant_id"], cur["id"])
+                    except Exception:  # noqa: BLE001
+                        METRICS.inc("vox_errors_total", where="limiter_release")
+
+            await to_thread(_end_drained)
             return Response(busy_twiml(), media_type="text/xml")
         meta = call["metadata"] if isinstance(call["metadata"], dict) else json.loads(call["metadata"] or "{}")
         n = int(meta.get("resumes", 0))
         if n >= MAX_RESUMES:
-            release_open(call, "stream_lost")
+            def _end_capped() -> None:
+                runtime.wait_messages()
+                err = runtime.peek_message_error(call_id)
+                cur = store.get_call_any(call_id) or call
+                if cur.get("end_reason") == "transcript_failed" and cur.get("status") != "active":
+                    return
+                reason = "transcript_failed" if (err is not None or cur.get("end_reason") == "transcript_failed") else "stream_lost"
+                if cur.get("status") in ("created", "active"):
+                    store.update_call(call_id, status="ended", ended=time.time(), end_reason=reason)
+                    try:
+                        limiter.release(cur["tenant_id"], cur["id"])
+                    except Exception:  # noqa: BLE001
+                        METRICS.inc("vox_errors_total", where="limiter_release")
+
+            await to_thread(_end_capped)
             METRICS.inc("vox_call_resume_refused_total")
             return Response('<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we are having technical '
                             'difficulties. Please call again shortly. Goodbye.</Say><Hangup/></Response>', media_type="text/xml")
-        # Free the dead leg and hold the replacement before yielding. Otherwise local_active drops to 0,
-        # another join takes the only slot, and this caller's new stream is closed node_full.
-        release_open(call, "stream_lost")
-        cid, decision = reserve_slot(call["tenant_id"])
-        if decision != "ok":
+        def _end_lost(reason: str) -> None:
+            # The end row must not land while the last lines are still only in the writer.
+            # A failed insert is not a clean cut-off. finish may already have consumed the
+            # in-memory error and stored transcript_failed; do not replace that.
+            runtime.wait_messages()
+            err = runtime.peek_message_error(call_id)
+            cur = store.get_call_any(call_id) or call
+            if cur.get("end_reason") == "transcript_failed" and cur.get("status") != "active":
+                return
+            if err is not None or cur.get("end_reason") == "transcript_failed":
+                reason = "transcript_failed"
+            if cur.get("status") in ("created", "active"):
+                store.update_call(call_id, status="ended", ended=time.time(), end_reason=reason)
+                try:
+                    limiter.release(cur["tenant_id"], cur["id"])
+                except Exception:  # noqa: BLE001
+                    METRICS.inc("vox_errors_total", where="limiter_release")
+
+        def _handoff():
+            # Free the dead leg and hold the replacement before returning. A gap where
+            # local_active drops to 0 lets another join take the only slot.
+            _end_lost("stream_lost")
+            cid, decision = reserve_slot(call["tenant_id"])
+            if decision != "ok":
+                return None
+            return create_reserved(cid, call["tenant_id"], call["agent_id"], "twilio", call["config"],
+                                   {**meta, "resumedFrom": call_id, "resumes": n + 1})
+
+        nxt = await to_thread(_handoff)
+        if nxt is None:
             return Response(busy_twiml(), media_type="text/xml")   # no new row while this process is full
-        nxt = create_reserved(cid, call["tenant_id"], call["agent_id"], "twilio", call["config"],
-                              {**meta, "resumedFrom": call_id, "resumes": n + 1})
         resumed_sid = str(form.get("CallSid", "") or (nxt["metadata"] or {}).get("callSid") or "")
         if not await bind_status_callback(nxt["id"], resumed_sid):
             return _drop_unbound(nxt)
         METRICS.inc("vox_call_resumes_total")
-        store.audit(call["tenant_id"], "system", "call.resume", nxt["id"], {"from": call_id, "attempt": n + 1})
+        await to_thread(store.audit, call["tenant_id"], "system", "call.resume", nxt["id"], {"from": call_id, "attempt": n + 1})
         return Response(stream_twiml(nxt), media_type="text/xml")
 
     SIP_OURS = ("agent_hangup", "transfer", "no_credit")
@@ -1526,12 +1734,16 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         caller_id = body.fromNumber or settings.twilio_number
         if not caller_id or not E164.match(caller_id):
             raise HTTPException(422, "no valid caller id: pass fromNumber or set VOX_TWILIO_NUMBER")
-        agent = store.get_agent(t["id"], body.agentId)
+        agent = await to_thread(store.get_agent, t["id"], body.agentId)
         if not agent:
             raise HTTPException(404, "agent not found")
         day_ago = time.time() - 86400
-        recent = sum(1 for c in store.list_calls(t["id"], limit=10_000)
-                     if c["created"] >= day_ago and c["metadata"].get("direction") == "outbound")
+
+        def _recent() -> int:
+            return sum(1 for c in store.list_calls(t["id"], limit=10_000)
+                       if c["created"] >= day_ago and c["metadata"].get("direction") == "outbound")
+
+        recent = await to_thread(_recent)
         if recent >= settings.outbound_per_day:
             raise HTTPException(429, f"outbound limit reached ({settings.outbound_per_day} per 24 h)")
         cfg = dict(agent["config"])
@@ -1550,7 +1762,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         cid, decision = reserve_slot(t["id"])
         if decision != "ok":
             raise HTTPException(503, "node full" if decision == "node" else "concurrency limit")
-        call = create_reserved(cid, t["id"], body.agentId, "twilio", cfg, meta)
+        call = await to_thread(create_reserved, cid, t["id"], body.agentId, "twilio", cfg, meta)
         twiml = stream_twiml(call)
         data = {"To": body.to, "From": caller_id, "Twiml": twiml,
                 "StatusCallback": f"{settings.public_base_url}/twilio/status/{call['id']}",
@@ -1559,13 +1771,13 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             data.update({"MachineDetection": "DetectMessageEnd", "AsyncAmd": "true",
                          "AsyncAmdStatusCallback": f"{settings.public_base_url}/twilio/amd/{call['id']}"})
 
-        def adopted_call():
+        async def adopted_call():
             """Twilio can open /ws/twilio before this POST returns. That leg is live; finish() owns the slot."""
-            cur = store.get_call_any(call["id"])
+            cur = await to_thread(store.get_call_any, call["id"])
             if not cur or cur.get("status") != "active":
                 return None
             meta_now = cur["metadata"] if isinstance(cur.get("metadata"), dict) else {}
-            log(t, "call.outbound", call["id"], to=body.to)
+            await to_thread(log, t, "call.outbound", call["id"], to=body.to)
             return {**public_call(cur), "callSid": str(meta_now.get("callSid") or "")}
 
         try:
@@ -1573,18 +1785,24 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                 f"https://api.twilio.com/2010-04-01/Accounts/{settings.twilio_account_sid}/Calls.json",
                 auth=(settings.twilio_account_sid, settings.twilio_auth_token), data=data, timeout=15)
         except Exception as e:  # noqa: BLE001
-            live = adopted_call()
+            live = await adopted_call()
             if live is not None:
                 return live
-            limiter.release(t["id"], call["id"])
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="twilio_unreachable")
+            try:
+                limiter.release(t["id"], call["id"])
+            except Exception:  # noqa: BLE001
+                METRICS.inc("vox_errors_total", where="limiter_release")
+            await to_thread(store.update_call, call["id"], status="ended", ended=time.time(), end_reason="twilio_unreachable")
             raise HTTPException(502, f"could not reach Twilio: {type(e).__name__}") from e
         if r.status_code >= 300:
-            live = adopted_call()
+            live = await adopted_call()
             if live is not None:
                 return live
-            limiter.release(t["id"], call["id"])
-            store.update_call(call["id"], status="ended", ended=time.time(), end_reason="twilio_rejected")
+            try:
+                limiter.release(t["id"], call["id"])
+            except Exception:  # noqa: BLE001
+                METRICS.inc("vox_errors_total", where="limiter_release")
+            await to_thread(store.update_call, call["id"], status="ended", ended=time.time(), end_reason="twilio_rejected")
             try:
                 msg = r.json().get("message", "")
             except ValueError:
@@ -1593,33 +1811,46 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         try:
             payload = r.json()
             sid = payload.get("sid", "") if isinstance(payload, dict) else ""
-            store.update_call(call["id"], metadata={**meta, "callSid": sid})
+            await to_thread(store.update_call, call["id"], metadata={**meta, "callSid": sid})
         except Exception:  # noqa: BLE001
-            live = adopted_call()
+            live = await adopted_call()
             if live is not None:
                 return live
             # 2xx we cannot record is the same as a dial that never took a slot. Release first:
             # a second write failure must not leave the node full.
-            limiter.release(t["id"], call["id"])
             try:
-                store.update_call(call["id"], status="ended", ended=time.time(), end_reason="twilio_rejected")
+                limiter.release(t["id"], call["id"])
+            except Exception:  # noqa: BLE001
+                METRICS.inc("vox_errors_total", where="limiter_release")
+            try:
+                await to_thread(store.update_call, call["id"], status="ended", ended=time.time(), end_reason="twilio_rejected")
             except Exception:  # noqa: BLE001
                 pass
             raise HTTPException(502, f"Twilio returned an unreadable call (HTTP {r.status_code})")
-        log(t, "call.outbound", call["id"], to=body.to)
-        return {**public_call(store.get_call_any(call["id"])), "callSid": sid}
+        await to_thread(log, t, "call.outbound", call["id"], to=body.to)
+        fresh = await to_thread(store.get_call_any, call["id"])
+        return {**public_call(fresh), "callSid": sid}
 
     @app.post("/twilio/status/{call_id}")
     async def twilio_status(call_id: str, request: Request):
         form = {k: str(v) for k, v in (await request.form()).items()}
         twilio_check(request, form)
-        call = store.get_call_any(call_id)
+        call = await to_thread(store.get_call_any, call_id)
         if not call:
             raise HTTPException(404, "call not found")
         status = form.get("CallStatus", "")
-        if call["status"] == "created" and status in TERMINAL_CALL_STATUS:
-            store.update_call(call_id, status="ended", ended=time.time(), end_reason=status)   # never answered / never connected
-            limiter.release(call["tenant_id"], call_id)   # the socket never adopted the reservation
+        # The snapshot above goes stale across this await. Only a row still in `created` ends here,
+        # so a join that already claimed it is not rewritten back to busy/no-answer.
+        if status in TERMINAL_CALL_STATUS:
+            ended = await to_thread(store.update_call_if_status, call_id, "created",
+                                    status="ended", ended=time.time(), end_reason=status)
+            if ended:
+                # The socket never adopted the reservation. A join that already claimed `created`
+                # did not end, and its slot stays held.
+                try:
+                    limiter.release(call["tenant_id"], call_id)
+                except Exception:  # noqa: BLE001
+                    METRICS.inc("vox_errors_total", where="limiter_release")
         return {"ok": True}
 
     @app.post("/twilio/whisper/{call_id}")
@@ -1627,9 +1858,19 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """Played only to the person who answers a warm transfer, before they are connected to the caller."""
         form = {k: str(v) for k, v in (await request.form()).items()}
         twilio_check(request, form)
-        if not store.get_call_any(call_id):
+        if not await to_thread(store.get_call_any, call_id):
             raise HTTPException(404, "call not found")
-        said = [m["text"] for m in store.messages(call_id) if m["role"] == "user" and m["text"] != "[inaudible]"][-2:]
+
+        def _said():
+            runtime.wait_messages()
+            err = runtime.peek_message_error(call_id)
+            if err is not None:
+                return err
+            return [m["text"] for m in store.messages(call_id) if m["role"] == "user" and m["text"] != "[inaudible]"][-2:]
+
+        said = await to_thread(_said)
+        if isinstance(said, BaseException):
+            raise HTTPException(500, f"{type(said).__name__}: {said}")
         clean = lambda x: re.sub(r"[^\w\s.,?!'-]", "", x)[:160]  # noqa: E731
         summary = " Then they said: ".join(clean(x) for x in said) or "They did not leave details"
         from xml.sax.saxutils import escape as xesc
@@ -1642,7 +1883,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         """Twilio's <Dial action>: hang up when the human talked and finished; if nobody answered, bring the agent back."""
         form = {k: str(v) for k, v in (await request.form()).items()}
         twilio_check(request, form)
-        call = store.get_call_any(call_id)
+        call = await to_thread(store.get_call_any, call_id)
         if not call:
             raise HTTPException(404, "call not found")
         if form.get("DialCallStatus", "") == "completed":
@@ -1650,7 +1891,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         # The Dial already replaced this call's media stream. Drop a slot it still holds, then hold
         # the return leg before yielding so it cannot lose the only slot to another join.
         if call["status"] == "active":
-            store.update_call(call_id, status="ended", ended=time.time(), end_reason="transfer_return")
+            await to_thread(store.update_call, call_id, status="ended", ended=time.time(), end_reason="transfer_return")
             limiter.release(call["tenant_id"], call_id)
         if app.state.draining:
             return Response(busy_twiml(), media_type="text/xml")
@@ -1670,7 +1911,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             prev = ""
         cfg["systemPrompt"] = base_prompt + note
         meta = {**call["metadata"], "resumedFrom": call_id, "promptSuffix": prev + note}
-        resumed = create_reserved(cid, call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
+        resumed = await to_thread(create_reserved, cid, call["tenant_id"], call["agent_id"], "twilio", cfg, meta)
         resumed_sid = str(form.get("CallSid", "") or (resumed["metadata"] or {}).get("callSid") or "")
         if not await bind_status_callback(resumed["id"], resumed_sid):
             return _drop_unbound(resumed)
@@ -1684,7 +1925,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
         call bus; the owning node's session is subscribed and speaks."""
         form = {k: str(v) for k, v in (await request.form()).items()}
         twilio_check(request, form)
-        call = store.get_call_any(call_id)
+        call = await to_thread(store.get_call_any, call_id)
         if not call:
             raise HTTPException(404, "call not found")
         answered = form.get("AnsweredBy", "")

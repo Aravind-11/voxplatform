@@ -8,6 +8,7 @@ filters by tenant_id.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
 import threading
@@ -66,14 +67,55 @@ def normalize_e164(raw: str) -> str:
     return "".join(str(raw or "").split())
 
 
+class _BufferedCursor:
+    """Rows copied off a pooled connection before it is returned to the pool."""
+
+    def __init__(self, rows: list, rowcount: int):
+        self._rows = rows
+        self._i = 0
+        self.rowcount = rowcount
+
+    def fetchone(self):
+        if self._i >= len(self._rows):
+            return None
+        row = self._rows[self._i]
+        self._i += 1
+        return row
+
+    def fetchall(self):
+        rows = self._rows[self._i:]
+        self._i = len(self._rows)
+        return rows
+
+
+def _buffer_cursor(cur: Any) -> _BufferedCursor:
+    if getattr(cur, "description", None):
+        rows = [dict(r) for r in cur.fetchall()]
+    else:
+        rows = []
+    return _BufferedCursor(rows, cur.rowcount)
+
+
+def _connection_closed(conn: Any) -> bool:
+    if conn is None:
+        return True
+    flag = getattr(conn, "closed", False)
+    if callable(flag):
+        try:
+            flag = flag()
+        except Exception:  # noqa: BLE001
+            return False
+    return bool(flag)
+
+
 class Store:
     def __init__(self, path: str = ":memory:"):
         self.lock = threading.RLock()
+        self.dsn = path
+        self.pool = None
         self.pg = path.startswith(("postgres://", "postgresql://"))
         if self.pg:
-            import psycopg
-            from psycopg.rows import dict_row
-            self.db = psycopg.connect(path, autocommit=True, row_factory=dict_row)
+            self._open_postgres()
             real, serial = "DOUBLE PRECISION", "BIGSERIAL PRIMARY KEY"
         else:
             self.db = sqlite3.connect(path, check_same_thread=False)
@@ -92,16 +134,91 @@ class Store:
                 self._x("UPDATE api_keys SET id=? WHERE key_hash=?", (new_id("key"), r["key_hash"]))
 
     # ---- low level
+    def _open_postgres(self) -> None:
+        """Connect to `self.dsn`. A pool is used when psycopg_pool imports; otherwise one connection."""
+        import psycopg
+        from psycopg.rows import dict_row
+        try:
+            from psycopg_pool import ConnectionPool
+        except ImportError:
+            ConnectionPool = None  # noqa: N806  (optional dependency)
+        if ConnectionPool is not None:
+            try:
+                max_size = int(os.environ.get("VOX_DB_POOL", "8"))
+            except ValueError:
+                max_size = 8
+            max_size = max(1, max_size)
+            self.pool = ConnectionPool(self.dsn, min_size=1, max_size=max_size, open=True,
+                                       kwargs={"autocommit": True, "row_factory": dict_row})
+            self.db = self.pool
+            return
+        self.pool = None
+        self.db = psycopg.connect(self.dsn, autocommit=True, row_factory=dict_row)
+
+    def _reconnect(self) -> None:
+        """Replace a dead Postgres connection or pool, same DSN. One retry, not a reconnect loop."""
+        if self.pool is not None:
+            try:
+                self.pool.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.pool = None
+        else:
+            db = getattr(self, "db", None)
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._open_postgres()
+
+    def _transient_pg(self, exc: BaseException) -> bool:
+        """Operational failures and a closed connection are retried once. Programming errors are not."""
+        try:
+            import psycopg
+        except ImportError:
+            return False
+        if isinstance(exc, psycopg.ProgrammingError):
+            return False
+        if isinstance(exc, psycopg.OperationalError):
+            return True
+        if self.pool is None and _connection_closed(getattr(self, "db", None)):
+            return True
+        return False
+
+    def _ensure_open(self, conn: Any) -> None:
+        if not _connection_closed(conn):
+            return
+        import psycopg
+        raise psycopg.OperationalError("connection is closed")
+
     def _sql(self, sql: str) -> str:
         return sql.replace("?", "%s") if self.pg else sql
 
-    def _run(self, sql: str, args: tuple = ()):
-        if self.pg:
-            cur = self.db.cursor()
-            cur.execute(self._sql(sql), args)
+    def _run(self, sql: str, args: tuple = (), *, _retry: bool = True):
+        if not self.pg:
+            cur = self.db.execute(sql, args)
+            self.db.commit()
             return cur
-        cur = self.db.execute(sql, args)
-        self.db.commit()
+        try:
+            return self._run_pg(sql, args)
+        except Exception as exc:  # noqa: BLE001
+            if _retry and self._transient_pg(exc):
+                self._reconnect()
+                return self._run(sql, args, _retry=False)
+            raise
+
+    def _run_pg(self, sql: str, args: tuple = ()):
+        sql = self._sql(sql)
+        if self.pool is not None:
+            with self.pool.connection() as conn:  # checks a connection out of the pool
+                self._ensure_open(conn)
+                cur = conn.cursor()
+                cur.execute(sql, args)
+                return _buffer_cursor(cur)
+        self._ensure_open(self.db)
+        cur = self.db.cursor()
+        cur.execute(sql, args)
         return cur
 
     def _add_column(self, table: str, col: str, typ: str) -> None:
@@ -128,11 +245,18 @@ class Store:
 
     def ping(self) -> None:
         """Raises if the database cannot answer (readiness check)."""
+        if self.pool is not None:
+            with self.pool.connection() as conn:  # readiness checks out a real connection
+                conn.execute("SELECT 1")
+            return
         self._one("SELECT 1 AS x")
 
     def close(self) -> None:
         with self.lock:
-            self.db.close()
+            if self.pool is not None:
+                self.pool.close()
+            else:
+                self.db.close()
 
     # ---- tenants / keys
     def create_tenant(self, name: str, concurrency_limit: Optional[int] = None, email: Optional[str] = None,
@@ -418,6 +542,20 @@ class Store:
         if fields:
             cols = ", ".join(f"{k}=?" for k in fields)
             self._x(f"UPDATE calls SET {cols} WHERE id=?", (*fields.values(), call_id))
+
+    def update_call_if_status(self, call_id: str, current: str, **fields: Any) -> bool:
+        """Apply `fields` only while the row's status is still `current`. False if that lost the race."""
+        allowed = {"status", "joined", "ended", "end_reason", "metadata"}
+        assert set(fields) <= allowed, f"unexpected fields {set(fields) - allowed}"
+        if "metadata" in fields:
+            fields["metadata"] = json.dumps(fields["metadata"])
+        if not fields:
+            return False
+        cols = ", ".join(f"{k}=?" for k in fields)
+        return self._x(
+            f"UPDATE calls SET {cols} WHERE id=? AND status=?",
+            (*fields.values(), call_id, current),
+        ) > 0
 
     # ---- usage
     def usage(self, tenant_id: str, days: int = 30) -> dict:

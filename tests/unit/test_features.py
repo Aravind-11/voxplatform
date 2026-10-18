@@ -1200,6 +1200,91 @@ def test_drain_during_outbound_admit_places_nothing():
     assert store.list_calls(tid) == []
 
 
+async def test_outbound_lock_wait_does_not_block_the_event_loop():
+    """/healthz must return while /v1/calls/outbound is still polling a held cap lock.
+
+    The poll sleeps. Running that sleep on the event loop keeps healthz from starting until the wait ends.
+    """
+    from api import security
+    from api.app import create_app
+    from api.runtime import Runtime
+    from api.store import Store
+    from test_api import FakeLLM as L, FakeTTS as T, FakeVAD
+
+    class HeldLock(_OutboundRedis):
+        def __init__(self):
+            super().__init__()
+            self.rejected_nx = 0
+
+        def set(self, name, value, ex=None, nx=False, **kwargs):
+            result = super().set(name, value, ex=ex, nx=nx, **kwargs)
+            if nx and result is None:
+                self.rejected_nx += 1
+            return result
+
+        def ping(self):
+            return True
+
+    def handler(req):
+        return httpx.Response(201, json={"sid": "CA1"})
+
+    store = Store()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    rt = Runtime(L(), lambda v: T(), FakeVAD, store, http=http)
+    fake = HeldLock()
+    settings = Settings(admin_key="adm", public_base_url="https://vox.example.com", twilio_auth_token="tok",
+                        twilio_account_sid="ACtest", twilio_number="+15550001111", outbound_per_day=5)
+    app = create_app(store, rt, security.RedisLimiter(client=fake), None, settings)
+    old_wait = security.OutboundCap.LOCK_WAIT_S
+    security.OutboundCap.LOCK_WAIT_S = 3          # inline sleep would block the loop for this long
+    outbound_task = None
+    key = ""
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = await client.post("/admin/tenants", json={"name": "acme"}, headers={"X-Admin-Key": "adm"})
+            assert created.status_code == 200
+            key_api, tid = created.json()["apiKey"], created.json()["tenantId"]
+            agent = await client.post("/v1/agents", json={"name": "a"}, headers={"X-API-Key": key_api})
+            assert agent.status_code == 200
+            key = f"vox:outbound-lock:{tid}"
+            with fake._mu:
+                fake.kv[key] = ("other-holder", time.time() + 60)
+            outbound_task = asyncio.create_task(client.post(
+                "/v1/calls/outbound", json={"agentId": agent.json()["id"], "to": "+15551230000"},
+                headers={"X-API-Key": key_api}))
+
+            async def until_polling():
+                while fake.rejected_nx < 1:
+                    await asyncio.sleep(0.01)
+
+            try:
+                await asyncio.wait_for(until_polling(), timeout=2)
+            except TimeoutError:
+                raise AssertionError("outbound lock poll never yielded; the wait is on the event loop") from None
+            assert not outbound_task.done()               # still inside the lock poll
+            started = time.monotonic()
+            health = await client.get("/healthz")
+            elapsed = time.monotonic() - started
+            assert health.status_code == 200 and health.json()["ok"] is True
+            assert elapsed < 0.5                           # not stuck behind LOCK_WAIT_S
+            assert not outbound_task.done()
+            assert fake.rejected_nx >= 1
+            with fake._mu:
+                assert key in fake.kv                     # the other holder still owns it
+                fake.kv.pop(key, None)                    # let the poll acquire and finish
+            resp = await outbound_task
+            outbound_task = None
+            assert resp.status_code == 200 and resp.json()["callSid"] == "CA1"
+    finally:
+        security.OutboundCap.LOCK_WAIT_S = old_wait
+        if key:
+            with fake._mu:
+                fake.kv.pop(key, None)
+        if outbound_task is not None and not outbound_task.done():
+            await outbound_task
+
+
 # ------------------------------------------------------------------ draining (scale-in without dropping calls)
 def test_drain_stops_new_calls_but_reports_readiness():
     from test_api import speech, silence

@@ -309,3 +309,35 @@ def test_claim_words_so_far_does_not_mark_the_rest_of_the_sentence_heard():
     assert sentence not in a.text and sentence not in b.text
     _fill_word_slices([a, b], [2880, 2880], sentence)
     assert (a.text + " " + b.text).split() == sentence.split()
+
+
+def test_build_selects_http_tts_from_the_environment(monkeypatch, tmp_path):
+    """Deleting the VOX_TTS_URL branch, or a model/key/rate default, must fail. Import runs build()."""
+    import sys
+
+    from core.metrics import METRICS
+
+    monkeypatch.setenv("VOX_TTS_URL", "http://tts.example/v1")
+    monkeypatch.setenv("VOX_TTS_MODEL", "tts-1-hd")
+    monkeypatch.setenv("VOX_TTS_API_KEY", "secret")
+    monkeypatch.setenv("VOX_TTS_RATE", "16000")
+    monkeypatch.setenv("VOX_DB", str(tmp_path / "vox.db"))
+    monkeypatch.delenv("VOX_REDIS_URL", raising=False)
+    monkeypatch.delenv("VOX_EMBED_URL", raising=False)
+    assert "api.main" not in sys.modules
+    gauges = dict(METRICS.gauges)
+    import api.main
+    rt = api.main.app.state.runtime
+    try:
+        tts = rt.make_tts("af_heart")
+        assert isinstance(tts, HttpTTS)
+        assert tts.base_url == "http://tts.example/v1"
+        assert tts.model == "tts-1-hd"
+        assert tts.voice == "af_heart"
+        assert tts.api_key == "secret"
+        assert tts.sample_rate == 16000
+        assert tts.client is rt.http
+    finally:
+        METRICS.gauges.clear()
+        METRICS.gauges.update(gauges)
+        rt.store.db.close()

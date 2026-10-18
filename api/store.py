@@ -415,7 +415,11 @@ class Store:
                 (e164, tenant_id, agent_id))
 
     def get_number(self, e164: str) -> Optional[dict]:
-        r = self._one("SELECT e164, tenant_id, agent_id FROM numbers WHERE e164=?", (normalize_e164(e164),))
+        key = normalize_e164(e164)
+        # _X. posts the dialed digits with no leading '+'. Rows are stored as E.164.
+        if key.isdigit():
+            key = "+" + key
+        r = self._one("SELECT e164, tenant_id, agent_id FROM numbers WHERE e164=?", (key,))
         return dict(r) if r else None
 
     def delete_number(self, tenant_id: str, e164: str) -> bool:

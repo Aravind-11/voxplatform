@@ -177,6 +177,12 @@ def test_number_normalize_and_setup_rows_expire():
     s.put_number("tnt", "+1 555 111 0000", "agt_b")
     got = s.get_number("+15551110000")
     assert got["tenant_id"] == "tnt" and got["agent_id"] == "agt_b" and got["e164"] == "+15551110000"
+    # Asterisk's _X. pattern posts ${EXTEN} as digits. The row is stored with a leading '+'.
+    bare = s.get_number("15551110000")
+    assert bare is not None and bare["agent_id"] == "agt_b" and bare["e164"] == "+15551110000"
+    dialplan = open("deploy/sip/extensions.conf", encoding="utf-8").read()
+    assert "Goto(${EXTEN:1},1)" in dialplan
+    assert "Goto(_X.,1)" not in dialplan
     assert s.delete_number("other", "+15551110000") is False
     assert s.delete_number("tnt", "+15551110000") is True and s.get_number("+15551110000") is None
     s.put_sip_setup("old", "+1", "+15551110000", created=time.time() - 90)
@@ -273,6 +279,16 @@ def test_dialed_number_routes_to_the_mapped_agent_and_no_setup_uses_the_default(
         plain = uuid.uuid4()
         sock = connect(plain)
         assert wait_n(3)[0]["agent_id"] == ag_a["id"]           # no setup row: the configured default agent
+        sock.sendall(A.pack(A.KIND_HANGUP))
+        sock.close()
+        wait_ended()
+
+        bare = uuid.uuid4()
+        ok = c.post("/internal/sip/setup", data={"uuid": str(bare), "caller": "+19998887777", "exten": "15551110000"},
+                    headers={"X-Vox-Sip-Token": "sip-secret"})
+        assert ok.status_code == 200
+        sock = connect(bare)
+        assert wait_n(4)[0]["agent_id"] == ag_b["id"]           # digits-only EXTEN still selects the E.164 mapping
         sock.sendall(A.pack(A.KIND_HANGUP))
         sock.close()
         wait_ended()

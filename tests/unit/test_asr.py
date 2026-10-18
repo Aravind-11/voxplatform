@@ -88,6 +88,7 @@ async def test_wrapper_transcribes_with_asr_and_streams_on_the_inner_client():
     client = _Client({"text": "from asr"})
     wrapped = AsrLLM(inner, HttpASR("http://asr.local/v1", client))
     assert await wrapped.transcribe(audio) == "from asr"
+    assert client.posts[0]["data"] == {"model": "whisper-1"}
     assert inner.transcripts == 0
     assert [x async for x in wrapped.stream([], audio, [], [])] == ["hello"]
     assert inner.streams == 1
@@ -128,6 +129,47 @@ async def test_runtime_prefers_asr_only_when_url_and_client_are_set(monkeypatch)
     assert rt_no_http.build_session(_call(store, {"systemPrompt": "Be brief."}), _T()).llm is inner
 
 
+async def test_unset_or_blank_asr_model_posts_whisper_1(monkeypatch):
+    """VOX_ASR_MODEL defaults to whisper-1, and a blank value is not posted as an empty model."""
+    monkeypatch.setenv("VOX_ASR_URL", "http://asr.local/v1/")
+    monkeypatch.delenv("VOX_ASR_MODEL", raising=False)
+    passed: list[str] = []
+    real = HttpASR
+
+    def capture(base_url, client, model="whisper-1"):
+        passed.append(model)
+        return real(base_url, client, model)
+
+    monkeypatch.setattr("api.runtime.HttpASR", capture)
+    audio = np.array([1, -2, 3], np.int16)
+    inner = _Inner()
+    store = Store()
+
+    async def posted(env: str | None) -> dict:
+        if env is None:
+            monkeypatch.delenv("VOX_ASR_MODEL", raising=False)
+        else:
+            monkeypatch.setenv("VOX_ASR_MODEL", env)
+        client = _Client({"text": "from asr"})
+        rt = Runtime(inner, lambda v: FakeTTS(), FakeVAD, store, http=client)
+        sess = rt.build_session(_call(store, {"systemPrompt": "Be brief."}), _T())
+        assert await sess.llm.transcribe(audio) == "from asr"
+        return client.posts[0]["data"]
+
+    assert await posted(None) == {"model": "whisper-1"}
+    assert await posted("") == {"model": "whisper-1"}
+    assert await posted("   ") == {"model": "whisper-1"}
+    # The runtime mapping itself must be whisper-1. HttpASR also rewrites a falsy model, so the
+    # post body alone would stay green if `strip() or "whisper-1"` stopped doing that.
+    assert passed == ["whisper-1", "whisper-1", "whisper-1"]
+    bare = _Client({"text": "bare"})
+    assert await HttpASR("http://asr.local/v1", bare).transcribe(audio) == "bare"
+    assert bare.posts[0]["data"] == {"model": "whisper-1"}
+    blank = _Client({"text": "blank"})
+    assert await HttpASR("http://asr.local/v1", blank, model="").transcribe(audio) == "blank"
+    assert blank.posts[0]["data"] == {"model": "whisper-1"}
+
+
 def test_restate_sentence_is_in_the_prompt_only_when_the_flag_is_on(monkeypatch):
     monkeypatch.delenv("VOX_ASR_URL", raising=False)
     store = Store()
@@ -149,6 +191,11 @@ def test_agent_stores_restate_slots_only_when_enabled():
     assert "restateSlots" not in store.get_agent_any(plain["id"])["config"]
     flagged = c.post("/v1/agents", json={"name": "f", "systemPrompt": "hi", "restateSlots": True}, headers=h).json()
     assert store.get_agent_any(flagged["id"])["config"]["restateSlots"] is True
+    # An omitted flag must not clear a reminder that is already on. Popping whenever the patch
+    # field is not True would keep every assertion above and drop it here.
+    assert c.patch(f"/v1/agents/{flagged['id']}", json={"systemPrompt": "still on"}, headers=h).status_code == 200
+    kept = store.get_agent_any(flagged["id"])["config"]
+    assert kept["systemPrompt"] == "still on" and kept["restateSlots"] is True
     assert c.patch(f"/v1/agents/{flagged['id']}", json={"restateSlots": False}, headers=h).status_code == 200
     assert "restateSlots" not in store.get_agent_any(flagged["id"])["config"]
     assert c.patch(f"/v1/agents/{plain['id']}", json={"systemPrompt": "still"}, headers=h).status_code == 200

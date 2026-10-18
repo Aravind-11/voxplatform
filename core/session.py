@@ -709,11 +709,16 @@ class Session:
     async def _interrupt(self, gen: _Generation) -> None:
         self._overlapped = True
         self._overlap_unscored += 1
-        heard, cut = self.tracker.heard()
         await self.clear_audio()          # stop the far end first: that is what the caller hears
+        if gen.cancelled:
+            # Another caller cancelled this generation while clear_audio waited on the socket.
+            # Keep their trim; a snapshot from this entry would wipe it and count the barge twice.
+            self._overlap_unscored = max(0, self._overlap_unscored - 1)
+            return
         if self.recorder is not None:
             self.recorder.clear()
-        await self._cancel(gen)
+        await self._cancel(gen)           # sets gen.cancelled before it yields, so the other caller loses
+        heard, cut = self.tracker.heard()
         a, gen.after = gen.after, None
         if a is not None and a.strict:
             self._spawn_action(a)         # strict: the caller talking over the goodbye does not keep the call alive

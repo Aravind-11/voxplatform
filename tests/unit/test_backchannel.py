@@ -612,6 +612,53 @@ async def test_prior_transcript_failure_still_commits_stop():
         await r.s.close()
 
 
+async def test_later_interrupt_keeps_the_heard_line_when_clear_is_slow():
+    """The overlap task can be inside clear_audio while the reader opens a real turn and
+    interrupts the same generation. The resume that snapshotted heard text earlier must not
+    wipe the line the later interrupt saved, or count the barge twice."""
+    gate = asyncio.Event()
+    nclear = {"n": 0}
+
+    async def transcribe(audio):
+        if len(audio) and bool((audio == 7000).any()) and not bool((audio == 4000).any()):
+            return "stop"
+        if len(audio) and bool((audio == 7000).any()):
+            return "stop I need a person"
+        return "hello"
+
+    r = await _agent_playing(transcribe, [
+        ["Hold on, I am still talking through this whole reply with you right now."],
+        ["Okay, go on."],
+    ])
+
+    async def clear():
+        nclear["n"] += 1
+        r.clears += 1
+        if nclear["n"] == 1:
+            await gate.wait()
+
+    r.s.clear_audio = clear
+    try:
+        await _feed_value(r, np.full(512, 7000, np.int16), 12)   # 384 ms, under the 450 ms gate
+        await r.frames("q", 8)
+        await r.settle()
+        assert nclear["n"] == 1                                   # overlap interrupt is held in clear
+        await _feed_value(r, np.full(512, 4000, np.int16), 16)    # opens a real turn while clear is held
+        gate.set()
+        await r.frames("q", 25)
+        await r.settle()
+        assistant = [m.get("content", "") for m in r.s.history if m.get("role") == "assistant"]
+        assert any(text.endswith("[interrupted]") and text.startswith("Hold") for text in assistant)
+        interrupted = [e for e in r.events if e["type"] == "user_interrupted"]
+        assert len(interrupted) == 1 and interrupted[0]["heard"].startswith("Hold")
+        assert r.s.stats["interruptions"] == 1
+        assert r.s._overlap_unscored == 0
+        assert "stop I need a person" in _user_texts(r)
+    finally:
+        gate.set()
+        await r.s.close()
+
+
 async def test_two_real_overlaps_do_not_leave_an_extra_generation():
     """Both transcripts unblock while the previous turn's transcript is still running.
     Both phrases are turns. Only the later reply stays live, and hang-up cancels it too."""

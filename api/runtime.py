@@ -27,6 +27,25 @@ from .writebehind import MessageLog
 _LlmWithASR = AsrLLM
 
 
+def _turn_config(cfg: dict) -> TurnConfig:
+    """Env defaults, then the agent's optional `turn` object (endMs, eotThreshold, patientMs)."""
+    over = cfg.get("turn") or {}
+    if not isinstance(over, dict):
+        over = {}
+
+    def pick(key: str, env: str, default: str) -> float:
+        raw = over.get(key)
+        if raw is None:
+            raw = os.environ.get(env, default)
+        return float(raw)
+
+    return TurnConfig(end_ms=pick("endMs", "VOX_END_MS", "640"),
+                      eot_threshold=pick("eotThreshold", "VOX_EOT_THRESHOLD", "0.8"),
+                      patient_end_ms=pick("patientMs", "VOX_PATIENT_MS", "1000"),
+                      backchannel_ms=BACKCHANNEL_MS.get(str(cfg.get("bargeIn") or "normal"),
+                                                         BACKCHANNEL_MS["normal"]))
+
+
 class LimitedTTS:
     """The semaphore stays (GIL-bound G2P); streaming removes the per-sentence buffer; a separate process is VOX_TTS_URL.
 
@@ -267,8 +286,17 @@ class Runtime:
         return None
 
     def _eot_sync(self):
-        """Acoustic end-of-turn cues, no model (VOX_EOT=prosody|both); falls back to an injected eot_fn."""
-        if self._eot_mode() in ("prosody", "both"):
+        """Acoustic end-of-turn cues, no model (VOX_EOT=prosody|both|classifier); falls back to an injected eot_fn.
+
+        `classifier` is a logistic retune of the same prosody features. It does not solve end-of-turn
+        detection. A missing VOX_EOT_MODEL keeps the hand priors.
+        """
+        mode = self._eot_mode()
+        if mode == "classifier":
+            from core.eot_classifier import EotClassifier
+            clf = EotClassifier.load(os.environ.get("VOX_EOT_MODEL", ""))
+            return lambda audio, history: clf.score(audio)
+        if mode in ("prosody", "both"):
             from core.prosody import eot_prosody
             return eot_prosody
         return self.eot_fn
@@ -420,11 +448,7 @@ class Runtime:
                              greeting=greeting,
                              error_phrase=ERROR_PHRASE.get(lang, ERROR_PHRASE["en"]),
                              tool_fillers=fillers,
-                             turn=TurnConfig(end_ms=float(os.environ.get("VOX_END_MS", "640")),
-                                             eot_threshold=float(os.environ.get("VOX_EOT_THRESHOLD", "0.8")),
-                                             patient_end_ms=float(os.environ.get("VOX_PATIENT_MS", "1000")),
-                                             backchannel_ms=BACKCHANNEL_MS.get(str(cfg.get("bargeIn") or "normal"),
-                                                                                BACKCHANNEL_MS["normal"])))
+                             turn=_turn_config(cfg))
         cid = call["id"]
         log = self.message_log
         store = self.store

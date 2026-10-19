@@ -69,6 +69,14 @@ def checked_overflow(url: str) -> str:
     return url
 
 
+class TurnIn(BaseModel):
+    """Per-agent end-of-turn timing. Operators tune these on VOX_DATASET=1 recordings; they do not
+    make the acoustic "um" decision correct."""
+    endMs: Optional[float] = Field(None, ge=200, le=2000)
+    eotThreshold: Optional[float] = Field(None, ge=0.05, le=0.99)
+    patientMs: Optional[float] = Field(None, ge=400, le=3000)
+
+
 class AgentIn(BaseModel):
     name: str
     systemPrompt: str = ""
@@ -84,6 +92,7 @@ class AgentIn(BaseModel):
     confirmSlots: bool = False                      # read names, dates, times, numbers and amounts back before acting
     restateSlots: bool = False                      # remind the model that earlier turns are transcripts, not audio
     redact: bool = False                            # strip card, SSN, email, phone, and street address from stored text
+    turn: Optional[TurnIn] = None                   # optional endMs / eotThreshold / patientMs over the env defaults
 
 
 class AgentPatch(BaseModel):
@@ -101,6 +110,7 @@ class AgentPatch(BaseModel):
     confirmSlots: Optional[bool] = None
     restateSlots: Optional[bool] = None
     redact: Optional[bool] = None
+    turn: Optional[TurnIn] = None
 
 
 class NumberIn(BaseModel):
@@ -529,6 +539,9 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             cfg0.pop("confirmSlots", None)
         if not cfg0.get("restateSlots"):
             cfg0.pop("restateSlots", None)          # default off: do not store a false flag on every agent
+        turn = cfg0.pop("turn", None)
+        if turn:
+            cfg0["turn"] = {k: v for k, v in turn.items() if v is not None}
         cfg0["voice"], cfg0["language"] = pick_voice("af_heart", None, body.voice, body.language, "voice" in body.model_fields_set)
         check_voice(cfg0["voice"], cfg0["language"])
         if exp is not None:
@@ -551,9 +564,13 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                                          "voice" in body.model_fields_set)
         check_voice(eff_voice, eff_lang)
         changed = []
-        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record", "bargeIn", "confirmSlots", "restateSlots", "redact"):
+        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record", "bargeIn", "confirmSlots", "restateSlots", "redact", "turn"):
             v = getattr(body, k)
             if v is not None:
+                if k == "turn":
+                    merged = dict(cfg.get("turn") or {})
+                    merged.update(v.model_dump(exclude_none=True))
+                    v = merged
                 cfg[k] = v
                 changed.append(k)
         if "experiment" in body.model_fields_set:

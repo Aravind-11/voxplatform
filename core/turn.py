@@ -14,8 +14,8 @@ Events
                  under the barge floor, so high sensitivity still interrupts at once.
 
 An optional end-of-turn scorer (e.g. UltraVAD) is consulted once per pause. If it is
-confident the caller is done, the turn ends after `fast_end_ms` of silence instead of
-`end_ms`, trading nothing in accuracy for lower latency on clear endings.
+confident the caller is done, the turn ends after `min(fast_end_ms, end_ms)` of silence,
+never later than `end_ms`, so a clear ending is not held open past the configured wait.
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ class TurnConfig:
     min_speech_ms: float = 160.0        # shorter utterances are treated as noise
     barge_confirm_ms: float = 400.0     # while the agent was speaking, speech shorter than this can still abort
     speculate_ms: float = 192.0         # silence before speculative generation starts
-    fast_end_ms: float = 320.0          # end of turn when the scorer is confident
+    fast_end_ms: float = 320.0          # silence cap when the scorer is confident; never longer than end_ms
     end_ms: float = 640.0               # end of turn otherwise
     eot_threshold: float = 0.7
     # Verdict-driven timing (apply_eot): a confident "done" ends the turn after fast_end_ms; a confident
@@ -218,7 +218,8 @@ class TurnManager:
         if not self._speculated and self._silence_ms >= c.speculate_ms:
             self._speculated = True
             confident = bool(self.eot_scorer and self.eot_scorer() >= c.eot_threshold)
-            self._end_target = c.fast_end_ms if confident else c.end_ms
+            # Confidence only shortens. An agent end_ms below fast_end_ms must not wait the fast path.
+            self._end_target = min(c.fast_end_ms, c.end_ms) if confident else c.end_ms
             out.append(TurnEvent(Ev.SPECULATE, t, self._onset_ms))
         if self._speculated and self._silence_ms >= self._end_target:
             out.append(TurnEvent(Ev.END_OF_TURN, t, self._onset_ms))

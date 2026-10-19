@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import struct
 import threading
 import time
 import wave
@@ -439,6 +440,198 @@ def test_recorder_queues_back_to_back_agent_audio():
     assert st[0, 1] == 7 and st[1599, 1] == 7 and st[1600, 1] == 9 and len(st) == 3200
 
 
+def test_streaming_recorder_writes_wav_before_save_and_bounds_memory(tmp_path):
+    t = [0.0]
+    part = tmp_path / "c.part.wav"
+    rec = CallRecorder(clock=lambda: t[0], path=str(part))
+    assert part.stat().st_size == 44                                # file exists before any audio
+    frame = np.full(512, 1000, np.int16)
+    for i in range(200):
+        rec.mic(frame)
+        t[0] += 512 / 16000
+        if i == 49:                                                  # header rewritten on mic, before agent/clear/save
+            early = _wav_pcm(part)
+            assert len(early) == 50 * len(frame) and early[:, 0].min() == 1000
+    assert len(rec.left) <= 2
+    rec.agent(np.full(16000, 2000, np.int16), 16000)               # extends past the caller track
+    data_bytes = int.from_bytes(part.read_bytes()[40:44], "little")
+    with wave.open(str(part)) as w:
+        assert w.getnchannels() == 2 and w.getframerate() == 16000
+        assert w.getnframes() * 4 == data_bytes and part.stat().st_size == 44 + data_bytes
+        assert w.getnframes() == 200 * 512 + 16000
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").reshape(-1, 2)
+    assert pcm[0, 0] == 1000 and pcm[200 * 512, 1] == 2000 and pcm[200 * 512 - 1, 1] == 0
+    assert np.array_equal(rec.stereo(), pcm)                        # streaming stereo() reads the file, not self.left
+    t[0] += 0.25
+    rec.clear()
+    with wave.open(str(part)) as w:
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").reshape(-1, 2)
+    now = int(t[0] * 16000)
+    assert len(pcm) == now and pcm[:, 1].nonzero()[0].max() < now
+    assert np.array_equal(rec.stereo(), pcm)
+    final = tmp_path / "c.wav"
+    secs = rec.save(str(final))
+    assert final.is_file() and not part.exists()
+    assert secs == pytest.approx(now / 16000)
+    with wave.open(str(final)) as w:
+        assert w.getnframes() == now and w.getnchannels() == 2
+
+
+def _wav_pcm(path):
+    """Stereo frames, but only if the RIFF sizes are exactly the bytes on disk."""
+    raw = path.read_bytes()
+    assert raw[:4] == b"RIFF" and raw[8:12] == b"WAVE"
+    data_bytes = int.from_bytes(raw[40:44], "little")
+    assert int.from_bytes(raw[4:8], "little") == 36 + data_bytes
+    assert len(raw) == 44 + data_bytes and data_bytes % 4 == 0
+    if not data_bytes:
+        return np.zeros((0, 2), dtype=np.int16)
+    return np.frombuffer(raw[44:], dtype="<i2").reshape(-1, 2).copy()
+
+
+def test_streaming_clear_retries_when_truncate_or_zero_patch_fails(tmp_path):
+    """clear must not move _agent_end until the file actually drops the unplayed tail."""
+    t = [0.0]
+    part = tmp_path / "trunc.part.wav"
+    rec = CallRecorder(clock=lambda: t[0], path=str(part))
+    for _ in range(5):
+        rec.mic(np.full(512, 1111, np.int16))
+        t[0] += 512 / 16000
+    rec.agent(np.full(80000, 2000, np.int16), 16000)
+    t[0] += 8000 / 16000
+    now = int(t[0] * 16000)
+    agent_end, n = rec._agent_end, rec._n
+    assert agent_end > now and n > now
+    orig = rec._fh.truncate
+
+    def fail_truncate(size, state={"n": 0}):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise OSError("truncate")
+        return orig(size)
+
+    rec._fh.truncate = fail_truncate
+    with pytest.raises(OSError):
+        rec.clear()
+    assert rec._agent_end == agent_end and rec._n == n
+    stuck = _wav_pcm(part)
+    assert len(stuck) == n and stuck[now, 1] == 2000
+    rec.clear()
+    pcm = _wav_pcm(part)
+    assert len(pcm) == now and rec._agent_end == now
+    assert pcm[:2560, 0].min() == 1111 and pcm[2560:, 0].max() == 0
+    assert pcm[:2560, 1].max() == 0 and pcm[2560:now, 1].min() == 2000
+
+    t2 = [0.0]
+    part2 = tmp_path / "patch.part.wav"
+    rec2 = CallRecorder(clock=lambda: t2[0], path=str(part2))
+    rec2.agent(np.full(30000, 2000, np.int16), 16000)
+    for _ in range(20):
+        rec2.mic(np.full(512, 1111, np.int16))
+    t2[0] = 2560 / 16000
+    now2 = int(t2[0] * 16000)
+    assert rec2._left_n > now2 and rec2._n > rec2._left_n
+    end2, n2 = rec2._agent_end, rec2._n
+    orig_patch = rec2._patch
+
+    def fail_patch(*_a, **_k):
+        raise OSError("patch")
+
+    rec2._patch = fail_patch
+    with pytest.raises(OSError):
+        rec2.clear()
+    assert rec2._agent_end == end2 and rec2._n == n2
+    mid = _wav_pcm(part2)
+    assert mid[now2, 0] == 1111 and mid[now2, 1] == 2000 and mid[-1, 1] == 2000
+    rec2._patch = orig_patch
+    rec2.clear()
+    pcm2 = _wav_pcm(part2)
+    assert len(pcm2) == rec2._left_n == 20 * 512
+    assert pcm2[:, 0].min() == 1111
+    assert pcm2[:now2, 1].min() == 2000 and pcm2[now2:, 1].max() == 0
+
+
+def test_streaming_write_error_stops_patching_and_save_matches_disk(tmp_path, monkeypatch):
+    import core.recorder as recmod
+
+    t = [0.0]
+    part = tmp_path / "c.part.wav"
+    rec = CallRecorder(clock=lambda: t[0], path=str(part))
+    rec.mic(np.full(512, 1000, np.int16))
+    t[0] += 512 / 16000
+    orig = rec._fh.write
+
+    def boom(data):
+        if len(data) != 44:
+            raise OSError("full")
+        return orig(data)
+
+    rec._fh.write = boom
+    with pytest.raises(OSError):
+        rec.mic(np.full(512, 2000, np.int16))
+    rec._fh.write = orig
+    rec.mic(np.full(512, 3000, np.int16))
+    rec.agent(np.full(800, 7, np.int16), 16000)
+    assert part.stat().st_size == 44 + 512 * 4
+    assert _wav_pcm(part)[0, 0] == 1000
+
+    part2 = tmp_path / "h.part.wav"
+    rec2 = CallRecorder(clock=lambda: 0.0, path=str(part2))
+    rec2.mic(np.full(512, 1000, np.int16))
+    real_header = recmod._wav_header
+    state = {"n": 0}
+
+    def flaky(nframes):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise struct.error("pack")
+        return real_header(nframes)
+
+    monkeypatch.setattr(recmod, "_wav_header", flaky)
+    with pytest.raises(struct.error):
+        rec2.mic(np.full(512, 2000, np.int16))
+    rec2.mic(np.full(512, 3000, np.int16))
+    final = tmp_path / "h.wav"
+    secs = rec2.save(str(final))
+    pcm = _wav_pcm(final)
+    assert len(pcm) == 1024 and pcm[0, 0] == 1000 and pcm[512, 0] == 2000
+    assert int(pcm[:, 0].max()) == 2000
+    assert secs == pytest.approx(1024 / 16000)
+
+    part3 = tmp_path / "p.part.wav"
+    rec3 = CallRecorder(clock=lambda: 0.0, path=str(part3))
+    rec3.mic(np.full(512, 1000, np.int16))
+    rec3._fh.seek(0, os.SEEK_END)
+    rec3._fh.write(b"abcde")
+    rec3._fh.flush()
+    out3 = tmp_path / "p.wav"
+    rec3.save(str(out3))
+    assert len(_wav_pcm(out3)) == 512 and _wav_pcm(out3)[0, 0] == 1000
+
+    part4 = tmp_path / "s.part.wav"
+    rec4 = CallRecorder(clock=lambda: 0.0, path=str(part4))
+    rec4.mic(np.full(512, 1000, np.int16))
+    rec4._fh.truncate(recmod._HEADER + 103)
+    rec4._fh.flush()
+    out4 = tmp_path / "s.wav"
+    rec4.save(str(out4))
+    short = _wav_pcm(out4)
+    assert len(short) == 25 and short[0, 0] == 1000
+
+    assert recmod._wav_header(recmod._MAX_WAV_FRAMES)
+    with pytest.raises(struct.error):
+        recmod._wav_header(recmod._MAX_WAV_FRAMES + 1)
+    assert recmod._MAX_WAV_FRAMES + 1 == 1073741815
+    part5 = tmp_path / "cap.part.wav"
+    rec5 = CallRecorder(clock=lambda: 0.0, path=str(part5))
+    rec5.mic(np.full(512, 1000, np.int16))
+    monkeypatch.setattr(recmod, "_MAX_WAV_FRAMES", 100)
+    out5 = tmp_path / "cap.wav"
+    assert rec5.save(str(out5)) == pytest.approx(100 / 16000)
+    capped = _wav_pcm(out5)
+    assert len(capped) == 100 and capped[0, 0] == 1000
+
+
 def test_recording_end_to_end_and_download(tmp_path, monkeypatch):
     monkeypatch.setenv("VOX_RECORD_DIR", str(tmp_path))
     from test_api import speech, silence
@@ -448,6 +641,8 @@ def test_recording_end_to_end_and_download(tmp_path, monkeypatch):
     a = c.post("/v1/agents", json={"name": "rec", "record": True}, headers=H(ka)).json()
     call = c.post("/v1/calls", json={"agentId": a["id"]}, headers=H(ka)).json()
     path = call["joinUrl"].replace("wss://vox.example.com", "")
+    part = tmp_path / f"{call['id']}.part.wav"
+    wav = tmp_path / f"{call['id']}.wav"
     with c.websocket_connect(path) as ws:
         got = b""
         for f in silence(5) + speech(15) + silence(40):
@@ -456,8 +651,11 @@ def test_recording_end_to_end_and_download(tmp_path, monkeypatch):
         while not got and time.time() - t0 < 5:
             m = ws.receive()
             got += m.get("bytes") or b""
+        live = _wav_pcm(part)                                        # streamed during the call, not held until save
+        assert (live[:, 0] == 5000).any() and not wav.exists()
+    assert wav.is_file() and not part.exists()
     r = c.get(f"/v1/calls/{call['id']}/recording", headers=H(ka))
-    assert r.status_code == 200 and r.content[:4] == b"RIFF"
+    assert r.status_code == 200 and r.content == wav.read_bytes() and r.content[:4] == b"RIFF"
     assert c.get(f"/v1/calls/{call['id']}/recording", headers=H(kb)).status_code == 404       # tenant isolation
     plain = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=H(ka)).json()            # record not set
     with c.websocket_connect(plain["joinUrl"].replace("wss://vox.example.com", "")) as ws:
@@ -2784,17 +2982,26 @@ def test_delete_call_removes_record_transcript_and_recording(tmp_path, monkeypat
     ka, ta = tenant(c, "a")
     kb, _ = tenant(c, "b")
     call = store.create_call(ta, None, "webSocket", {})
+    kept = store.create_call(ta, None, "webSocket", {})
     store.add_message(call["id"], "user", "secret words", 1.0)
     (tmp_path / f"{call['id']}.wav").write_bytes(b"RIFF....")
+    (tmp_path / f"{call['id']}.part.wav").write_bytes(b"PART")       # crash leftover beside the finished wav
+    (tmp_path / f"{kept['id']}.wav").write_bytes(b"KEEP")
+    (tmp_path / f"{kept['id']}.part.wav").write_bytes(b"KEEPPART")
     (tmp_path / "utterances").mkdir()
     (tmp_path / "utterances" / f"{call['id']}-001.wav").write_bytes(b"x")
     store.update_call(call["id"], status="active")
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(ka)).status_code == 409           # not while live
+    assert (tmp_path / f"{call['id']}.part.wav").exists()                                  # a refused delete must not erase audio
     store.update_call(call["id"], status="ended")
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(kb)).status_code == 404           # other tenant
+    assert (tmp_path / f"{call['id']}.part.wav").exists()
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(ka)).status_code == 200
     assert store.get_call_any(call["id"]) is None and store.messages(call["id"]) == []
-    assert not (tmp_path / f"{call['id']}.wav").exists() and not list((tmp_path / "utterances").iterdir())
+    assert not (tmp_path / f"{call['id']}.wav").exists() and not (tmp_path / f"{call['id']}.part.wav").exists()
+    assert not list((tmp_path / "utterances").iterdir())
+    assert (tmp_path / f"{kept['id']}.wav").read_bytes() == b"KEEP"                        # a call that was not erased keeps its files
+    assert (tmp_path / f"{kept['id']}.part.wav").read_bytes() == b"KEEPPART"
     assert c.get("/v1/audit", headers=H(ka)).json()[0]["action"] == "call.delete"
 
 
@@ -2897,6 +3104,7 @@ def test_retention_purges_old_ended_calls_files_and_leaves_the_rest(tmp_path):
         store.update_call(call["id"], status=status, joined=now - age_days * day - 60, ended=now - age_days * day)
         store.add_message(call["id"], "user", "hi", 1.0)
         (tmp_path / f"{call['id']}.wav").write_bytes(b"RIFF")
+        (tmp_path / f"{call['id']}.part.wav").write_bytes(b"PART")   # unfinished stream left by a crash
         (tmp_path / "utterances").mkdir(exist_ok=True)
         (tmp_path / "utterances" / f"{call['id']}-001.wav").write_bytes(b"x")
         return call["id"]
@@ -2905,12 +3113,16 @@ def test_retention_purges_old_ended_calls_files_and_leaves_the_rest(tmp_path):
     out = retention.purge_expired(store, str(tmp_path))
     assert out == {ta: 1}
     assert store.get_call_any(old_a) is None and store.messages(old_a) == []
-    assert not (tmp_path / f"{old_a}.wav").exists() and not (tmp_path / "utterances" / f"{old_a}-001.wav").exists()
+    assert not (tmp_path / f"{old_a}.wav").exists() and not (tmp_path / f"{old_a}.part.wav").exists()
+    assert not (tmp_path / "utterances" / f"{old_a}-001.wav").exists()
     for kept in (new_a, live_old_a, old_b):                          # recent, still-live and no-retention-tenant calls survive
         assert store.get_call_any(kept) is not None and (tmp_path / f"{kept}.wav").exists()
+        assert (tmp_path / f"{kept}.part.wav").read_bytes() == b"PART"
     assert store.list_audit(ta)[0]["action"] == "retention.purge"
     assert retention.purge_expired(store, str(tmp_path), default_days=10) == {tb: 1}      # b has no limit of its own: the default applies; a keeps its 30
     assert store.get_call_any(old_b) is None and store.get_call_any(new_a) is not None      # server default (10 d) now applies to b
+    assert not (tmp_path / f"{old_b}.part.wav").exists() and not (tmp_path / f"{old_b}.wav").exists()
+    assert (tmp_path / f"{new_a}.part.wav").exists() and (tmp_path / f"{live_old_a}.part.wav").exists()
     assert store.get_call_any(live_old_a) is not None
 
 

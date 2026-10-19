@@ -14,9 +14,11 @@ from .store import Store
 def delete_call_files(record_dir: str, call_id: str) -> None:
     if not record_dir:
         return
-    wav = os.path.join(record_dir, f"{call_id}.wav")
-    if os.path.isfile(wav):
-        os.remove(wav)
+    # .part.wav is the in-progress stream. A crash or a failed save never renames it, so erase must remove it too.
+    for name in (f"{call_id}.wav", f"{call_id}.part.wav"):
+        path = os.path.join(record_dir, name)
+        if os.path.isfile(path):
+            os.remove(path)
     udir = os.path.join(record_dir, "utterances")
     if os.path.isdir(udir):
         for f in os.listdir(udir):

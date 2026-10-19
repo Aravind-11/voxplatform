@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Protocol
@@ -264,6 +265,13 @@ class Session:
                 await self._turn_lock.acquire()
                 self._turn_owner = asyncio.current_task()
 
+    def _record(self, fn: Callable, *args: Any) -> None:
+        """Disk and header errors must not end the call or skip playback accounting."""
+        try:
+            fn(*args)
+        except (OSError, struct.error) as e:
+            self._emit("error", where="recorder", error=repr(e))
+
     # ------------------------------------------------------------------ input
     async def feed(self, frame: np.ndarray) -> None:
         """Feed one 512-sample 16 kHz int16 frame (32 ms)."""
@@ -273,7 +281,7 @@ class Session:
             self._turn_owner = asyncio.current_task()
             try:
                 if self.recorder is not None:
-                    self.recorder.mic(frame)
+                    self._record(self.recorder.mic, frame)
                 if self.vad_scheduler is not None:
                     prob = await self.vad_scheduler.prob(self.vad, frame)
                 else:
@@ -1275,7 +1283,7 @@ class Session:
                     elif isinstance(track, _WordSlice):
                         gen.sent_slices.append(track)
                     if self.recorder is not None and not failed:
-                        self.recorder.agent(pcm, self.cfg.out_rate)
+                        self._record(self.recorder.agent, pcm, self.cfg.out_rate)
                     dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
                     self.tracker.on_sent(track if isinstance(track, _WordSlice) else text, dur)
                     if isinstance(mark, str) and mark:
@@ -1316,7 +1324,7 @@ class Session:
             await asyncio.sleep(0)
         await self.clear_audio()
         if self.recorder is not None:
-            self.recorder.clear()
+            self._record(self.recorder.clear)
 
     def _outgoing_idle(self, gen: _Generation) -> bool:
         """Produce and synth will not enqueue anything else (the drain may still be in its end wait)."""
@@ -1506,7 +1514,7 @@ class Session:
             self._overlap_unscored = max(0, self._overlap_unscored - 1)
             return
         if self.recorder is not None:
-            self.recorder.clear()
+            self._record(self.recorder.clear)
         await self._cancel(gen)           # sets gen.cancelled before it yields, so the other caller loses
         gen.holding = False
         if not paused_barge:

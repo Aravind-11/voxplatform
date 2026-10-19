@@ -356,7 +356,7 @@ class Runtime:
         recorder = None
         on_utt = None
         if cfg.get("record") and rec_dir:
-            recorder = CallRecorder()
+            recorder = CallRecorder(path=os.path.join(rec_dir, call["id"] + ".part.wav"))
             self.recorders[call["id"]] = recorder
             if os.environ.get("VOX_DATASET") == "1":
                 counter = {"n": 0}

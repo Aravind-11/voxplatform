@@ -758,7 +758,9 @@ def test_dead_sip_hangup_ends_the_row_and_frees_its_slot():
         assert len(lab.store.list_calls(lab.tid)) == before
         again = lab.store.get_call_any(call_id)
         assert again["status"] == "ended" and again["end_reason"] == end_reason
-        assert lab.lim.total_active() == 0 and call_id not in lab.rt.live
+        # The refused socket reserves a slot before the UUID is known and drops it in
+        # the handler finally, after the writer closes. EOF can arrive first.
+        assert _poll(lambda: lab.lim.total_active() == 0 and call_id not in lab.rt.live)
 
     with lab.client(lab.app) as c:
         uid, cid = open_row(resumes=2, hold=True)

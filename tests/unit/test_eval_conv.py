@@ -197,9 +197,13 @@ async def test_replay_keeps_silence_until_end_ms_when_it_is_the_longest_timer():
     assert out["first_audio_ms"] >= turn.end_ms
 
 
-async def test_replay_keeps_silence_until_fast_end_ms_when_the_scorer_is_confident():
-    """A sync eot_fn above eot_threshold commits at fast_end_ms. That timer is the
-    longest one here; leaving it out of the tail drops the expected tool."""
+async def test_replay_does_not_hold_a_confident_ending_past_end_ms():
+    """A confident score shortens the wait to min(fast_end_ms, end_ms).
+
+    fast_end_ms used to be able to outwait end_ms. A clear ending is not held open
+    past the configured end_ms, so first audio stays on that shorter timer. The
+    harness tail still has to cover end_ms or the expected tool never runs.
+    """
     turn = TurnConfig(fast_end_ms=2000)
 
     def confident(audio, history):
@@ -220,7 +224,7 @@ async def test_replay_keeps_silence_until_fast_end_ms_when_the_scorer_is_confide
     out = await replay(make, _case())
     assert out["task_success"] is True
     assert out["wrong_actions"] == []
-    assert out["first_audio_ms"] >= turn.fast_end_ms
+    assert turn.end_ms <= out["first_audio_ms"] < turn.fast_end_ms
 
 
 async def test_replay_fails_when_expected_and_forbidden_tools_both_finish():

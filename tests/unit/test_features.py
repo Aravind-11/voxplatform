@@ -651,8 +651,21 @@ def test_recording_end_to_end_and_download(tmp_path, monkeypatch):
         while not got and time.time() - t0 < 5:
             m = ws.receive()
             got += m.get("bytes") or b""
-        live = _wav_pcm(part)                                        # streamed during the call, not held until save
-        assert (live[:, 0] == 5000).any() and not wav.exists()
+        # The part file grows by one frame, then the header is flushed. A read in that
+        # gap sees more bytes than the header names. Wait until a consistent snapshot
+        # already contains the caller audio. The finished wav is still absent.
+        live = None
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            try:
+                live = _wav_pcm(part)
+            except AssertionError:
+                time.sleep(0.02)
+                continue
+            if (live[:, 0] == 5000).any():
+                break
+            time.sleep(0.02)
+        assert live is not None and (live[:, 0] == 5000).any() and not wav.exists()
     assert wav.is_file() and not part.exists()
     r = c.get(f"/v1/calls/{call['id']}/recording", headers=H(ka))
     assert r.status_code == 200 and r.content == wav.read_bytes() and r.content[:4] == b"RIFF"

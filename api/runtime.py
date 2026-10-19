@@ -13,6 +13,7 @@ from core.asr import AsrLLM, HttpASR
 from core.backchannel import BACKCHANNEL_MS
 from core.metrics import METRICS
 from core.recorder import CallRecorder, write_wav16
+from core.redact import redact_text
 from core.session import Session, SessionConfig
 from core.turn import TurnConfig
 from core.vad_exec import VADScheduler
@@ -296,7 +297,6 @@ class Runtime:
         cfg = call["config"]
         meta = call.get("metadata") or {}
         if isinstance(meta, str):
-            import json
             meta = json.loads(meta or "{}")
         variant = None
         experiment = cfg.get("experiment")
@@ -355,6 +355,7 @@ class Runtime:
         rec_dir = self.record_dir or os.environ.get("VOX_RECORD_DIR", "")
         recorder = None
         on_utt = None
+        redact = bool(cfg.get("redact"))
         if cfg.get("record") and rec_dir:
             recorder = CallRecorder(path=os.path.join(rec_dir, call["id"] + ".part.wav"))
             self.recorders[call["id"]] = recorder
@@ -363,6 +364,8 @@ class Runtime:
 
                 def on_utt(audio, text, eot):          # noqa: F811
                     counter["n"] += 1
+                    if redact:
+                        text = redact_text(text)
                     base = os.path.join(rec_dir, "utterances", f"{call['id']}-{counter['n']:03d}")
                     write_wav16(base + ".wav", audio)
                     with open(os.path.join(rec_dir, "utterances", "index.jsonl"), "a") as f:
@@ -431,10 +434,10 @@ class Runtime:
             if os.environ.get('VOX_LOG_EVENTS'):
                 print('EV', cid, e, flush=True)
             _count(e, variant_id)
-            if e["type"] == "user_transcript":
-                log.add(cid, "user", e["text"], time.time())
-            elif e["type"] == "agent_speech":
-                log.add(cid, "agent", e["text"], time.time())
+            if e["type"] in ("user_transcript", "agent_speech"):
+                text = redact_text(e["text"]) if redact else e["text"]
+                role = "user" if e["type"] == "user_transcript" else "agent"
+                log.add(cid, role, text, time.time())
             if forward_events and hasattr(transport, "send_event"):
                 import asyncio
                 asyncio.get_running_loop().create_task(transport.send_event(e))

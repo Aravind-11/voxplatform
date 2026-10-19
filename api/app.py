@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
 
 from core.metrics import METRICS
+from core.redact import redact_text
 from core.vad_exec import watch_loop_lag
 from core import tts as ttsmod
 from core.tts import DEFAULT_VOICE, LANG_NAME, VOICES
@@ -82,6 +83,7 @@ class AgentIn(BaseModel):
     bargeIn: Literal["high", "normal", "low"] = "normal"  # how easily the caller can talk over the agent
     confirmSlots: bool = False                      # read names, dates, times, numbers and amounts back before acting
     restateSlots: bool = False                      # remind the model that earlier turns are transcripts, not audio
+    redact: bool = False                            # strip card, SSN, email, phone, and street address from stored text
 
 
 class AgentPatch(BaseModel):
@@ -98,6 +100,7 @@ class AgentPatch(BaseModel):
     bargeIn: Optional[Literal["high", "normal", "low"]] = None
     confirmSlots: Optional[bool] = None
     restateSlots: Optional[bool] = None
+    redact: Optional[bool] = None
 
 
 class NumberIn(BaseModel):
@@ -548,7 +551,7 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
                                          "voice" in body.model_fields_set)
         check_voice(eff_voice, eff_lang)
         changed = []
-        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record", "bargeIn", "confirmSlots", "restateSlots"):
+        for k in ("systemPrompt", "voice", "language", "variables", "greeting", "tools", "speed", "record", "bargeIn", "confirmSlots", "restateSlots", "redact"):
             v = getattr(body, k)
             if v is not None:
                 cfg[k] = v
@@ -1139,7 +1142,11 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             raise RuntimeError("call did not end")
 
         def _transcript():
-            return [{"role": m["role"], "text": m["text"], "t": m["t"]} for m in store.messages(call["id"])[:500]]
+            rows = [{"role": m["role"], "text": m["text"], "t": m["t"]} for m in store.messages(call["id"])[:500]]
+            # Redact at send time. A row written raw stays raw in the table; finish does not copy it.
+            if (call.get("config") or {}).get("redact"):
+                rows = [{**m, "text": redact_text(m["text"])} for m in rows]
+            return rows
 
         snap_err = None
         done, secs = None, 0.0

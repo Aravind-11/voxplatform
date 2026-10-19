@@ -565,8 +565,10 @@ def test_sip_setup_puts_the_caller_on_the_call_and_into_the_prompt():
         assert call["metadata"]["channel"] == "sip" and call["medium"] == "sip"
         sess = rt.live[call["id"]][0]
         from api.runtime import SHORT_FIRST_SENTENCE
-        # {{caller}} rendered. The cascaded-TTS opener is appended after that rendered line.
-        assert sess.history[0]["content"] == f"Caller is {caller}\n\n{SHORT_FIRST_SENTENCE}"
+        # {{caller}} rendered. 8 kHz AudioSocket is narrowband, then the cascaded-TTS opener.
+        narrow = ("This call is narrowband telephone audio. Spell back any name and read back any number "
+                  "before you use it.")
+        assert sess.history[0]["content"] == f"Caller is {caller}\n\n{narrow}\n\n{SHORT_FIRST_SENTENCE}"
         asyncio.run(sess.tools["lookup_caller"]({}))
         assert seen["body"]["from"] == caller and seen["body"]["to"] == callee
         assert seen["body"]["callSid"] == str(u)

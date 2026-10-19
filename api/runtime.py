@@ -396,6 +396,9 @@ class Runtime:
             prompt += "\n\n" + toolmod.READBACK_INSTRUCTION
         if cfg.get("restateSlots"):
             prompt += "\n\n" + RESTATE_SLOTS
+        if getattr(transport, "narrowband", False):
+            prompt += ("\n\nThis call is narrowband telephone audio. Spell back any name and read back any number "
+                       "before you use it.")
         # Lost-stream reconnects replace the greeting with a "cut off" apology. A failed warm transfer also
         # sets resumedFrom, but its own greeting is the "not available" line and must be kept.
         greeting = varmod.render(str(cfg.get("greeting") or ""), values)

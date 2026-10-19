@@ -28,6 +28,7 @@ async def _as_messages(ws):
 
 class BrowserTransport:
     out_rate = 24000
+    narrowband = False         # browser audio is 16 kHz in and 24 kHz out, not a telephone codec
 
     def __init__(self, ws, session_factory: SessionFactory):
         self.ws = ws                      # needs: iter_bytes(), send_bytes(b), send_text(s)

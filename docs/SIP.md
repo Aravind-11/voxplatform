@@ -51,6 +51,7 @@ The dialplan POSTs `uuid` and `channelId` to `POST /sip/bind` with the same `X-V
 - **Security:** the AudioSocket port has no authentication. Keep it on a private network and never publish it.
 - **Outbound SIP audio:** `POST /v1/calls/outbound` with `"channel": "sip"` originates through Asterisk ARI (`ASTERISK_ARI_URL`), not VoxSun's `calls/initiate`. See below. Nothing in this repo answers Stasis app `vox`, so the new channel is not attached to AudioSocket by itself.
 - **Open ports for Asterisk:** UDP 5060 and the RTP range 10000-10100. Behind NAT, set the public address in `pjsip.conf`.
+- **8 kHz band:** when the carrier offers wideband (G.722), use it; a narrowband codec has already dropped everything above 4 kHz and the engine cannot restore those frequencies.
 - Asterisk is GPL-2.0 software run as a separate program; this repo does not include or link it. Get the same licence check you would for any GPL component.
 
 ## More than one Asterisk

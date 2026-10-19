@@ -43,7 +43,7 @@ Grafana is optional and AGPL-3.0; running it internally is the usual case, but c
 
 ```mermaid
 flowchart TB
-    P["Phone caller"] --> TEL["Telephony provider<br/>(Twilio today; VoxSun adapter designed)"]
+    P["Phone caller"] --> TEL["Telephony provider<br/>(Twilio; VoxSun via Asterisk SIP, tested in simulation only)"]
     TEL <-->|"audio stream, WebSocket"| LB["Load balancer / TLS<br/>(Caddy, health-checked)"]
     BR["Browser / app"] <-->|"audio, WebSocket"| LB
     LB <--> N1["API node 1"]
@@ -115,7 +115,7 @@ The boundary is HTTP in both directions, with credentials held by the platform:
 
 ### VoxSun audio/call infrastructure (SIP path built and tested against a simulation; never run against VoxSun)
 VoxSun's own published description (https://voxsun.com/llms-full.txt) shows a SIP/PBX platform (SIP authentication, G.711/G.722/G.729/Opus codecs, SRTP/TLS, a REST API and call webhooks; detailed API docs only through sales). It does not describe WebSocket audio streaming, so the route in is **SIP**.
-**Built:** an Asterisk-based SIP front end (`deploy/sip/`) that streams each call's audio to the engine over AudioSocket (`transports/audiosocket.py`): 8 kHz audio in, real-time-paced audio out, interruption (queued audio cleared), keypad digits, hangup. Tested with a simulated Asterisk against the real app (4 unit tests). **Not done:** the Asterisk configuration has never been run, and no call from VoxSun has been made.
+**Built:** an Asterisk-based SIP front end (`deploy/sip/`) that streams each call's audio to the engine over AudioSocket (`transports/audiosocket.py`): 8 kHz audio in, real-time-paced audio out, interruption (queued audio cleared), keypad digits, hangup. Tested with a simulated Asterisk against the real app (unit tests). **Not done:** the Asterisk configuration has never been run, and no call from VoxSun has been made.
 **Needed from VoxSun:** the SIP server address, credentials (or the IP they call from), permission to route a number to an outside SIP server, and a test number. Details, setup steps and limits (one Asterisk points at one engine node, outbound SIP not built): `docs/SIP.md`.
 Remaining work once those arrive: configure and test the trunk against VoxSun, and add a TCP load balancer for several nodes: about 2-4 days (estimate).
 
@@ -142,7 +142,7 @@ Bottlenecks in the order they will bite: **text-to-speech throughput** per node 
 | 1. Pilot build | 3-4 | VoxSun adapter; BoostMyDeal connectors via OpenAPI import; tune turn-taking and read-back flows on real recordings; validate target languages with native speakers; staging on 2 nodes with domain, TLS, alerts | proof of concept on a VoxSun test call with measured latency, resources and cost; word-error and task-success within the agreed margin of the baseline |
 | 2. Hardening | 4-6 | 72 h soak; failover and recovery drills against the real carrier; multi-node load test (100 calls); security review and penetration test; runbooks; alert tuning; canary on 5-10% of real traffic | no unexplained errors in soak; recovery works on the real carrier; target SLOs met on canary |
 | 3. Scale and improve | 6-10 | autoscaling; TTS batching or dedicated workers; recording-based evaluation loop; model upgrade path and A/B against the paid service; cost dashboards | hundreds of concurrent calls at target latency and cost |
-Total to confident production at hundreds of calls: roughly **4-6 months** (estimate). The largest uncertainty is Phase 1's accuracy result and VoxSun's interface.
+Two tracks (estimates): a **pilot on a VoxSun test call** takes about 1 week from receiving VoxSun's SIP details and BoostMyDeal's API documents; **confident production at hundreds of calls** takes about 2-4 months, mostly because stability, load and rollout tests take wall-clock time and tuning on real recordings has an unknown length. The largest uncertainty is Phase 1's accuracy result and VoxSun's SIP terms.
 
 ## 8. Risks
 

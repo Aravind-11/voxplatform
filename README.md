@@ -193,6 +193,8 @@ Put that object in an agent's `tools` list. More in [docs/TOOLS.md](docs/TOOLS.m
 - **Fill in details per call** (customer name, offer): put `{{customerName}}` in the prompt or greeting and send `"variables": {"customerName": "Priya"}` when starting a call. See [docs/INTEGRATION.md](docs/INTEGRATION.md).
 - **Import your whole API as tools** from an OpenAPI file: `POST /v1/tools/import-openapi`. See [docs/INTEGRATION.md](docs/INTEGRATION.md).
 - **Get the transcript after every call** at your own URL (signed notice): `PUT /v1/webhook`.
+- **Phone calls from VoxSun or any SIP provider** (inbound, with caller number, dialed-number-to-agent mapping, voicemail detection, cold transfer): through Asterisk, see [docs/SIP.md](docs/SIP.md). Tested only against a simulated Asterisk.
+- **Use your own speech-to-text or text-to-speech server** (any OpenAI-compatible one): `VOX_ASR_URL`, `VOX_TTS_URL`; full list of settings at the top of `api/main.py`.
 - **Other languages**: set `"language": "es"` on an agent. Off by default for licence reasons and never tested with audio; see [docs/LANGUAGES.md](docs/LANGUAGES.md).
 - **Save calls to measure accuracy**: set `"record": true` on the agent and `VOX_DATASET=1` on the server. Each caller turn is saved with its transcript.
 - **Estimate cost**: `python scripts/cost_model.py`. **Log GPU/CPU use during calls**: `bash scripts/resource_log.sh`.
@@ -226,7 +228,7 @@ Kubernetes: `deploy/k8s/voxplatform.yaml` (autoscale on the per-node `vox_active
 
 ## 6. Run the tests (no GPU)
 ```bash
-pip install -r requirements-dev.txt && pytest          # 240+ unit tests
+pip install -r requirements-dev.txt && pytest          # about 740 tests, no GPU needed
 ```
 
 ## 7. Technical documentation
@@ -244,7 +246,7 @@ pip install -r requirements-dev.txt && pytest          # 240+ unit tests
 | [docs/TUNING.md](docs/TUNING.md) | Turn-taking and latency settings |
 | [docs/LICENSES.md](docs/LICENSES.md) | Every component's license (commercial use) |
 
-Not built: customer sign-up and billing, outbound calls over SIP, load balancing of SIP calls, voice cloning, single sign-on.
+Not built: customer sign-up and billing, warm transfer on SIP, voice cloning, single sign-on. Outbound calls over SIP start the call but no agent answers it yet (see [docs/SIP.md](docs/SIP.md)), voice cloning, single sign-on.
 
 Code layout: `core/` (turn-taking, VAD, speech, session), `transports/` (Twilio, browser), `api/` (REST, WebSocket,
 dashboard, storage), `scripts/` (setup and deploy), `deploy/` (Docker, Kubernetes), `tests/`.

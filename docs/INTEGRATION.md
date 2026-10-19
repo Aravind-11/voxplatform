@@ -1,7 +1,7 @@
 # Integrating with BoostMyDeal-style APIs (and VoxSun, as a design)
 
 Status labels: **tested** = unit/integration tests in this repo; **hypothetical** = an example I wrote to show the shape (BoostMyDeal's real API was not seen);
-**design only** = not built, not tested (VoxSun).
+**simulation only** = built and tested against a simulated peer, never run against the real system (VoxSun).
 
 ## 1. Give the agent your business tools (tested with a mock server)
 If your system has an OpenAPI 3 document, import it once. Each operation becomes a tool the agent can call.

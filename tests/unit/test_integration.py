@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from api import http_tools, openapi_import, variables
-from api.runtime import Runtime
+from api.runtime import SHORT_FIRST_SENTENCE, Runtime
 from api.store import Store
 from core.session import SessionConfig
 from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD, make, silence, speech, tenant
@@ -46,7 +46,8 @@ def test_call_needs_every_variable_and_values_reach_the_prompt():
         async def end(self): ...
     rt = Runtime(FakeLLM(), lambda v: FakeTTS(), FakeVAD, store)
     sess = rt.build_session(call, T())
-    assert sess.history[0]["content"] == "Call Dana about the renewal. From ."          # agent default + call value + built-in
+    assert sess.history[0]["content"] == "Call Dana about the renewal. From .\n\n" + SHORT_FIRST_SENTENCE
+    assert sess.cfg.short_first_sentence is True
     assert sess.cfg.greeting == "Hi Dana!"
 
 
@@ -84,7 +85,8 @@ def test_inbound_phone_calls_get_caller_number_and_empty_unknowns():
         async def send_audio(self, b): ...
         async def clear(self): ...
         async def end(self): ...
-    assert rt.build_session(call, T()).history[0]["content"] == "Caller +15551230000 dialled +15559990000. "
+    assert rt.build_session(call, T()).history[0]["content"] == (
+        "Caller +15551230000 dialled +15559990000. \n\n" + SHORT_FIRST_SENTENCE)
 
 
 # ------------------------------------------------------- HTTP tool: path + query

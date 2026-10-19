@@ -92,7 +92,7 @@ def test_voices_endpoint_lists_languages_with_availability(monkeypatch):
 
 
 def test_agent_language_is_added_to_the_system_prompt():
-    from api.runtime import Runtime
+    from api.runtime import ERROR_PHRASE, SHORT_FIRST_SENTENCE, Runtime
     from api.store import Store
     from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD
     from transports.browser import BrowserTransport  # noqa: F401
@@ -108,12 +108,13 @@ def test_agent_language_is_added_to_the_system_prompt():
         async def end(self): ...
     sess = rt.build_session(call, T())
     sp = sess.history[0]["content"]
-    assert sp.startswith("Be brief.") and "Spanish" in sp
-    from api.runtime import ERROR_PHRASE
+    assert sp.startswith("Be brief.") and "Spanish" in sp and sp.endswith(SHORT_FIRST_SENTENCE)
+    assert sess.cfg.short_first_sentence is True
     assert sess.cfg.error_phrase == ERROR_PHRASE["es"]
     call2 = store.create_call(tid, None, "webSocket", {"systemPrompt": "Be brief."}, {})
     sess2 = rt.build_session(call2, T())
-    assert "Spanish" not in sess2.history[0]["content"]
+    plain = sess2.history[0]["content"]
+    assert "Spanish" not in plain and plain.endswith(SHORT_FIRST_SENTENCE)
     assert sess2.cfg.error_phrase == ERROR_PHRASE["en"]
     call3 = store.create_call(tid, None, "webSocket", {"systemPrompt": "Be brief.", "language": "de"}, {})
     sess3 = rt.build_session(call3, T())

@@ -564,7 +564,9 @@ def test_sip_setup_puts_the_caller_on_the_call_and_into_the_prompt():
         assert call["metadata"]["callSid"] == str(u)
         assert call["metadata"]["channel"] == "sip" and call["medium"] == "sip"
         sess = rt.live[call["id"]][0]
-        assert sess.history[0]["content"] == f"Caller is {caller}"          # {{caller}} rendered
+        from api.runtime import SHORT_FIRST_SENTENCE
+        # {{caller}} rendered. The cascaded-TTS opener is appended after that rendered line.
+        assert sess.history[0]["content"] == f"Caller is {caller}\n\n{SHORT_FIRST_SENTENCE}"
         asyncio.run(sess.tools["lookup_caller"]({}))
         assert seen["body"]["from"] == caller and seen["body"]["to"] == callee
         assert seen["body"]["callSid"] == str(u)

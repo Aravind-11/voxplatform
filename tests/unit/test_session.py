@@ -374,14 +374,18 @@ def _blocked_lookup(release):
 
 
 def _two_sentence_tool_turn(release, phrase):
-    """First sentence is 40 words (3.2s) so it stays above the 1.5s lookahead while the tool blocks."""
-    first = " ".join(["alpha"] * 40) + "."
+    """First sentence is 40 words (3.2s). The opener is cut at 12 words (960 ms); the 28-word tail
+    is still long enough that Beta stays above the 1.5s lookahead while the tool blocks."""
+    words = ["alpha"] * 40
+    first = " ".join(words) + "."
+    opener = " ".join(words[:12])
+    tail = " ".join(words[12:]) + "."
     second = "Beta sentence follows."
     llm = FakeLLM([[f"{first} ", f"{second} ", ToolCall("t1", "lookup", {"day": "mon"})],
                    ["All done now."]])
     cfg = SessionConfig(tts_poll_s=0, tts_lookahead_ms=1500, filler_delay_s=0.01,
                         tool_fillers={"lookup": phrase})
-    return first, second, Rig(llm, tools={"lookup": _blocked_lookup(release)}, cfg=cfg)
+    return opener, tail, second, Rig(llm, tools={"lookup": _blocked_lookup(release)}, cfg=cfg)
 
 
 async def test_filler_does_not_speak_ahead_of_a_queued_sentence():
@@ -389,12 +393,12 @@ async def test_filler_does_not_speak_ahead_of_a_queued_sentence():
     that returns before that sentence is released must not leave the filler in tts.texts."""
     release = asyncio.Event()
     phrase = "FILLER"
-    first, second, r = _two_sentence_tool_turn(release, phrase)
+    opener, tail, second, r = _two_sentence_tool_turn(release, phrase)
     await r.frames("s", 15)
     await r.frames("q", 25)
     try:
         await asyncio.sleep(0.05)          # past filler_delay_s; sentence 2 is held for lookahead
-        assert r.tts.texts == [first]      # not [first, FILLER] while Beta is still unspoken
+        assert r.tts.texts == [opener, tail]  # tail is spoken; Beta and the filler are not
         assert second not in r.tts.texts and phrase not in r.tts.texts
     finally:
         release.set()                      # tool returns before the filler is allowed to start
@@ -403,7 +407,7 @@ async def test_filler_does_not_speak_ahead_of_a_queued_sentence():
         await asyncio.sleep(0.03)
     await r.settle()
     assert phrase not in r.tts.texts
-    assert r.tts.texts == [first, second, "All done now."]
+    assert r.tts.texts == [opener, tail, second, "All done now."]
 
 
 async def test_tool_only_turn_still_speaks_a_filler():
@@ -429,7 +433,7 @@ async def test_tool_only_turn_still_speaks_a_filler():
 async def test_filler_follows_queued_sentences_when_the_tool_is_still_running():
     release = asyncio.Event()
     phrase = "FILLER"
-    first, second, r = _two_sentence_tool_turn(release, phrase)
+    opener, tail, second, r = _two_sentence_tool_turn(release, phrase)
     await r.frames("s", 15)
     await r.frames("q", 25)
     try:
@@ -440,7 +444,7 @@ async def test_filler_follows_queued_sentences_when_the_tool_is_still_running():
             if phrase in r.tts.texts and second in r.tts.texts:
                 break
             await asyncio.sleep(0.02)
-        assert r.tts.texts == [first, second, phrase]
+        assert r.tts.texts == [opener, tail, second, phrase]
     finally:
         release.set()
     await r.settle()
@@ -1725,21 +1729,22 @@ async def test_speculation_synthesizes_only_first_sentence_before_commit():
 
 
 async def test_later_sentences_wait_until_playback_needs_them():
-    words = " ".join(["w"] * 30)      # 30 words x 80 ms = 2.4 s of audio per sentence
+    words = " ".join(["w"] * 30)      # 30 words x 80 ms = 2.4 s; the opener is cut at 12 words (960 ms)
     llm = FakeLLM([[f"{words}. ", f"{words}. ", f"{words}."]])
     r = Rig(llm, cfg=SessionConfig(tts_lookahead_ms=1500, tts_poll_s=0))
     await r.frames("s", 15)
-    await r.frames("q", 23)           # commit; first sentence sent (2.4 s buffered)
+    await r.frames("q", 23)           # commit; 960 ms opener is under the lookahead, so the rest of sentence 1 plays too
     await r.settle()
-    assert len(r.tts.texts) == 1 and len(r.sent) == 1      # 2.4 s queued > 1.5 s lookahead
-    r.clk.t += 1000                    # listener has heard 1 s: 1.4 s left < 1.5 s
+    assert r.tts.texts == [" ".join(["w"] * 12), " ".join(["w"] * 18) + "."]
+    assert len(r.sent) == 2           # 960 + 1440 ms queued > 1.5 s, so sentence 2 waits
+    r.clk.t += 1000                    # 1.4 s left < 1.5 s
     for _ in range(20):
         await asyncio.sleep(0.03)
-    assert len(r.tts.texts) == 2
+    assert len(r.tts.texts) == 3
     r.clk.t += 10_000
     for _ in range(20):
         await asyncio.sleep(0.03)
-    assert len(r.tts.texts) == 3 and r.s.history[-1]["content"].count("w") == 90
+    assert len(r.tts.texts) == 4 and r.s.history[-1]["content"].count("w") == 90
 
 
 async def test_tts_chunks_are_sent_as_they_are_produced():

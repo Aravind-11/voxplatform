@@ -7,7 +7,7 @@ from starlette.testclient import TestClient
 from api import security
 from api.app import Settings, create_app
 from api.experiments import ExperimentError, choose_variant, validate_experiment
-from api.runtime import Runtime, _count
+from api.runtime import SHORT_FIRST_SENTENCE, Runtime, _count
 from api.store import Store
 from core.metrics import METRICS
 from tests.unit.test_api import FakeLLM, FakeTTS, FakeVAD, make, sign, tenant
@@ -17,6 +17,11 @@ EXP = {"id": "exp1", "variants": [
     {"id": "A", "weight": 50, "voice": "af_heart", "systemPrompt": "Prompt A.", "model": "ultravox"},
     {"id": "B", "weight": 50, "voice": "af_bella", "model": "ultravox-b"}]}
 SPLIT = {"id": "exp1", "variants": [{"id": "A", "weight": 1}, {"id": "B", "weight": 99}]}
+
+
+def _with_short_opener(text: str) -> str:
+    """Variant text and transfer notes stay; the cascaded-TTS opener is appended after them."""
+    return text + "\n\n" + SHORT_FIRST_SENTENCE
 
 
 class T:
@@ -115,9 +120,9 @@ async def test_build_session_records_the_variant_and_does_not_mutate_the_shared_
     assert stored["metadata"]["variant"] == chosen["id"]
     assert voices == [chosen["voice"]]
     if chosen.get("systemPrompt"):
-        assert sess.history[0]["content"] == chosen["systemPrompt"]
+        assert sess.history[0]["content"] == _with_short_opener(chosen["systemPrompt"])
     else:
-        assert sess.history[0]["content"] == "base prompt"
+        assert sess.history[0]["content"] == _with_short_opener("base prompt")
     async for _ in sess.llm.stream([], np.zeros(0, np.int16), [], []):
         pass
     assert llm.model == "base-model"
@@ -159,7 +164,7 @@ def test_variant_write_keeps_caller_identity_stored_after_the_call_object_was_lo
     assert stored["callSid"] == "CA123"
     assert stored["experiment"] == "exp1"
     assert stored["variant"] in ("A", "B")
-    assert sess.history[0]["content"] == "Caller +15551110000 dialled +15552220000."
+    assert sess.history[0]["content"] == _with_short_opener("Caller +15551110000 dialled +15552220000.")
 
 
 def _until(store, tid, cfg, meta, pred):
@@ -196,7 +201,7 @@ async def test_continuation_keeps_the_root_variant_and_a_client_variant_does_not
     sess = rt.build_session(child, T())
     assert store.get_call_any(child["id"])["metadata"]["variant"] == root_vid
     prompt = next(v.get("systemPrompt") for v in exp["variants"] if v["id"] == root_vid) or "base prompt"
-    assert sess.history[0]["content"] == prompt
+    assert sess.history[0]["content"] == _with_short_opener(prompt)
     async for _ in sess.llm.stream([], np.zeros(0, np.int16), [], []):
         pass
     assert llm.model == "base-model"
@@ -218,7 +223,7 @@ async def test_continuation_keeps_the_root_variant_and_a_client_variant_does_not
                               {"resumedFrom": root["id"], "variant": "B"})
     stale_sess = rt.build_session(stale, T())
     assert store.get_call_any(stale["id"])["metadata"]["variant"] == "A"
-    assert stale_sess.history[0]["content"] == "Only A."
+    assert stale_sess.history[0]["content"] == _with_short_opener("Only A.")
 
     foreign = store.create_call(other, None, "twilio", cfg, {"experiment": "exp1", "variant": "B"})
     local = _until(store, tid, cfg, {"resumedFrom": foreign["id"], "variant": "B"},
@@ -301,7 +306,7 @@ async def test_failed_transfer_keeps_the_variant_prompt_and_one_transfer_note():
     voices = []
     rt = Runtime(llm, lambda voice: voices.append(voice) or FakeTTS(), FakeVAD, store)
     sess = rt.build_session(child, T())
-    assert sess.history[0]["content"] == ("PROMPT-A" if root_vid == "A" else "PROMPT-B") + note
+    assert sess.history[0]["content"] == _with_short_opener(("PROMPT-A" if root_vid == "A" else "PROMPT-B") + note)
     assert voices == ["af_heart" if root_vid == "A" else "af_bella"]
     assert store.get_call_any(child["id"])["metadata"]["variant"] == root_vid
     assert store.get_call_any(child["id"])["metadata"]["promptSuffix"] == note
@@ -311,7 +316,7 @@ async def test_failed_transfer_keeps_the_variant_prompt_and_one_transfer_note():
     assert llm.seen[-1] == (("model-a" if root_vid == "A" else "model-b"), "shared")
     again = store.create_call(tid, agent.json()["id"], "twilio", child["config"],
                               {**store.get_call_any(child["id"])["metadata"], "resumedFrom": child["id"], "resumes": 1})
-    assert rt.build_session(again, T()).history[0]["content"] == ("PROMPT-A" if root_vid == "A" else "PROMPT-B") + note
+    assert rt.build_session(again, T()).history[0]["content"] == _with_short_opener(("PROMPT-A" if root_vid == "A" else "PROMPT-B") + note)
     assert store.get_call_any(again["id"])["metadata"]["variant"] == root_vid
 
     voice_only = {"id": "exp-voice", "variants": [{"id": "A", "weight": 1, "voice": "af_bella"}]}
@@ -322,7 +327,7 @@ async def test_failed_transfer_keeps_the_variant_prompt_and_one_transfer_note():
     miss = {"DialCallStatus": "busy"}
     assert "<Connect>" in c.post(f"{path}?{q}", data=miss, headers=sign(f"https://vox.example.com{path}?{q}", miss)).text
     child2 = [x for x in store.list_calls(tid) if x["metadata"].get("resumedFrom") == call2["id"]][0]
-    assert rt.build_session(child2, T()).history[0]["content"] == "Be brief." + note
+    assert rt.build_session(child2, T()).history[0]["content"] == _with_short_opener("Be brief." + note)
 
 
 def test_variant_prompt_placeholders_are_required_on_api_calls_and_outbound():
@@ -349,8 +354,8 @@ def test_variant_prompt_placeholders_are_required_on_api_calls_and_outbound():
                                        "variables": {"customer": "Dana", "extra": "the plan"}}, headers=h)
     assert filled.status_code == 200
     rt = Runtime(SharedLLM(), lambda voice: FakeTTS(), FakeVAD, store)
-    assert rt.build_session(store.get_call_any(ok.json()["id"]), T()).history[0]["content"] == "Hello Ada."
-    assert rt.build_session(store.get_call_any(filled.json()["id"]), T()).history[0]["content"] == "Call Dana and the plan."
+    assert rt.build_session(store.get_call_any(ok.json()["id"]), T()).history[0]["content"] == _with_short_opener("Hello Ada.")
+    assert rt.build_session(store.get_call_any(filled.json()["id"]), T()).history[0]["content"] == _with_short_opener("Call Dana and the plan.")
 
     def handler(req):
         handler.called = True
@@ -426,7 +431,7 @@ def test_blank_variant_prompt_keeps_the_agent_prompt_and_blank_model_does_not_wr
         voices = []
         rt.make_tts = lambda voice: voices.append(voice) or FakeTTS()
         sess = rt.build_session(call, T())
-        assert sess.history[0]["content"] == "agent prompt"
+        assert sess.history[0]["content"] == _with_short_opener("agent prompt")
         assert sess.llm is llm
         assert voices == ["af_bella"]
         voices.clear()
@@ -526,7 +531,7 @@ def test_second_failed_transfer_keeps_every_note_and_a_voice_only_variant_does_n
     assert grand["metadata"]["promptSuffix"] == billing + sales
     assert grand["metadata"]["from"] == "+1555"
     rt = Runtime(FakeLLM(), lambda voice: FakeTTS(), FakeVAD, store)
-    assert rt.build_session(grand, T()).history[0]["content"] == "PROMPT-A" + billing + sales
+    assert rt.build_session(grand, T()).history[0]["content"] == _with_short_opener("PROMPT-A" + billing + sales)
 
     voice_only = {"id": "exp-voice", "variants": [{"id": "A", "weight": 1, "voice": "af_bella"}]}
     agent2 = c.post("/v1/agents", json={"name": "b", "systemPrompt": "Be brief.", "experiment": voice_only}, headers=h)
@@ -537,7 +542,7 @@ def test_second_failed_transfer_keeps_every_note_and_a_voice_only_variant_does_n
     _fail_transfer(c, child2["id"], "sales")
     grand2 = _resumed_from(store, tid, child2["id"])
     heard = rt.build_session(grand2, T()).history[0]["content"]
-    assert heard == "Be brief." + billing + sales
+    assert heard == _with_short_opener("Be brief." + billing + sales)
     assert heard.count("did not answer") == 2
 
 
@@ -556,21 +561,21 @@ def test_client_prompt_suffix_is_not_rendered_unless_the_configured_prompt_ends_
     assert created.status_code == 200
     rt = Runtime(FakeLLM(), lambda voice: FakeTTS(), FakeVAD, store)
     call = store.get_call_any(created.json()["id"])
-    assert rt.build_session(call, T()).history[0]["content"] == "VARIANT"
+    assert rt.build_session(call, T()).history[0]["content"] == _with_short_opener("VARIANT")
     _fail_transfer(c, call["id"], "billing")
     child = _resumed_from(store, tid, call["id"])
     note = _transfer_note("billing")
     assert child["metadata"]["promptSuffix"] == note
     assert injected not in child["config"]["systemPrompt"]
-    assert rt.build_session(child, T()).history[0]["content"] == "VARIANT" + note
+    assert rt.build_session(child, T()).history[0]["content"] == _with_short_opener("VARIANT" + note)
 
     blank = c.post("/v1/calls", json={"agentId": aid, "metadata": {"promptSuffix": "   "}}, headers=h)
     assert blank.status_code == 200
-    assert rt.build_session(store.get_call_any(blank.json()["id"]), T()).history[0]["content"] == "VARIANT"
+    assert rt.build_session(store.get_call_any(blank.json()["id"]), T()).history[0]["content"] == _with_short_opener("VARIANT")
     tail = store.create_call(tid, aid, "webSocket",
                              {"systemPrompt": "BASE" + note, "experiment": agent.json()["config"]["experiment"]},
                              {"promptSuffix": note})
-    assert rt.build_session(tail, T()).history[0]["content"] == "VARIANT" + note
+    assert rt.build_session(tail, T()).history[0]["content"] == _with_short_opener("VARIANT" + note)
 
     def handler(req):
         return httpx.Response(201, json={"sid": "CA1"})
@@ -588,7 +593,7 @@ def test_client_prompt_suffix_is_not_rendered_unless_the_configured_prompt_ends_
                                                  "metadata": {"promptSuffix": injected}}, headers=h2)
     assert placed.status_code == 200
     outbound = store2.get_call_any(placed.json()["id"])
-    assert rt2.build_session(outbound, T()).history[0]["content"] == "VARIANT"
+    assert rt2.build_session(outbound, T()).history[0]["content"] == _with_short_opener("VARIANT")
 
 
 def test_variant_voice_must_speak_the_agent_language_on_create_and_on_a_language_only_patch(monkeypatch):
@@ -694,7 +699,7 @@ def test_api_metadata_cannot_pin_a_parent_variant_or_count_a_call_that_never_sta
     rt = Runtime(FakeLLM(), lambda voice: FakeTTS(), FakeVAD, store)
     sess = rt.build_session(child, T())
     assert store.get_call_any(child["id"])["metadata"]["variant"] == "B"
-    assert sess.history[0]["content"] == "PROMPT-B"
+    assert sess.history[0]["content"] == _with_short_opener("PROMPT-B")
     assert _report_counts(c, h, "exp1") == {"A": 0, "B": 1}
 
     def handler(req):
@@ -736,10 +741,10 @@ def test_caller_cannot_append_a_suffix_by_making_it_the_tail_of_the_prompt():
     rt = Runtime(FakeLLM(), lambda voice: FakeTTS(), FakeVAD, store)
     call = store.get_call_any(created.json()["id"])
     assert "promptSuffix" not in call["metadata"]
-    assert rt.build_session(call, T()).history[0]["content"] == "PROMPT-A"
+    assert rt.build_session(call, T()).history[0]["content"] == _with_short_opener("PROMPT-A")
     tail = c.post("/v1/calls", json={"agentId": aid, "metadata": {"promptSuffix": "E"}}, headers=h)
     assert tail.status_code == 200
-    assert rt.build_session(store.get_call_any(tail.json()["id"]), T()).history[0]["content"] == "PROMPT-A"
+    assert rt.build_session(store.get_call_any(tail.json()["id"]), T()).history[0]["content"] == _with_short_opener("PROMPT-A")
 
 
 def test_variant_id_with_a_line_break_is_rejected_and_cannot_split_the_scrape():

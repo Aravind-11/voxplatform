@@ -4,7 +4,7 @@ import wave
 
 import numpy as np
 
-from api.runtime import RESTATE_SLOTS, Runtime
+from api.runtime import RESTATE_SLOTS, SHORT_FIRST_SENTENCE, Runtime
 from api.store import Store
 from core.asr import AsrLLM, HttpASR
 from tests.unit.test_api import FakeTTS, FakeVAD, make, tenant
@@ -180,7 +180,10 @@ def test_restate_sentence_is_in_the_prompt_only_when_the_flag_is_on(monkeypatch)
     off = rt.build_session(_call(store, {"systemPrompt": "Be brief.", "language": "es"}), _T())
     assert RESTATE_SLOTS not in off.history[0]["content"] and "Spanish" in off.history[0]["content"]
     only = rt.build_session(_call(store, {"systemPrompt": "Be brief.", "restateSlots": True}), _T())
-    assert only.history[0]["content"] == "Be brief.\n\n" + RESTATE_SLOTS
+    # Both reminders are in the prompt. The restate line cannot be the whole text once the
+    # cascaded-TTS opener is appended after it.
+    assert only.history[0]["content"] == (
+        "Be brief.\n\n" + RESTATE_SLOTS + "\n\n" + SHORT_FIRST_SENTENCE)
 
 
 def test_agent_stores_restate_slots_only_when_enabled():

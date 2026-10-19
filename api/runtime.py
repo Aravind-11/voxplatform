@@ -108,6 +108,9 @@ def _count(e: dict, variant: str = "") -> None:
 RESTATE_SLOTS = ("Earlier caller turns are transcripts and may not match the audio. "
                  "Restate any name, date, or number before you act on it.")
 
+# Cascaded TTS cannot start until text exists. This does not let Kokoro hear the caller.
+SHORT_FIRST_SENTENCE = "Keep your first sentence under eight words."
+
 
 # Said when a phone call is reconnected after the media stream or its node was lost. Short phrases per language;
 # the non-English ones have not been reviewed by a native speaker.
@@ -398,7 +401,11 @@ class Runtime:
         greeting = varmod.render(str(cfg.get("greeting") or ""), values)
         if resumed and meta.get("resumeReason") != "transfer":
             greeting = RESUME_PHRASE.get(lang, RESUME_PHRASE["en"])
+        short_first_sentence = True
+        if short_first_sentence:
+            prompt += "\n\n" + SHORT_FIRST_SENTENCE
         scfg = SessionConfig(system_prompt=prompt,
+                             short_first_sentence=short_first_sentence,
                              out_rate=transport.out_rate, tools_schema=schemas,
                              greeting=greeting,
                              error_phrase=ERROR_PHRASE.get(lang, ERROR_PHRASE["en"]),

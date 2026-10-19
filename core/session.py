@@ -156,6 +156,7 @@ class SessionConfig:
     turn: TurnConfig = field(default_factory=TurnConfig)
     max_context_tokens: int = 6000     # model context budget; the stored transcript is not trimmed to this
     history_tail: int = 6              # recent messages kept verbatim when the budget replaces older turns
+    short_first_sentence: bool = True  # runtime asks for a short opener; Kokoro still cannot hear the caller
 
 
 class _Generation:

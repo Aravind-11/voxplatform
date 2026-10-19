@@ -518,4 +518,29 @@ class Runtime:
                     return str(message["content"])
             return ""
         ctx.last_assistant_text = last_assistant_text
+
+        async def last_user_text() -> str:
+            # Tools run while the committed turn is still "[caller audio]". Wait for every in-flight
+            # transcript: barge-in cancels this generation, and a newer turn replaces `_transcript_task`
+            # while an older line is still being written. A newer benign line must not hide an older one.
+            # Injection phrases are not a complete defense.
+            try:
+                while True:
+                    pending = [t for t in list(sess._transcript_tasks) if not t.done()]
+                    if not pending:
+                        break
+                    await sess._shield_transcripts(pending)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001  (a failed transcript still leaves the earlier lines to check)
+                pass
+            lines = []
+            for message in sess.history:
+                if message.get("role") != "user":
+                    continue
+                text = str(message.get("content") or "").strip()
+                if text and text != "[caller audio]":
+                    lines.append(text)
+            return "\n".join(lines)
+        ctx.last_user_text = last_user_text
         return sess

@@ -6,7 +6,9 @@ Later entries override earlier ones with the same name (so a tenant can replace 
 """
 from __future__ import annotations
 
+import asyncio
 import copy
+import inspect
 import json
 import re
 from dataclasses import dataclass
@@ -70,6 +72,9 @@ class CallContext:
     call_control: Any = None                                        # TwilioCallControl or AsteriskCallControl; None uses ctx.twilio
     medium: str = ""                                                # sip, twilio, webSocket; which controller a live call may use
     record_sip_transfer: Optional[Callable[[str], bool]] = None    # SIP: store the dialplan target; None keeps ARI redirect
+    tool_budget: int = 8                                            # side-effect calls allowed on this call; the next one is refused
+    tool_calls: int = 0
+    last_user_text: Callable[[], Any] = lambda: ""                  # str or awaitable str; empty when not transcribed yet
 
 
 # Spoken read-back the model is told to do. It does not correct a mishearing: a wrong value that was
@@ -80,6 +85,13 @@ _SLOT_MARKS = ("book", "create", "update", "delete", "transfer", "purchase")
 _READBACK_STEP = "Read these values back to the caller before calling the tool."
 # Sentence marks and currency only. A sign, accounting parentheses, percent, or unicode minus is part of the amount.
 _SLOT_EDGE = ".,!?;:'\"$£€"
+
+# Phrase list only. A caller who avoids these words is not stopped, and a quoted phrase can still false-positive.
+_INJECTION = re.compile(
+    r"ignore (?:all |your |previous )?instructions|system prompt|you are now|jailbreak|developer message",
+    re.IGNORECASE)
+_BUDGET_ERROR = "tool call budget for this call is used up"
+_INJECTION_ERROR = "refused: the caller's words look like an instruction to the model, not a request to the business"
 
 
 def needs_slot_guard(specs: list) -> bool:
@@ -129,14 +141,74 @@ def _slot_was_said(value: str, said: str) -> bool:
     return any(hay[i:i + n] == needle for i in range(len(hay) - n + 1))
 
 
+def injection_risk(text) -> bool:
+    return bool(text) and _INJECTION.search(str(text)) is not None
+
+
+def _iter_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_strings(item)
+
+
+async def _injection_blocked(ctx, args) -> bool:
+    """True when a caller line or a string argument matches the injection phrase list."""
+    if injection_risk(await _caller_text(ctx)):
+        return True
+    return any(injection_risk(text) for text in _iter_strings(args))
+
+
+async def _caller_text(ctx) -> str:
+    """Caller text from the provider. A coroutine provider is awaited; anything else non-str is empty."""
+    provider = getattr(ctx, "last_user_text", None)
+    if provider is None:
+        return ""
+    try:
+        text = provider() if callable(provider) else provider
+        if inspect.isawaitable(text):
+            text = await text
+    except asyncio.CancelledError:
+        raise  # an empty line would fail open and run the side effect
+    except Exception:  # noqa: BLE001
+        return ""
+    return text if isinstance(text, str) else ""
+
+
+def _injection_refusal() -> dict:
+    return {"executed": False, "error": _INJECTION_ERROR}
+
+
+def _with_budget(fn, ctx):
+    """Shared per-call cap. The refused call does not run `fn` and does not increment the counter."""
+    async def run(args: dict):
+        args = dict(args or {})
+        if await _injection_blocked(ctx, args):
+            return _injection_refusal()
+        used = int(getattr(ctx, "tool_calls", 0) or 0)
+        budget = int(getattr(ctx, "tool_budget", 8))
+        if used >= budget:
+            return {"error": _BUDGET_ERROR}
+        ctx.tool_calls = used + 1
+        return await fn(args)
+    return run
+
+
 def slot_guard(fn, ctx):
     """Block a state-changing call until each string argument (length >= 3) was in the assistant's last message.
 
     Runs outside `with_confirmation`. A value the model invented and never said is refused; a value it
-    misheard and then repeated is not. That limit stays with the speech model.
+    misheard and then repeated is not. That limit stays with the speech model. An injection phrase is
+    refused before the read-back check. The phrase list is not a complete defense.
     """
     async def run(args: dict):
         args = dict(args or {})
+        if await _injection_blocked(ctx, args):
+            return _injection_refusal()
         if not getattr(ctx, "guard_slots", False):
             return await fn(args)
         said = _assistant_text(ctx)
@@ -145,6 +217,8 @@ def slot_guard(fn, ctx):
                 return {"executed": False, "next_step": _READBACK_STEP, "details": args}
         return await fn(args)
     return run
+
+
 
 
 def _canon(args: dict) -> str:
@@ -169,6 +243,8 @@ def with_confirmation(fn, schema: dict, ctx):
 
     async def run(args: dict):
         args = dict(args or {})
+        if await _injection_blocked(ctx, args):
+            return _injection_refusal()
         confirmed = args.pop("confirmed", False) is True
         key, turn = _canon(args), ctx.turn_fn()
         if confirmed and key in pending and pending[key] < turn:
@@ -283,24 +359,29 @@ def build(specs: list, ctx: Optional[CallContext] = None, client: Any = None):
     schemas: dict[str, dict] = {}
     fns: dict[str, Callable] = {}
 
-    def prepare(name: str, sch: dict, fn, confirmed: bool):
+    def prepare(name: str, sch: dict, fn, confirmed: bool, *, budget: bool = False):
+        if budget:
+            # Inside confirmation: a proposal that does not run the tool does not spend a slot.
+            fn = _with_budget(fn, ctx)
         if confirmed:
             sch, fn = with_confirmation(fn, sch, ctx)
-        # Slot guard is the outer wrapper, so a missing read-back never reaches the confirm bookkeeping.
+        # Slot guard is the outer wrapper, so a missing read-back never reaches confirm or the budget.
         if getattr(ctx, "guard_slots", False) and _changes_state(name, confirmed):
             fn = slot_guard(fn, ctx)
         return sch, fn
 
     for d in validate_specs(specs):
         if "demo" in d:
-            sch, fn = prepare(d["demo"], DEMO_SCHEMAS[d["demo"]], demo[d["demo"]], bool(d.get("confirm")))
+            sch, fn = prepare(d["demo"], DEMO_SCHEMAS[d["demo"]], demo[d["demo"]], bool(d.get("confirm")),
+                              budget=d["demo"] == "book_slot")
             schemas[d["demo"]], fns[d["demo"]] = sch, fn
         elif "builtin" in d:
             key = d.get("name") or d["builtin"]
-            sch, fn = prepare(key, builtin_tools.schema(d), builtin_tools.make(d, ctx, client), bool(d.get("confirm")))
+            sch, fn = prepare(key, builtin_tools.schema(d), builtin_tools.make(d, ctx, client),
+                              bool(d.get("confirm")), budget=d["builtin"] in ("hangUp", "transfer"))
             schemas[key], fns[key] = sch, fn
         else:
             sch, fn = prepare(d["name"], http_tools.schema(d), http_tools.make_http_tool(d, ctx, client),
-                              bool(d.get("confirm")))
+                              bool(d.get("confirm")), budget=True)
             schemas[d["name"]], fns[d["name"]] = sch, fn
     return list(schemas.values()), fns

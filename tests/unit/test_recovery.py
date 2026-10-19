@@ -816,7 +816,8 @@ def test_rejected_resume_keeps_the_same_continuation_and_transcript():
         row = lab.store.get_call_any(cid)
         assert row["status"] == "created" and row.get("end_reason") is None and row.get("joined") is None
         assert row["metadata"]["resumes"] == 1 and len(lab.store.list_calls(lab.tid)) == 2
-        assert lab.lim.total_active() == 1
+        # Refused before the UUID was known. The placeholder drops after the writer closes.
+        assert _poll(lambda: lab.lim.total_active() == 1)
         # Admit's write stuck (handler died before restore): the retry POST must not mint resumes=2.
         lab.store.update_call(cid, status="ended", ended=time.time(), end_reason="concurrency_limit")
         again = c.post("/sip/recover", json={"uuid": uid}, headers=headers)
@@ -827,6 +828,7 @@ def test_rejected_resume_keeps_the_same_continuation_and_transcript():
         assert _push_uuid(lab, uid)
         row = lab.store.get_call_any(cid)
         assert row["status"] == "created" and row["metadata"]["resumes"] == 1
+        assert _poll(lambda: lab.lim.total_active() == 1)
         lab.lim.release(lab.tid, "blocker")
         assert lab.lim.total_active() == 0
         sock = _open_uuid(lab, uid)
@@ -960,7 +962,9 @@ def test_second_audiosocket_while_recovered_call_is_live_does_not_create_a_call(
                 closed = False
                 deadline = time.time() + 2
                 while time.time() < deadline:
-                    if len(lab.store.list_calls(lab.tid)) > 2 or lab.lim.total_active() > 1:
+                    # A second row is a real extra call. The placeholder slot is not:
+                    # it is reserved before the UUID is known and released after close.
+                    if len(lab.store.list_calls(lab.tid)) > 2:
                         break
                     try:
                         chunk = other.recv(64)
@@ -971,7 +975,9 @@ def test_second_audiosocket_while_recovered_call_is_live_does_not_create_a_call(
                         break
                 assert closed, "the duplicate socket joined the call"
                 assert len(lab.store.list_calls(lab.tid)) == 2
-                assert lab.lim.total_active() == 1
+                # The duplicate reserves a slot before its UUID is known and drops it
+                # in the handler finally, after this socket closes.
+                assert _poll(lambda: lab.lim.total_active() == 1)
                 assert list(lab.rt.live) == [cid]
                 assert ("user", "I want Tuesday at eleven.") in _history(lab.rt.live[cid][0])
                 assert c.post("/sip/recover", json={"uuid": uid}, headers=headers).status_code == 409

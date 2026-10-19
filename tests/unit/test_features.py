@@ -2984,6 +2984,9 @@ def test_delete_call_removes_record_transcript_and_recording(tmp_path, monkeypat
     call = store.create_call(ta, None, "webSocket", {})
     kept = store.create_call(ta, None, "webSocket", {})
     store.add_message(call["id"], "user", "secret words", 1.0)
+    store.add_timing(call["id"], 1, "llm_first_token", 40, 1.0)
+    store.add_timing(call["id"], 1, "tool_result", 7, 2.0)
+    timing_rows = [(1, "llm_first_token", 40.0), (1, "tool_result", 7.0)]
     (tmp_path / f"{call['id']}.wav").write_bytes(b"RIFF....")
     (tmp_path / f"{call['id']}.part.wav").write_bytes(b"PART")       # crash leftover beside the finished wav
     (tmp_path / f"{kept['id']}.wav").write_bytes(b"KEEP")
@@ -2993,11 +2996,14 @@ def test_delete_call_removes_record_transcript_and_recording(tmp_path, monkeypat
     store.update_call(call["id"], status="active")
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(ka)).status_code == 409           # not while live
     assert (tmp_path / f"{call['id']}.part.wav").exists()                                  # a refused delete must not erase audio
+    assert [(r["turn"], r["stage"], r["ms"]) for r in store.timings(call["id"])] == timing_rows
     store.update_call(call["id"], status="ended")
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(kb)).status_code == 404           # other tenant
     assert (tmp_path / f"{call['id']}.part.wav").exists()
+    assert [(r["turn"], r["stage"], r["ms"]) for r in store.timings(call["id"])] == timing_rows
     assert c.delete(f"/v1/calls/{call['id']}", headers=H(ka)).status_code == 200
     assert store.get_call_any(call["id"]) is None and store.messages(call["id"]) == []
+    assert store.timings(call["id"]) == []
     assert not (tmp_path / f"{call['id']}.wav").exists() and not (tmp_path / f"{call['id']}.part.wav").exists()
     assert not list((tmp_path / "utterances").iterdir())
     assert (tmp_path / f"{kept['id']}.wav").read_bytes() == b"KEEP"                        # a call that was not erased keeps its files

@@ -710,6 +710,12 @@ def create_app(store: Store, runtime: Runtime, limiter: security.ConcurrencyLimi
             raise HTTPException(500, f"{type(got).__name__}: {got}")
         return got
 
+    @app.get("/v1/calls/{call_id}/timings")
+    async def call_timings(call_id: str, t: dict = Depends(tenant)):
+        if not store.get_call(t["id"], call_id):
+            raise HTTPException(404, "call not found")
+        return store.timings(call_id)
+
     @app.get("/v1/usage")
     async def usage(days: int = 30, t: dict = Depends(tenant)):
         u = store.usage(t["id"], max(1, min(days, 365)))

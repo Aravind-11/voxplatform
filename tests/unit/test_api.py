@@ -85,6 +85,182 @@ def test_admin_disabled_when_no_admin_key():
     assert c.post("/admin/tenants", json={"name": "x"}, headers={"X-Admin-Key": ""}).status_code == 403
 
 
+def test_call_timings_are_tenant_scoped_and_recorded_from_events():
+    c, store, _ = make()
+    ka, _ = tenant(c, "a")
+    kb, _ = tenant(c, "b")
+    ha, hb = {"X-API-Key": ka}, {"X-API-Key": kb}
+    call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers=ha).json()
+    store.add_timing(call["id"], 1, "llm_first_token", 120, 1.0)
+    store.add_timing(call["id"], 1, "tts_done", 80, 2.0)
+    rows = c.get(f"/v1/calls/{call['id']}/timings", headers=ha).json()
+    assert [(r["turn"], r["stage"], r["ms"]) for r in rows] == [(1, "llm_first_token", 120.0), (1, "tts_done", 80.0)]
+    assert c.get(f"/v1/calls/{call['id']}/timings", headers=hb).status_code == 404
+    sess = c.app.state.runtime.build_session(store.get_call_any(call["id"]), type("T", (), {
+        "out_rate": 16000, "send_audio": lambda s, *a: None, "clear": lambda s: None, "end": lambda s: None})())
+    sess.stats["turns"] = 3
+    sess.on_event({"type": "llm_first_token", "ms": 40})
+    sess.on_event({"type": "agent_first_audio", "latency_ms": 90})
+    sess.on_event({"type": "tts_done", "ms": 15})
+    sess.on_event({"type": "tool_result", "name": "lookup", "ms": 7})
+    sess.on_event({"type": "user_transcript", "text": "hi"})
+    got = [(r["turn"], r["stage"], r["ms"]) for r in store.timings(call["id"])]
+    assert got[2:] == [(3, "llm_first_token", 40.0), (3, "agent_first_audio", 90.0),
+                       (3, "tts_done", 15.0), (3, "tool_result", 7.0)]
+
+
+async def test_speculative_stages_share_the_committed_turn():
+    """llm_first_token and tts_done fire while the reply is still speculative, before stats['turns']
+    increments. They belong on the caller turn that is about to commit, with agent_first_audio."""
+    c, store, _ = make()
+    key, _ = tenant(c)
+    call = c.post("/v1/calls", json={"systemPrompt": "p"}, headers={"X-API-Key": key}).json()
+
+    class T:
+        out_rate = 8000
+
+        async def send_audio(self, pcm, rate=8000):
+            return None
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            return None
+
+    sess = c.app.state.runtime.build_session(store.get_call_any(call["id"]), T())
+    speech = np.full(512, 5000, dtype=np.int16)
+    quiet = np.zeros(512, dtype=np.int16)
+    for _ in range(10):
+        await sess.feed(speech)
+    for _ in range(8):
+        await sess.feed(quiet)
+    for _ in range(50):
+        await asyncio.sleep(0)
+    for _ in range(16):
+        await sess.feed(quiet)
+    gen = sess._gen
+    assert gen is not None
+    await asyncio.wait(set(gen.tasks), timeout=2)
+    want = ("llm_first_token", "tts_done", "agent_first_audio")
+    got = {r["stage"]: r["turn"] for r in store.timings(call["id"]) if r["stage"] in want}
+    assert set(got) == set(want)
+    assert set(got.values()) == {1}
+    assert sess.stats["turns"] == 1
+
+
+async def test_timing_insert_failure_keeps_the_tool_result_and_the_audio():
+    """add_timing is telemetry. A locked database must not swallow the tool result, drop
+    synthesized audio, or run a hangUp `after` before that audio is sent."""
+    import sqlite3
+
+    from core.metrics import METRICS
+    from core.session import ToolCall
+
+    def errors(where):
+        return METRICS.counters.get(("vox_errors_total", (("where", where),)), 0.0)
+
+    before = {w: errors(w) for w in ("timings", "tts", "produce")}
+    c, store, _ = make()
+    key, _ = tenant(c)
+    call = c.post("/v1/calls", json={"systemPrompt": "p", "tools": ["hangUp"]},
+                  headers={"X-API-Key": key}).json()
+
+    class LLM:
+        def __init__(self):
+            self.seen = []
+
+        async def stream(self, history, audio, followups, tools):
+            self.seen.append(list(followups))
+            if not followups:
+                yield "Goodbye now. "
+                yield ToolCall("h1", "hangUp", {"reason": "done"})
+            else:
+                yield "Take care."
+
+        async def transcribe(self, audio):
+            return "bye"
+
+    llm = LLM()
+    c.app.state.runtime.llm = llm
+    real = store.add_timing
+
+    def fail(call_id, turn, stage, ms, t):
+        if stage in ("tool_result", "tts_done", "agent_first_audio"):
+            raise sqlite3.OperationalError("database is locked")
+        return real(call_id, turn, stage, ms, t)
+
+    store.add_timing = fail
+    order = []
+
+    class T:
+        out_rate = 8000
+
+        async def send_audio(self, pcm, rate=8000):
+            order.append(("send", len(pcm)))
+
+        async def clear(self):
+            return None
+
+        async def end(self):
+            order.append(("end", 0))
+
+    sess = c.app.state.runtime.build_session(store.get_call_any(call["id"]), T())
+    speech = np.full(512, 5000, dtype=np.int16)
+    quiet = np.zeros(512, dtype=np.int16)
+    for _ in range(10):
+        await sess.feed(speech)
+    for _ in range(8):
+        await sess.feed(quiet)
+    for _ in range(50):
+        await asyncio.sleep(0)
+    for _ in range(16):
+        await sess.feed(quiet)
+    gen = sess._gen
+    assert gen is not None
+    _done, pending = await asyncio.wait(set(gen.tasks), timeout=5)
+    assert not pending
+    for _ in range(100):
+        if any(kind == "end" for kind, _ in order):
+            break
+        await asyncio.sleep(0.02)
+    await sess.close()
+
+    assert len(llm.seen) == 2
+    assert llm.seen[1][1]["role"] == "tool" and llm.seen[1][1]["tool_call_id"] == "h1"
+    assert llm.seen[1][1]["content"] == '{"ok": true, "reason": "done"}'
+    kinds = [kind for kind, _ in order]
+    assert kinds == ["send", "send", "end"]
+    assert all(n > 0 for kind, n in order if kind == "send")
+    assert sess.history[-1] == {"role": "assistant", "content": "Goodbye now. Take care."}
+    for t in gen.tasks:
+        assert t.exception() is None
+    assert errors("timings") == before["timings"] + 4
+    assert errors("tts") == before["tts"] and errors("produce") == before["produce"]
+    stages = [r["stage"] for r in store.timings(call["id"])]
+    assert stages.count("llm_first_token") == 2
+    assert not {"tts_done", "tool_result", "agent_first_audio"} & set(stages)
+
+
+def test_dashboard_waterfall_is_text_bars_in_show_call():
+    """The call view fetches timings after the transcript and draws stage bars with h(), not innerHTML."""
+    from pathlib import Path
+    html = (Path(__file__).resolve().parents[2] / "api" / "static" / "dashboard.html").read_text()
+    start = html.index("async function showCall")
+    body = html[start:html.index('\n$("login")', start)]
+    assert body.index("/messages") < body.index("/timings")
+    assert 'api("/v1/calls/" + c.id + "/timings")' in body
+    water = body[body.index("/timings"):body.index("/recording")]
+    for piece in ('llm_first_token: "llm"', 'tts_done: "tts"',
+                  'agent_first_audio: "first audio"', 'tool_result: "tool"'):
+        assert piece in water
+    assert "t.turn === r.turn" in water
+    assert 'h("div", { class: "barrow"' in water
+    assert 'h("span", {}, labels[r.stage]' in water
+    assert 'h("div", { class: "bar"' in water
+    assert "innerHTML" not in water
+
+
 def test_tenant_isolation():
     c, *_ = make()
     ka, _ = tenant(c, "a")

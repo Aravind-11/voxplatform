@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-TABLES = ["tenants", "api_keys", "agents", "calls", "messages", "audit", "tools", "corpora", "docs",
+TABLES = ["tenants", "api_keys", "agents", "calls", "messages", "timings", "audit", "tools", "corpora", "docs",
           "numbers", "sip_setup"]
 
 

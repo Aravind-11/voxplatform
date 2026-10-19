@@ -427,7 +427,7 @@ class Runtime:
                                                                                 BACKCHANNEL_MS["normal"])))
         cid = call["id"]
         log = self.message_log
-
+        store = self.store
         variant_id = str(variant["id"]) if variant else ""
 
         def on_event(e: dict) -> None:
@@ -438,6 +438,20 @@ class Runtime:
                 text = redact_text(e["text"]) if redact else e["text"]
                 role = "user" if e["type"] == "user_transcript" else "agent"
                 log.add(cid, role, text, time.time())
+            # agent_first_audio carries latency_ms; the other three stages carry ms.
+            # Speculative llm/tts events fire before END_OF_TURN increments stats["turns"].
+            # `sess` is assigned below; events run only after the session exists.
+            if e["type"] in ("llm_first_token", "tts_done", "agent_first_audio", "tool_result"):
+                ms = e["ms"] if "ms" in e else e.get("latency_ms")
+                if ms is not None:
+                    try:
+                        turn = int(sess.stats["turns"])
+                        gen = sess._gen
+                        if gen is not None and not gen.committed:
+                            turn += 1
+                        store.add_timing(cid, turn, e["type"], ms, time.time())
+                    except Exception:  # noqa: BLE001  (a timings write must never break the call)
+                        METRICS.inc("vox_errors_total", where="timings")
             if forward_events and hasattr(transport, "send_event"):
                 import asyncio
                 asyncio.get_running_loop().create_task(transport.send_event(e))

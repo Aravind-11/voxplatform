@@ -840,6 +840,86 @@ async def test_noyield_burst_does_not_block_round0_on_this_turns_asr():
     assert "[caller audio]" not in _contents(later)
     assert llm.calls[0]["n_audio"] > 0
 
+async def test_barge_in_while_tools_wait_for_transcript_keeps_the_caller_line():
+    # Confirm waits on this turn's transcript before tools. Cancelling the generation must not
+    # cancel that task, or the line stays "[caller audio]" and a real "yes" never counts.
+    gate = asyncio.Event()
+    calls = []
+
+    class LLM(FakeLLM):
+        def __init__(self):
+            super().__init__([["Tuesday at eleven. ", ToolCall("t1", "book_slot",
+                                                               {"day": "tuesday", "time": "11:00", "confirmed": True})]])
+            self.transcript_cancelled = False
+
+        async def transcribe(self, audio):
+            self.n_transcribe += 1
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                self.transcript_cancelled = True
+                raise
+            return "yes"
+
+    async def book(args):
+        calls.append(dict(args))
+        return {"booked": True, **args}
+
+    llm = LLM()
+    # 3 words * 400 ms stays playing through a 512 ms barge. The default 80 ms clip ends first,
+    # and eight frames (256 ms) never clear the 450 ms backchannel gate.
+    r = Rig(llm, tools={"book_slot": book}, tts=FakeTTS(word_ms=400))
+    await r.frames("s", 15)
+    await r.frames("q", 25)          # speculate, then commit; tools block on the transcript
+    await r.settle()
+    assert calls == []
+    assert [m["content"] for m in r.s.history if m["role"] == "user"] == ["[caller audio]"]
+    await r.frames("s", 16)          # 512 ms: past the speaking gate and barge_confirm_ms
+    await r.settle()
+    assert "user_interrupted" in r.types()
+    gate.set()
+    await r.settle()
+    assert llm.transcript_cancelled is False
+    assert [m["content"] for m in r.s.history if m["role"] == "user"][0] == "yes"
+    assert calls == []               # the interrupted generation must not run the tool
+
+
+async def test_cancelled_speculation_does_not_drop_the_previous_caller_line():
+    # The next reply waits on the previous transcript. Cancelling that speculation must not
+    # cancel the previous turn's task and stick the line on "[caller audio]".
+    gate = asyncio.Event()
+
+    class LLM(FakeLLM):
+        def __init__(self):
+            super().__init__([["Noted. "], ["Hello ", "there."]])
+            self.transcript_cancelled = False
+
+        async def transcribe(self, audio):
+            self.n_transcribe += 1
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                self.transcript_cancelled = True
+                raise
+            return "yes"
+
+    llm = LLM()
+    r = Rig(llm)
+    await r.frames("s", 15)
+    await r.frames("q", 25)          # turn commits; reply has no tool call, transcript stays in flight
+    await r.settle()
+    assert r.s._gen is not None and r.s._gen.produce_done
+    await r.frames("s", 15)
+    await r.frames("q", 8)           # next turn starts speculating and waits on the previous transcript
+    await r.settle()
+    await r.frames("s", 8)           # caller resumes: speculation is cancelled
+    await r.settle()
+    assert r.s.stats["speculations_cancelled"] == 1
+    gate.set()
+    await r.settle()
+    assert llm.transcript_cancelled is False
+    assert [m["content"] for m in r.s.history if m["role"] == "user"][0] == "yes"
+
 async def test_tool_call_cancelled_speculation_never_runs_tool():
     calls = []
 

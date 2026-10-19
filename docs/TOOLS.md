@@ -24,10 +24,13 @@ definitions are rejected with HTTP 422 at creation, not mid-call) and overridabl
 ## Confirm before acting (guards against mishearing)
 Add `"confirm": true` to an HTTP tool, or write a named tool as `{"tool": "book_slot", "confirm": true}`. The first
 call does not run the tool: the model gets the details and must read them back to the caller. The tool runs only
-on a second call with `confirmed: true`, the same details, made in a **later caller turn**; one confirmation
-authorizes one action, and changed details need a new confirmation. A misheard request becomes an audible
-"Tuesday at 11, correct?" the caller can fix, instead of a silent action. Limit: it relies on the model hearing a
-short yes/no correctly, which is far easier than hearing a day or a name.
+on a later caller turn with `confirmed: true` and the same details, and only when the **latest** caller transcript
+is an affirmative whole utterance such as "yes" or "that's right". "um", "yes but make it Monday", "don't",
+"actually", an empty line, and `[caller audio]` are not consent, and an older "yes" does not count once a later
+line is in the history. The platform checks that transcript; `confirmed: true` on a later turn is not enough by
+itself. When slot read-back is on, each value also has to appear in the assistant's previous message; a yes
+does not skip that. One confirmation authorizes one action, and changed details need a new confirmation. A misheard request
+becomes an audible "Tuesday at 11, correct?" the caller can fix, instead of a silent action.
 
 ## Built-ins
 - `"hangUp"` or `{"builtin": "hangUp", "strict": false}`: ends the call after the agent finishes speaking.

@@ -543,4 +543,15 @@ class Runtime:
                     lines.append(text)
             return "\n".join(lines)
         ctx.last_user_text = last_user_text
+
+        def latest_user_line() -> str:
+            # Consent is this line only. "[caller audio]" is not a yes, and an older yes
+            # does not count once a later line is stored. Injection uses last_user_text,
+            # which joins every line, so a newer benign line cannot hide an older phrase.
+            for message in reversed(sess.history):
+                if message.get("role") == "user":
+                    return str(message.get("content") or "")
+            return ""
+        ctx.latest_user_line = latest_user_line
+        ctx.audit = lambda action, detail: self.store.audit(tid, "tool", action, cid, detail)
         return sess

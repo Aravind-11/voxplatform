@@ -857,7 +857,8 @@ class Session:
                 await gen.commit.wait()  # never run side effects for an uncommitted reply
                 task = getattr(gen, "transcript_task", None)
                 # Await this generation's transcript even when a newer turn has replaced the
-                # pointer. Skipping it sends the tool round "[inaudible]" instead of the words.
+                # pointer. Skipping it sends the tool round "[inaudible]" instead of the words,
+                # and confirmation would treat the line as "[caller audio]" rather than a yes.
                 # Shielded: a barge-in cancels this reply and must not cancel the transcript.
                 if task is not None and not task.done():
                     await asyncio.shield(task)

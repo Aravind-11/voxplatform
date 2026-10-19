@@ -74,7 +74,9 @@ class CallContext:
     record_sip_transfer: Optional[Callable[[str], bool]] = None    # SIP: store the dialplan target; None keeps ARI redirect
     tool_budget: int = 8                                            # side-effect calls allowed on this call; the next one is refused
     tool_calls: int = 0
-    last_user_text: Callable[[], Any] = lambda: ""                  # str or awaitable str; empty when not transcribed yet
+    last_user_text: Callable[[], Any] = lambda: ""                  # str or awaitable; every caller line, for the injection check
+    latest_user_line: Any = None                                    # sync () -> latest line only, placeholder included; None uses last_user_text
+    audit: Callable[..., Any] = lambda *a, **k: None                # (action, detail); a failure must not undo the tool
 
 
 # Spoken read-back the model is told to do. It does not correct a mishearing: a wrong value that was
@@ -220,18 +222,72 @@ def slot_guard(fn, ctx):
 
 
 
-
 def _canon(args: dict) -> str:
     """Order- and case-insensitive key for 'the same request', so '  Tuesday' and 'tuesday' match."""
     norm = {k: (v.strip().lower() if isinstance(v, str) else v) for k, v in args.items()}
     return json.dumps(norm, sort_keys=True, default=str)
 
 
+# Whole-utterance agreements. A longer phrase is listed before the word it contains ("that's right" before "right")
+# so a stack of them ("yes that's right") still matches, and a hedge ("yes but make it Monday") does not.
+_AFFIRM = (
+    "that's right", "thats right", "that is right", "go ahead", "do it",
+    "yes", "yeah", "yep", "correct", "right", "ok", "okay", "sure", "confirm",
+    "sí", "si", "oui", "correcto", "vale", "haan", "hai",
+)
+_REJECT = re.compile(r"\b(?:not|don't|dont|actually)\b")
+_PUNCT = re.compile(r"[^\w\s']+", re.UNICODE)
+_SPACE = re.compile(r"\s+")
+
+
+def _normalize_utterance(text: str) -> str:
+    t = _PUNCT.sub(" ", str(text).strip().lower())
+    return _SPACE.sub(" ", t).strip()
+
+
+def _is_affirmative(text: str) -> bool:
+    """True only when the caller agreed: the whole line is one or more affirmative phrases, with no hedge."""
+    norm = _normalize_utterance(text)
+    if not norm or _REJECT.search(norm):
+        return False
+    rest = norm
+    while rest:
+        match = next((p for p in _AFFIRM if rest == p or rest.startswith(p + " ")), None)
+        if match is None:
+            return False
+        rest = rest[len(match):].lstrip()
+    return True
+
+
+def _confirm_transcript(ctx) -> str:
+    """The latest caller line, for consent. Not the joined injection text.
+
+    `latest_user_line` wins. Otherwise a synchronous `last_user_text` is that line.
+    A coroutine provider joins every line for the injection check, so it is closed
+    and not treated as a yes.
+    """
+    provider = getattr(ctx, "latest_user_line", None)
+    if not callable(provider):
+        provider = getattr(ctx, "last_user_text", None)
+    if provider is None:
+        return ""
+    try:
+        text = provider() if callable(provider) else provider
+    except Exception:  # noqa: BLE001  (a transcript lookup must not become a tool error)
+        return ""
+    if inspect.isawaitable(text):
+        close = getattr(text, "close", None)
+        if callable(close):
+            close()
+        return ""
+    return text if isinstance(text, str) else ""
+
+
 def with_confirmation(fn, schema: dict, ctx):
     """Makes a tool that changes things safe against mishearing. The first call does NOT run it: the model gets
     the details to read back and must ask the caller. Only a second call with confirmed=true, with the same
-    arguments, made in a LATER caller turn, runs it. A mis-heard booking becomes an audible 'Tuesday at 11,
-    correct?' that the caller can fix, instead of a silent action."""
+    arguments, made in a LATER caller turn, AND an affirmative caller transcript, runs it. A mis-heard booking
+    becomes an audible 'Tuesday at 11, correct?' that the caller can fix, instead of a silent action."""
     sch = copy.deepcopy(schema)
     f = sch["function"]
     f["parameters"].setdefault("properties", {})["confirmed"] = {
@@ -239,6 +295,7 @@ def with_confirmation(fn, schema: dict, ctx):
         "description": "true ONLY after the caller heard these exact details read back and clearly said yes."}
     f["description"] += (" This changes things for real. First call it WITHOUT confirmed to get the details to read "
                          "back to the caller; call again with confirmed=true only after they agree.")
+    name = f.get("name", "")
     pending: dict[str, int] = {}
 
     async def run(args: dict):
@@ -247,9 +304,18 @@ def with_confirmation(fn, schema: dict, ctx):
             return _injection_refusal()
         confirmed = args.pop("confirmed", False) is True
         key, turn = _canon(args), ctx.turn_fn()
-        if confirmed and key in pending and pending[key] < turn:
-            pending.pop(key)
-            return await fn(args)
+        transcript = _confirm_transcript(ctx)
+        if confirmed and key in pending and pending[key] < turn and _is_affirmative(transcript):
+            detail = {"name": name, "args": dict(args), "transcript": transcript}
+            result = await fn(args)
+            pending.pop(key)  # a raise leaves the proposal; a failed audit must not undo this
+            try:
+                audit = getattr(ctx, "audit", None)
+                if callable(audit):
+                    audit("tool.confirmed", detail)
+            except Exception:  # noqa: BLE001 (a logging failure is not the tool result)
+                pass
+            return result
         pending[key] = turn
         return {"executed": False,
                 "next_step": ("NOT DONE YET. Read these details back to the caller in one short sentence and ask them "

@@ -2,11 +2,15 @@
 
 KPipeline is a blocking generator, so synthesis runs in a worker thread and PCM pieces are
 handed back through an asyncio queue. Output: int16 mono at 24 kHz.
+
+`HttpTTS` is the swap for a commercially licensed engine (`VOX_TTS_URL`). Kokoro's voice list
+does not grow when that is set.
 """
 from __future__ import annotations
 
 import asyncio
 import io
+import json
 import wave
 from typing import AsyncIterator
 
@@ -198,16 +202,45 @@ _PRINTABLE = bytes(b for b in range(256) if b in (9, 10, 13) or 32 <= b <= 126)
 
 def _content_type(resp) -> str:
     headers = getattr(resp, "headers", None)
-    getter = getattr(headers, "get", None)
-    if getter is None:
+    if headers is None:
         return ""
-    return str(getter("content-type") or "").split(";", 1)[0].strip().lower()
+    value = None
+    getter = getattr(headers, "get", None)
+    if getter is not None:
+        value = getter("content-type")
+    # A plain dict does not fold case. Tests and some fakes send "Content-Type".
+    if not value and isinstance(headers, dict):
+        for key, item in headers.items():
+            if str(key).lower() == "content-type":
+                value = item
+                break
+    return str(value or "").split(";", 1)[0].strip().lower()
+
+
+# OpenAI speech defaults to mp3. These are not s16le. A bare 0xFFFB frame sync is left alone
+# because those two bytes are common in PCM; only the media type (or an ID3 tag) refuses them.
+_COMPRESSED_MEDIA = frozenset({
+    "audio/mpeg", "audio/mp3", "audio/opus", "audio/ogg", "audio/flac", "audio/aac", "audio/mp4",
+})
 
 
 def _text_media(resp) -> bool:
     """A JSON or text Content-Type is an error document, not a raw PCM body."""
     ctype = _content_type(resp)
-    return ctype.startswith("text/") or ctype == "application/json" or ctype.endswith("+json")
+    return ctype.startswith("text/") or ctype == "application/json" or ctype.endswith("+json") or "json" in ctype
+
+
+def _compressed_media(resp) -> bool:
+    return _content_type(resp) in _COMPRESSED_MEDIA
+
+
+def _http_status(resp) -> int | None:
+    code = getattr(resp, "status_code", None)
+    if isinstance(code, bool) or not isinstance(code, int):
+        code = getattr(resp, "status", None)
+    if isinstance(code, bool) or not isinstance(code, int):
+        return None
+    return int(code)
 
 
 def _wav_media(resp) -> bool:
@@ -229,6 +262,21 @@ def _all_printable(body: bytes) -> bool:
     return not body.translate(None, _PRINTABLE)
 
 
+def _json_document(raw: bytes) -> bool:
+    """True when the whole body is a JSON object or array. A lone '{' byte is a PCM sample."""
+    try:
+        text = raw.decode("utf-8-sig").strip()
+    except UnicodeDecodeError:
+        return False
+    if len(text) < 2 or text[0] not in "{[":
+        return False
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(value, (dict, list))
+
+
 def _is_error_document(raw: bytes, *, final: bool = True) -> bool:
     """True for a JSON/HTML token or, once the body is complete, a run of plain text.
 
@@ -240,6 +288,10 @@ def _is_error_document(raw: bytes, *, final: bool = True) -> bool:
         return False
     low = body[:16].lower()
     if any(low.startswith(tok) for tok in _TOKENS):
+        return True
+    # `[]` and `{ }` do not match the token list. Decide only once the body is finished so a
+    # lone '[' or '{' sample is not refused mid-stream.
+    if final and _json_document(body):
         return True
     # A short printable prefix can still be the start of PCM; decide only when the body is finished.
     return bool(final and len(body) >= 4 and _all_printable(body))
@@ -270,6 +322,10 @@ def _pcm_from_tts(raw, default_rate: int) -> tuple[np.ndarray, int]:
         if channels > 1:
             pcm = pcm.reshape(-1, channels)[:, 0].copy()
         return pcm, rate
+    # An ID3 tag is an mp3 container even when the response has no media type. A bare 0xFFFB
+    # frame sync is still PCM: those bytes show up in ordinary s16le.
+    if raw.startswith(b"ID3"):
+        raise ValueError("HttpTTS response was not audio")
     # An error document (JSON or HTML) is even-length often enough to decode as loud PCM.
     if _is_error_document(raw):
         raise ValueError("HttpTTS response was not audio")
@@ -343,6 +399,11 @@ class _BytePCM:
         if not view:
             return False
         if _is_error_document(view, final=final):
+            raise ValueError("HttpTTS response was not audio")
+        # Hold "I" / "ID" until the next byte. "ID3" is an mp3 tag, not s16le.
+        if len(view) < 3 and not final and b"ID3".startswith(view):
+            return False
+        if view.startswith(b"ID3"):
             raise ValueError("HttpTTS response was not audio")
         if view.startswith(b"RIFF"):
             if len(view) < 12 and not final:
@@ -484,18 +545,29 @@ async def _response_bytes(resp) -> bytes:
 class HttpTTS:
     """OpenAI-compatible `POST {base_url}/audio/speech`.
 
-    `sample_rate` starts at 24000 and is replaced by the rate in a WAV response. If `client.post`
-    returns an async iterator, each yielded piece is one chunk; one WAV body is one chunk.
+    The body is `{model, voice, input, response_format: "pcm"}`. `sample_rate` starts at 24000
+    (or `VOX_TTS_RATE`) and is replaced by the rate in a WAV response. Headerless audio is raw
+    s16le at that rate. JSON, text, ID3, and compressed types (mpeg, opus, ogg, flac, aac, mp4)
+    are refused. If `client.post` returns an async iterator, each yielded piece is one chunk;
+    one WAV or PCM body is one chunk.
+
+    Callers pass either `(url, client, *, voice=)` or `(voice, url, client, *, rate=)`.
     """
 
-    def __init__(self, base_url: str, client, *, model: str = "tts-1", voice: str = "alloy",
-                 api_key: str = "", sample_rate: int = 24000) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.client = client
-        self.model = model
-        self.voice = voice
+    def __init__(self, base_url: str, client=None, third=None, *, model: str = "tts-1",
+                 voice: str = "alloy", api_key: str = "", sample_rate: int = 24000,
+                 rate: int | None = None) -> None:
+        # A voice name has no scheme. PR 62 passes the voice first; streaming callers pass the URL first.
+        if isinstance(client, str) and "://" in client:
+            voice_name, url, http = base_url, client, third
+        else:
+            voice_name, url, http = voice, base_url, client
+        self.base_url = self.url = str(url).rstrip("/")
+        self.client = http
+        self.model = (model or "tts-1").strip() or "tts-1"
+        self.voice = voice_name
         self.api_key = api_key
-        self.sample_rate = sample_rate
+        self.sample_rate = sample_rate if rate is None else rate
 
     async def _iter_pieces(self, pieces, *, require_wav: bool = False) -> AsyncIterator[np.ndarray]:
         dec = _BytePCM(self.sample_rate, require_wav=require_wav)
@@ -511,20 +583,25 @@ class HttpTTS:
                 yield pcm
 
     async def synthesize(self, text: str) -> AsyncIterator[np.ndarray]:
-        payload = {"model": self.model, "voice": self.voice, "input": text}
+        # pcm asks an OpenAI-compatible server not to default to mp3. The read budget stays
+        # above the shared client's 5s (a sentence can start late) and still finite (60s).
+        payload = {"model": self.model, "voice": self.voice, "input": text, "response_format": "pcm"}
         kwargs: dict = {"json": payload, "timeout": TTS_HTTP_TIMEOUT}
         if self.api_key:
             kwargs["headers"] = {"Authorization": f"Bearer {self.api_key}"}
         posted = self.client.post(f"{self.base_url}/audio/speech", **kwargs)
-        if hasattr(posted, "__aiter__"):
+        if hasattr(posted, "__aiter__") and not asyncio.iscoroutine(posted):
             async for pcm in self._iter_pieces(posted):
                 yield pcm
             return
         resp = await posted
-        status = getattr(resp, "status_code", None)
-        if status is not None and int(status) >= 400:
+        status = _http_status(resp)
+        # 3xx is not audio either. A redirect body must not be played as s16le.
+        if status is not None and (status < 200 or status >= 300):
             raise RuntimeError(f"HttpTTS HTTP {status}")
-        if _text_media(resp):
+        if status is None and hasattr(resp, "raise_for_status"):
+            resp.raise_for_status()
+        if _text_media(resp) or _compressed_media(resp):
             raise ValueError("HttpTTS response was not audio")
         require_wav = _wav_media(resp)
         if hasattr(resp, "__aiter__") and not isinstance(resp, (bytes, bytearray)):
@@ -538,3 +615,20 @@ class HttpTTS:
         self.sample_rate = rate
         if len(pcm):
             yield pcm
+
+
+def make_tts_factory(env, http):
+    """Kokoro unless `VOX_TTS_URL` is set, in which case every voice uses that HTTP engine.
+
+    The HTTP branch does not construct a Kokoro pipeline. A blank or whitespace URL stays on Kokoro,
+    and every voice shares that one pipeline set.
+    """
+    url = str(env.get("VOX_TTS_URL") or "").strip().rstrip("/")
+    if url:
+        model = str(env.get("VOX_TTS_MODEL") or "tts-1").strip() or "tts-1"
+        key = env.get("VOX_TTS_API_KEY") or ""
+        rate = int(env.get("VOX_TTS_RATE") or "24000")
+        return lambda voice, url=url, model=model, key=key, rate=rate, client=http: HttpTTS(
+            voice, url, client, model=model, api_key=key, rate=rate)
+    pipelines = PipelineSet(preload=env.get("VOX_PRELOAD_LANGS", "a"))  # one front end per language, shared by all calls
+    return lambda voice, pipelines=pipelines: KokoroTTS(voice=voice, pipeline=pipelines.for_voice(voice))

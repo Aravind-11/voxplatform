@@ -1130,8 +1130,10 @@ class Session:
             t_tts = self.clock()
             slices: list[_WordSlice] = []
             lengths: list[int] = []
+            yielded = False
             try:
                 async for part in self.tts.synthesize(text):
+                    yielded = True
                     pcm = resample(np.asarray(part), self.tts.sample_rate, self.cfg.out_rate)
                     if len(pcm) == 0:
                         continue
@@ -1153,8 +1155,13 @@ class Session:
             if slices:
                 _fill_word_slices(slices, lengths, text)
                 await gen.outbox.put((text, slices, None))
-            else:
+            elif yielded:
+                # The engine handed back silence on purpose (an empty frame). Still commit the sentence.
                 await gen.outbox.put((text, text, np.zeros(0, np.int16)))
+            else:
+                # A 2xx body with no samples is not speech the caller heard. Raising would make
+                # _synth drop every sentence still queued; skip this one and keep going.
+                self._emit("error", where="tts", error="empty audio")
 
     async def _render(self, text: str) -> tuple[np.ndarray, float]:
         """Full PCM for a replay. Streaming sends go through _speak; this stays for the tail

@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 
 from core.audio import mulaw_to_pcm16, pcm16_to_mulaw
+from core.session import Session, SessionConfig
 from core.tts import KokoroTTS
+from tests.unit.test_session import Clock, EnergyVAD, FakeLLM, FakeTTS
 from transports.browser import BrowserTransport
 from transports.twilio import TwilioTransport
 
@@ -81,25 +83,121 @@ async def test_twilio_outbound_media_mark_clear_and_chunking():
     tr = TwilioTransport(ws, None)
     tr.stream_sid = "MZ9"
     pcm = (np.arange(400) * 20).astype(np.int16)
-    await tr.send_audio(pcm, 8000)
+    name = await tr.send_audio(pcm, 8000)
     media, mark = ws.sent
     assert media["event"] == "media" and media["streamSid"] == "MZ9"
     raw = base64.b64decode(media["media"]["payload"])
     assert len(raw) == 400 and np.array_equal(mulaw_to_pcm16(raw), mulaw_to_pcm16(pcm16_to_mulaw(pcm)))
-    assert mark == {"event": "mark", "streamSid": "MZ9", "mark": {"name": "m1"}}
+    assert mark == {"event": "mark", "streamSid": "MZ9", "mark": {"name": "m1"}} and name == "m1"
     ws.sent.clear()
-    await tr.send_audio(np.zeros(20000, dtype=np.int16), 8000)
+    name = await tr.send_audio(np.zeros(20000, dtype=np.int16), 8000)
     sizes = [len(base64.b64decode(m["media"]["payload"])) for m in ws.sent if m["event"] == "media"]
-    assert sizes == [8000, 8000, 4000] and ws.sent[-1]["mark"]["name"] == "m2"
+    assert sizes == [8000, 8000, 4000] and ws.sent[-1]["mark"]["name"] == "m2" and name == "m2"
     ws.sent.clear()
     await tr.clear()
     assert ws.sent == [{"event": "clear", "streamSid": "MZ9"}]
+
+
+async def test_twilio_inbound_mark_reaches_the_handler():
+    seen = []
+    msgs = [{"event": "start", "streamSid": "MZ1",
+             "start": {"streamSid": "MZ1", "callSid": "CA1", "customParameters": {}}},
+            {"event": "mark", "streamSid": "MZ1", "mark": {"name": "m1"}},
+            {"event": "stop", "streamSid": "MZ1"}]
+    sess = StubSession()
+
+    async def factory(tr, custom):
+        tr.set_mark_handler(seen.append)
+        return sess
+
+    tr = TwilioTransport(FakeTwilioWS(msgs), factory)
+    await tr.run()
+    assert seen == ["m1"] and tr.marks_acked == 1 and sess.closed
 
 
 async def test_twilio_rejects_non_8k_output():
     tr = TwilioTransport(FakeTwilioWS([]), None)
     with pytest.raises(AssertionError):
         await tr.send_audio(np.zeros(10, dtype=np.int16), 24000)
+
+
+class MarkFailWS:
+    """Accepts media frames, then raises when the playback mark is written."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_text(self, s):
+        obj = json.loads(s)
+        if obj.get("event") == "mark":
+            raise RuntimeError("mark failed")
+        self.sent.append(obj["event"])
+
+    async def close(self):
+        return None
+
+
+async def test_failed_mark_write_holds_say_and_wait_until_the_mark_timeout():
+    """Media is already queued when the mark write raises. say_and_wait must not return on the
+    local clock: voicemail would hang up while that audio is still in Twilio's buffer."""
+    ws = MarkFailWS()
+    tr = TwilioTransport(ws, None)
+    tr.stream_sid = "MZ1"
+    clk = Clock()
+    events = []
+    sess = Session(llm=FakeLLM([["x."]]), tts=FakeTTS(word_ms=500), vad=EnergyVAD(),
+                   send_audio=tr.send_audio, clear_audio=tr.clear, clock=clk,
+                   on_event=events.append,
+                   cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500))
+    task = asyncio.create_task(sess.say_and_wait("Please call us back."))
+    for _ in range(400):
+        await asyncio.sleep(0)
+    assert ws.sent == ["media", "media"]
+    assert [str(c.text) for c in sess.tracker._chunks] == ["Please call us back."]
+    assert sess.tracker.pending_marks == {}
+    assert any(e["type"] == "error" and e["where"] == "send_audio" for e in events)
+    assert not task.done()
+    clk.t = sess.tracker.ends_at() + 1
+    await asyncio.sleep(0.3)
+    assert not task.done() and sess.tracker.is_playing()
+    clk.t = sess.tracker.ends_at() + sess.cfg.mark_timeout_ms
+    await asyncio.sleep(0.3)
+    assert task.done() and task.exception() is None
+
+
+async def test_session_arms_the_mark_name_twilio_writes_and_releases_on_that_echo():
+    """The string on the wire is the string send_audio returns, and that is what the session arms.
+
+    Echoing it while the clock is still before ends_at marks the chunk heard and lets say_and_wait return.
+    """
+    ws = FakeTwilioWS([])
+    tr = TwilioTransport(ws, None)
+    tr.stream_sid = "MZ9"
+    returned = []
+
+    async def send(pcm, rate):
+        name = await tr.send_audio(pcm, rate)
+        returned.append(name)
+        return name
+
+    clk = Clock()
+    sess = Session(llm=FakeLLM([["x."]]), tts=FakeTTS(word_ms=200), vad=EnergyVAD(),
+                   send_audio=send, clear_audio=tr.clear, clock=clk,
+                   cfg=SessionConfig(tts_poll_s=0, mark_timeout_ms=1500))
+    sess.attach_transport_marks(tr)
+    task = asyncio.create_task(sess.say_and_wait("Hello there friend."))
+    for _ in range(400):
+        await asyncio.sleep(0)
+    wire = [m["mark"]["name"] for m in ws.sent if m["event"] == "mark"]
+    assert returned == wire == ["m1"]
+    assert set(sess.tracker.pending_marks) == {"m1"}
+    assert clk.t < sess.tracker.ends_at() and not task.done()
+    tr._on_mark(returned[0])
+    assert sess.tracker.heard() == ("Hello there friend.", False)
+    assert sess.tracker.buffered_ms() == 0 and not sess.tracker.is_playing()
+    await asyncio.sleep(0.3)
+    assert task.done() and task.exception() is None
+    assert clk.t < sess.tracker.ends_at()
 
 
 class FakeBrowserWS:

@@ -407,9 +407,13 @@ class Runtime:
         short_first_sentence = True
         if short_first_sentence:
             prompt += "\n\n" + SHORT_FIRST_SENTENCE
+        # Twilio jitter: trust mark acks, and don't assume playback is instant. Other transports
+        # keep output_latency_ms at 0 so clock-driven unit tests stay put.
+        use_marks = getattr(transport, "out_rate", 0) == 8000 and hasattr(transport, "set_mark_handler")
         scfg = SessionConfig(system_prompt=prompt,
                              short_first_sentence=short_first_sentence,
                              out_rate=transport.out_rate, tools_schema=schemas,
+                             output_latency_ms=200.0 if use_marks else 0.0,
                              greeting=greeting,
                              error_phrase=ERROR_PHRASE.get(lang, ERROR_PHRASE["en"]),
                              tool_fillers=fillers,
@@ -453,6 +457,7 @@ class Runtime:
                        cfg=scfg, tools=fns, on_event=on_event, eot_fn=self._eot_sync(),
                        eot_async=eot_async, recorder=recorder, on_utterance=on_utt,
                        vad_scheduler=self.vad_scheduler)
+        sess.attach_transport_marks(transport)
 
         async def voicemail(message: str) -> None:
             # Same flag the owning node's webhook sets before it speaks, so a retry published

@@ -145,6 +145,7 @@ class SessionConfig:
     pre_roll_frames: int = 10
     max_tool_rounds: int = 3
     output_latency_ms: float = 0.0
+    mark_timeout_ms: float = 1500.0    # give up waiting for a playback mark this long after the clock estimate
     tts_lookahead_ms: float = 1500.0   # synthesize sentence k+1 only when < this much audio is queued
     tts_poll_s: float = 0.02           # how often a waiting sentence re-checks the playback buffer
     tools_schema: list[dict] = field(default_factory=list)
@@ -173,6 +174,7 @@ class _Generation:
         self.tasks: list[asyncio.Task] = []
         self.spoken: list[str] = []
         self.sent_slices: list[_WordSlice] = []  # slices whose send_audio has returned
+        self.failed_sentences: set[str] = set()  # a later chunk of this sentence did not send
         self.produce_done = False
         self.first_audio_sent = False
         self.cancelled = False
@@ -219,7 +221,8 @@ class Session:
         self._last_eot: Optional[float] = None
         self._eot_task: Optional[asyncio.Task] = None
         self.turn = TurnManager(self.cfg.turn, eot_scorer=self._eot_score if eot_fn else None)
-        self.tracker = PlaybackTracker(clock, self.cfg.output_latency_ms)
+        self.tracker = PlaybackTracker(clock, self.cfg.output_latency_ms,
+                                       mark_timeout_ms=self.cfg.mark_timeout_ms)
         self.history: list[dict] = [{"role": "system", "content": self.cfg.system_prompt}]
         self._pre: deque[np.ndarray] = deque(maxlen=self.cfg.pre_roll_frames)
         self._utt: list[np.ndarray] = []
@@ -315,10 +318,16 @@ class Session:
         if self.cfg.greeting.strip():
             await self.say(self.cfg.greeting.strip())
 
+    def _drop_finished_playback(self) -> None:
+        """Forget chunks once playback has finished. A later turn must not inherit their acks."""
+        if not self.tracker.is_playing():
+            self.tracker.reset()
+
     async def say(self, text: str) -> None:
         """Speaks fixed text with no model call. It is a normal committed reply: the caller can talk over it
         (barge-in) and the history keeps only what they heard."""
         async with self._turn_lock:
+            self._drop_finished_playback()
             gen = _Generation(np.zeros(0, np.int16), list(self.history), self.clock())
             gen.committed = True
             gen.commit.set()
@@ -342,8 +351,14 @@ class Session:
         assert gen is not None
         deadline = self.clock() + timeout_s * 1000.0
         await asyncio.wait({gen.tasks[-1]}, timeout=timeout_s)         # the drain task: every sentence sent
-        while not gen.cancelled and self.tracker.buffered_ms() > 0 and self.clock() < deadline:
-            await asyncio.sleep(0.05)
+        # Until the first ack, buffered_ms follows the local clock and can hit zero while Twilio
+        # still has the audio. Voicemail hangs up when this returns. The give-up is re-read each
+        # pass: ends_at moves when more audio is armed while this sleeps.
+        while not gen.cancelled and self.clock() < deadline:
+            if self._playback_blocking():
+                await asyncio.sleep(0.05)
+                continue
+            break
 
     def seed_history(self, messages: list[dict]) -> None:
         """Restores earlier turns ({"role": "user"|"agent", "text"}) before the call starts, so a call that was
@@ -361,6 +376,7 @@ class Session:
             elif g and not g.committed:
                 await self._cancel(g)
                 self._gen = None
+            self._drop_finished_playback()
             self.stats["turns"] += 1
             self.history.append({"role": "user", "content": text})
             base = list(self.history)
@@ -676,6 +692,7 @@ class Session:
 
     # ----------------------------------------------------------- generation
     def _start_generation(self) -> None:
+        self._drop_finished_playback()
         audio = np.concatenate(self._utt) if self._utt else np.zeros(0, np.int16)
         gen = _Generation(audio, list(self.history), self._last_speech_clock)
         gen.prior_transcript = self._transcript_task
@@ -1018,13 +1035,24 @@ class Session:
         except Exception as e:  # noqa: BLE001
             self._emit("error", where="call_action", error=repr(e))
 
+    def _playback_blocking(self) -> bool:
+        """True while a hang-up or say_and_wait should keep holding.
+
+        Armed marks, and a send that raised (bytes may already be buffered, with no echo coming),
+        hold until mark_timeout_ms after the live clock estimate. ends_at moves when more audio
+        is armed, so this is read on every pass of the wait.
+        """
+        now = self.clock()
+        if self.tracker.pending_marks or self.tracker._unconfirmed:
+            return now < self.tracker.ends_at() + self.cfg.mark_timeout_ms
+        return self.tracker.buffered_ms() > 0
+
     async def _finish_action(self, gen: _Generation) -> None:
         deadline = self.clock() + 30000.0
-        # buffered_ms stays > 0 after clear() until the estimate catches up. A tentative barge
-        # must not take gen.after in that gap: a cough resumes the tail, a confirmed interrupt
-        # decides strict vs cancelled. Both cancel this wait.
+        # Marks lag the local clock. A tentative barge must not take gen.after while holding:
+        # a cough resumes the tail, a confirmed interrupt decides strict vs cancelled.
         while not gen.cancelled and self.clock() < deadline and (
-                gen.holding or self.tracker.buffered_ms() > 0):
+                gen.holding or self._playback_blocking()):
             await asyncio.sleep(0.05)
         if gen.cancelled or gen.holding:
             return
@@ -1087,6 +1115,11 @@ class Session:
                 parts.append(joined)
         if parts:
             self._commit_transcript(gen, " ".join(parts))
+
+    def attach_transport_marks(self, transport) -> None:
+        """If the transport echoes playback marks, feed them to the tracker."""
+        if hasattr(transport, "set_mark_handler"):
+            transport.set_mark_handler(self.tracker.note_mark)
 
     async def _speak(self, gen: _Generation, text: str) -> None:
         """Enqueue each TTS chunk as it arrives. The sentence is recorded once every chunk is sent,
@@ -1186,6 +1219,10 @@ class Session:
                     # A send failure may already have recorded earlier slices of this sentence.
                     # The marker still names the whole sentence; do not append that prefix twice.
                     slices = [sl for sl in track if isinstance(sl, _WordSlice)] if isinstance(track, list) else []
+                    if slices and any(sl.sentence in gen.failed_sentences for sl in slices):
+                        self._commit_sent_prefix(gen)
+                        self._cover_slices(track)
+                        continue
                     already = any(sl.covered for sl in slices)
                     fresh = [sl for sl in slices if not sl.covered and sl.text]
                     self._cover_slices(track)
@@ -1205,25 +1242,39 @@ class Session:
                                latency_ms=self.clock() - gen.speech_end_clock)
                 gen.sending = True
                 try:
+                    failed = False
+                    mark = None
                     try:
-                        await self.send_audio(pcm, self.cfg.out_rate)
+                        mark = await self.send_audio(pcm, self.cfg.out_rate)
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:  # noqa: BLE001
-                        # Not sent. Record slices that did leave, and put this chunk back so a
-                        # cough can start another player. Do not apply the sentence marker behind it.
-                        if counted:
-                            gen.outbox_audio += 1
-                        self._commit_sent_prefix(gen)
+                        if gen.holding:
+                            # Tentative barge: this chunk did not land. The next drain replays it.
+                            if counted:
+                                gen.outbox_audio += 1
+                            self._commit_sent_prefix(gen)
+                            self._emit("error", where="send_audio", error=repr(e))
+                            self._requeue_front(gen, item)
+                            return
+                        # Media may already be buffered (Twilio writes it, then the mark).
+                        # Keep the chunk on the clock so lookahead and hang-up still cover it.
                         self._emit("error", where="send_audio", error=repr(e))
-                        self._requeue_front(gen, item)
-                        return
-                    if isinstance(track, _WordSlice):
+                        mark = None
+                        failed = True
+                    if failed and isinstance(track, _WordSlice):
+                        # The sentence marker must not record words whose send raised.
+                        gen.failed_sentences.add(track.sentence)
+                    elif isinstance(track, _WordSlice):
                         gen.sent_slices.append(track)
-                    if self.recorder is not None:
+                    if self.recorder is not None and not failed:
                         self.recorder.agent(pcm, self.cfg.out_rate)
                     dur = pcm_duration_ms(len(pcm), self.cfg.out_rate)
                     self.tracker.on_sent(track if isinstance(track, _WordSlice) else text, dur)
+                    if isinstance(mark, str) and mark:
+                        self.tracker.arm_mark(mark)
+                    if failed:
+                        self.tracker._unconfirmed = True
                     gen.pending_ms -= dur
                     if replay:
                         # Already in spoken/history. Still tell listeners the words went out again.

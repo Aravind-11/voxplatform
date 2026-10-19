@@ -6,8 +6,9 @@ Wire format (verified against Twilio's WebSocket message docs):
   out: {"event":"media","streamSid":..., "media":{"payload": b64}}
        {"event":"mark","streamSid":..., "mark":{"name":...}}   (echoed back after playback)
        {"event":"clear","streamSid":...}                        (flush buffered audio)
-After `clear`, Twilio echoes a mark for every unplayed chunk, so marks are NOT proof of playback
-once an interruption has happened; this transport only counts them.
+After `clear`, Twilio echoes a mark for every unplayed chunk, so those echoes are not proof
+the caller heard them. The session drops pending marks when it interrupts; a late echo whose
+name is no longer armed is ignored. Until then, an echoed mark is the playback position.
 """
 from __future__ import annotations
 
@@ -40,6 +41,8 @@ class TwilioTransport:
         self.custom: dict = {}
         self.marks_sent = 0
         self.marks_acked = 0
+        self.last_mark = ""
+        self._on_mark = None          # optional (name: str) -> None, set by the session
         self._send_lock = asyncio.Lock()
         self._rs = StreamResampler(8000, 16000)
         self._buf = np.zeros(0, dtype=np.int16)
@@ -53,15 +56,22 @@ class TwilioTransport:
             await self.ws.send_text(json.dumps(obj))
 
     # --- called by Session ---
-    async def send_audio(self, pcm: np.ndarray, rate: int) -> None:
+    def set_mark_handler(self, fn) -> None:
+        """Called with the mark name when Twilio echoes it (playback reached that chunk)."""
+        self._on_mark = fn
+
+    async def send_audio(self, pcm: np.ndarray, rate: int) -> str:
         assert rate == 8000, "Twilio transport expects 8 kHz output"
         for i in range(0, len(pcm), MAX_PAYLOAD_SAMPLES):
             payload = base64.b64encode(pcm16_to_mulaw(pcm[i : i + MAX_PAYLOAD_SAMPLES])).decode()
             await self._send({"event": "media", "streamSid": self.stream_sid,
                               "media": {"payload": payload}})
         self.marks_sent += 1
+        name = f"m{self.marks_sent}"
+        self.last_mark = name
         await self._send({"event": "mark", "streamSid": self.stream_sid,
-                          "mark": {"name": f"m{self.marks_sent}"}})
+                          "mark": {"name": name}})
+        return name
 
     async def clear(self) -> None:
         await self._send({"event": "clear", "streamSid": self.stream_sid})
@@ -122,6 +132,10 @@ class TwilioTransport:
                     self._on_dtmf(str((msg.get("dtmf") or {}).get("digit", "")))
                 elif ev == "mark":
                     self.marks_acked += 1
+                    mark = msg.get("mark") or {}
+                    name = str(mark.get("name", "")) if isinstance(mark, dict) else ""
+                    if self._on_mark is not None and name:
+                        self._on_mark(name)
                 elif ev == "stop":
                     break
         except EOFError:          # socket adapter signals a peer disconnect
